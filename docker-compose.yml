@@ -36,10 +36,14 @@ services:
     environment:
       DB_HOST: postgres
       REDIS_HOST: redis
+    volumes:
+      # Read-only: lets scripts/import-sources.ts (run on demand, not part of this command)
+      # read docs/sources.txt without baking it into the image.
+      - ./docs:/app/docs:ro
     depends_on:
       postgres:
         condition: service_healthy
-    command: sh -c "npm run migration:run && npm run seed"
+    command: sh -c "npm run migration:run && npm run seed && npm run seed:keywords"
 
   backend:
     build:
