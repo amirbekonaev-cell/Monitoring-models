@@ -7,6 +7,7 @@ const TYPE_LABELS: Record<Source['type'], string> = {
   parser: 'Универсальный парсер (К-5)',
   search_api: 'Поисковый API (К-1)',
   social_api: 'Соцсеть VK (К-4)',
+  social_search_api: 'Соцсети через OpenAI web search (К-6)',
 };
 
 const STATUS_LABELS: Record<Source['status'], { label: string; color: string }> = {

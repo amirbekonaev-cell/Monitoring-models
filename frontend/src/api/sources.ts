@@ -2,7 +2,7 @@ export interface Source {
   id: string;
   name: string | null;
   url: string;
-  type: 'rss' | 'telegram' | 'parser' | 'search_api' | 'social_api';
+  type: 'rss' | 'telegram' | 'parser' | 'search_api' | 'social_api' | 'social_search_api';
   status: 'active' | 'error' | 'disabled';
   lastSuccessAt: string | null;
   lastError: string | null;

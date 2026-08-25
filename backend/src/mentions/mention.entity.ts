@@ -6,6 +6,8 @@ export enum MentionSourceType {
   TELEGRAM = 'telegram',
   REVIEWS = 'reviews',
   OTHER = 'other',
+  // К-6: найдено через OpenAI web search на Instagram/Facebook/Threads/публичных Telegram-каналах.
+  SOCIAL_SEARCH = 'social_search',
 }
 
 export enum Sentiment {
@@ -57,8 +59,29 @@ export class Mention {
   @Column({ name: 'sentiment_manual', type: 'boolean', default: false })
   sentimentManual: boolean;
 
+  /** Short (1-2 sentence) LLM-generated summary, produced by the same call that classifies sentiment. */
+  @Column({ type: 'text', nullable: true })
+  summary: string | null;
+
   @Column({ type: 'varchar', length: 64, unique: true })
   hash: string;
+
+  /**
+   * Явно указанный источник/платформа находки (например, "instagram.com", "kz-forum.example") —
+   * заполняется каналами, у которых один запрос может вернуть результаты с разных площадок
+   * (сейчас — только объединённый OpenAI web search, К-6). Для остальных каналов остаётся
+   * null: там источник и так однозначен через source_id -> sources.name.
+   */
+  @Column({ name: 'source_label', type: 'text', nullable: true })
+  sourceLabel: string | null;
+
+  /** Set true the moment the Telegram alert has actually been claimed/sent — see MentionsService.claimForNotification. */
+  @Column({ name: 'notification_sent', type: 'boolean', default: false })
+  notificationSent: boolean;
+
+  /** True for items found during a source's one-time historical catch-up run (not sent to Telegram individually). */
+  @Column({ name: 'is_backfill', type: 'boolean', default: false })
+  isBackfill: boolean;
 
   @Column({ type: 'jsonb', default: () => "'[]'" })
   keywords: string[];

@@ -6,6 +6,8 @@ export enum SourceKind {
   PARSER = 'parser',
   SEARCH_API = 'search_api',
   SOCIAL_API = 'social_api',
+  // К-6: соцсети/Telegram-каналы через OpenAI web search (не прямой API соцсети).
+  SOCIAL_SEARCH_API = 'social_search_api',
 }
 
 export enum SourceStatus {

@@ -74,6 +74,83 @@ describe('ActiveKeywordSet', () => {
     expect((dataSource.query as jest.Mock).mock.calls.length).toBe(0);
   });
 
+  it('matches "Казклауд"/"QazCloud" across Russian grammatical case endings (genitive/dative/instrumental/prepositional)', async () => {
+    // Mirrors the real seeded keyword config (seed-keywords.ts): manualForms is non-empty, so
+    // this goes through literal substring matching, not Postgres FTS. Substring matching on the
+    // bare stem "Казклауд"/"QazCloud" already catches every Russian case ending on its own,
+    // because the case suffix is appended *after* the stem rather than altering it — no morphology
+    // engine needed for a foreign brand name that doesn't participate in vowel/consonant alternation.
+    const dataSource = makeDataSourceMock({});
+    const kazklaud = makeKeyword({
+      phrase: 'Казклауд',
+      type: KeywordType.REQUIRED,
+      language: 'ru',
+      manualForms: ['Каз Клауд'],
+    });
+    const qazcloud = makeKeyword({
+      phrase: 'QazCloud',
+      type: KeywordType.REQUIRED,
+      language: 'ru',
+      manualForms: ['Qaz Cloud'],
+    });
+    const set = new ActiveKeywordSet([kazklaud, qazcloud], dataSource);
+
+    const declinedSentences = [
+      'Обратились в Казклауд за консультацией', // именительный
+      'Договор с Казклаудом подписан вчера', // творительный
+      'В дата-центре Казклауда установлено оборудование', // родительный
+      'Компании передали доступ Казклауду', // дательный
+      'О Казклауде писали многие издания', // предложный
+      'Чистый доход QazCloud вырос почти на четверть', // именительный (несклоняемое)
+      'Сотрудничество с QazCloud’ом продолжается', // творительный с апострофом
+      'Клиенты QazCloud-а получили уведомление', // родительный через дефис
+    ];
+
+    for (const text of declinedSentences) {
+      const result = await set.match(text, '');
+      expect(result.matched).toBe(true);
+    }
+
+    // FTS must never be consulted for these — manualForms forces the literal-substring path.
+    expect((dataSource.query as jest.Mock).mock.calls.length).toBe(0);
+  });
+
+  it('matches every real-world case variant of "QazCloud"/"Казклауд" regardless of letter case', async () => {
+    // Mirrors the real seeded keyword config exactly (seed-keywords.ts). Case-insensitivity is
+    // enforced in application code (both the haystack and each candidate form are .toLowerCase()'d
+    // before .includes() — see ActiveKeywordSet.literalMatch), not via a DB-level ILIKE/to_tsvector,
+    // because this is a manualForms/literal-substring keyword, matched against the item's
+    // title+text *before* insertion, not via a SQL WHERE clause against already-stored mentions.
+    const dataSource = makeDataSourceMock({});
+    const kazklaud = makeKeyword({
+      phrase: 'Казклауд',
+      type: KeywordType.REQUIRED,
+      language: 'ru',
+      manualForms: ['Каз Клауд'],
+    });
+    const qazcloud = makeKeyword({
+      phrase: 'QazCloud',
+      type: KeywordType.REQUIRED,
+      language: 'ru',
+      manualForms: ['Qaz Cloud'],
+    });
+    const set = new ActiveKeywordSet([kazklaud, qazcloud], dataSource);
+
+    const testMentionTitle = 'Новое упоминание компании в СМИ';
+    const variants = ['QazCloud', 'qazcloud', 'QAZCLOUD', 'Qazcloud', 'Казклауд', 'казклауд', 'КАЗКЛАУД', 'Каз Клауд'];
+
+    const results: Array<{ variant: string; matched: boolean }> = [];
+    for (const variant of variants) {
+      const result = await set.match(testMentionTitle, `Текст со словом ${variant} внутри`);
+      results.push({ variant, matched: result.matched });
+    }
+
+    // eslint-disable-next-line no-console
+    console.table(results);
+
+    expect(results.every((r) => r.matched)).toBe(true);
+  });
+
   it('matches an exact_phrase keyword only as a literal substring', async () => {
     const dataSource = makeDataSourceMock({});
     const kw = makeKeyword({ phrase: 'новый тариф', type: KeywordType.EXACT_PHRASE });

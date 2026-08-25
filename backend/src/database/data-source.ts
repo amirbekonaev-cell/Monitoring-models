@@ -4,17 +4,22 @@ import { config } from 'dotenv';
 import { Source } from '../sources/source.entity';
 import { Mention } from '../mentions/mention.entity';
 import { Keyword } from '../keywords/keyword.entity';
+import { Setting } from '../settings/setting.entity';
+import { resolveDbConfig } from '../config/database.util';
 
 config();
 
+const db = resolveDbConfig();
+
 export const AppDataSource = new DataSource({
   type: 'postgres',
-  host: process.env.DB_HOST || 'localhost',
-  port: Number(process.env.DB_PORT) || 5432,
-  username: process.env.DB_USER || 'postgres',
-  password: process.env.DB_PASSWORD || 'postgres',
-  database: process.env.DB_NAME || 'mentions',
-  entities: [Source, Mention, Keyword],
+  host: db.host,
+  port: db.port,
+  username: db.username,
+  password: db.password,
+  database: db.database,
+  ssl: db.ssl,
+  entities: [Source, Mention, Keyword, Setting],
   migrations: [__dirname + '/migrations/*.{ts,js}'],
   synchronize: false,
 });

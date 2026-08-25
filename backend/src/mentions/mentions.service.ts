@@ -1,7 +1,9 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
+import { createHash, randomUUID } from 'crypto';
 import { DataSource, Repository } from 'typeorm';
-import { Mention } from './mention.entity';
+import { Mention, Sentiment } from './mention.entity';
+import { SentimentAnalysisService } from '../sentiment/sentiment-analysis.service';
 
 export interface CreateMentionInput {
   title: string;
@@ -10,8 +12,25 @@ export interface CreateMentionInput {
   publishedAt: Date | null;
   sourceId: string;
   sourceType: Mention['sourceType'];
+  /** See Mention.sourceLabel — explicit per-item source/domain when a channel can return results from more than one platform per call. */
+  sourceLabel?: string | null;
   hash: string;
   keywords: string[];
+  /**
+   * True when this item came from a source's one-time historical catch-up run. Backfilled
+   * items are inserted already marked as notified (notificationSent=true) so they never queue
+   * a Telegram alert and don't arrive as a spam burst — only genuinely new post-backfill items do.
+   */
+  isBackfill?: boolean;
+  /**
+   * Disables BOTH the exact-hash duplicate check and the pg_trgm similarity ("reprint") check
+   * for this insert. Only the consolidated OpenAI web search channel (К-6) sets this: unlike
+   * sites/RSS/parser, where the same news story genuinely gets reprinted verbatim by several
+   * outlets and should collapse into one card, every web-search result is its own independent
+   * finding (a different page, a different quote) even when the wording looks similar — it
+   * should always show up as its own entry, every time it's found, not get merged away.
+   */
+  skipDedup?: boolean;
 }
 
 export interface FindMentionsQuery {
@@ -42,6 +61,7 @@ export class MentionsService {
     @InjectRepository(Mention)
     private readonly mentionsRepo: Repository<Mention>,
     private readonly dataSource: DataSource,
+    private readonly sentimentAnalysisService?: SentimentAnalysisService,
   ) {}
 
   /**
@@ -50,17 +70,31 @@ export class MentionsService {
    * reprint on the existing card instead of creating a new row.
    */
   async createIfNew(input: CreateMentionInput): Promise<CreateMentionResult> {
-    const existingByHash = await this.mentionsRepo.findOne({ where: { hash: input.hash } });
-    if (existingByHash) {
-      await this.addReprintIfNewUrl(existingByHash, input);
-      return 'duplicate';
+    const isBackfill = input.isBackfill ?? false;
+
+    if (!input.skipDedup) {
+      const existingByHash = await this.mentionsRepo.findOne({ where: { hash: input.hash } });
+      if (existingByHash) {
+        await this.addReprintIfNewUrl(existingByHash, input);
+        return 'duplicate';
+      }
+
+      const similar = await this.findSimilarByContent(input.title, input.text, input.publishedAt);
+      if (similar) {
+        await this.addReprintIfNewUrl(similar, input);
+        return 'reprint';
+      }
     }
 
-    const similar = await this.findSimilarByContent(input.title, input.text, input.publishedAt);
-    if (similar) {
-      await this.addReprintIfNewUrl(similar, input);
-      return 'reprint';
-    }
+    // hash has a UNIQUE constraint AND a varchar(64) length limit at the DB level regardless of
+    // skipDedup — a skipDedup insert still needs a hash that (a) won't collide with an earlier
+    // row for the same (or similar) finding, since we deliberately skipped the checks that would
+    // normally catch that, and (b) fits the column. input.hash is already a 64-char sha256 hex
+    // digest, so naively appending a random suffix overflows varchar(64) — re-hashing it together
+    // with a fresh random component keeps it at exactly 64 hex characters.
+    const hash = input.skipDedup
+      ? createHash('sha256').update(`${input.hash}:${randomUUID()}`).digest('hex')
+      : input.hash;
 
     const result = await this.mentionsRepo
       .createQueryBuilder()
@@ -73,14 +107,112 @@ export class MentionsService {
         publishedAt: input.publishedAt,
         sourceId: input.sourceId,
         sourceType: input.sourceType,
-        hash: input.hash,
+        sourceLabel: input.sourceLabel ?? null,
+        hash,
         keywords: input.keywords,
         reprints: [],
+        isBackfill,
+        // No background collection writes mentions any more (see README "Деплой на Vercel") —
+        // there is no per-mention Telegram alert left to guard against, but the column still
+        // records whether a mention came from a backfill run.
+        notificationSent: isBackfill,
       })
       .orIgnore()
       .execute();
 
-    return (result.identifiers?.length ?? 0) > 0 ? 'inserted' : 'duplicate';
+    const insertedId = result.identifiers?.[0]?.id as string | undefined;
+    if (!insertedId) {
+      return 'duplicate';
+    }
+
+    // Fire-and-forget, deliberately not awaited: a slow/failing OpenAI call must never delay the
+    // insert or its caller (on-demand /search, or the onboarding "add by link" test collection).
+    // There's no queue/retry behind this any more — a failure is logged once and the mention stays
+    // at Sentiment.UNDEFINED (same permanent-error outcome SentimentAnalysisService already returns
+    // for a missing key or a bad response), rather than being retried later.
+    void this.classifySentimentInBackground(insertedId);
+
+    return 'inserted';
+  }
+
+  private async classifySentimentInBackground(mentionId: string): Promise<void> {
+    if (!this.sentimentAnalysisService) {
+      return;
+    }
+    try {
+      const mention = await this.findById(mentionId);
+      if (!mention) {
+        return;
+      }
+      const classification = await this.sentimentAnalysisService.classify(mention.title, mention.text, mention.url);
+      if (!classification) {
+        return;
+      }
+      await this.updateSentiment(mentionId, classification.sentiment, classification.summary);
+      this.logger.log(`Mention ${mentionId} sentiment classified as "${classification.sentiment}": ${classification.reason}`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.logger.error(`Не удалось определить тональность упоминания ${mentionId}: ${message}`);
+    }
+  }
+
+  findById(id: string): Promise<Mention | null> {
+    return this.mentionsRepo.findOne({ where: { id } });
+  }
+
+  /**
+   * Atomically flips notification_sent false->true and reports whether *this* call was the
+   * one that made the change. This claim-before-send pattern is what guarantees "one mention,
+   * one notification" even across a crash/restart: if the worker dies after the claim succeeds
+   * but before the Telegram API call completes, the mention is left marked as sent without ever
+   * having been delivered (a rare silent miss) rather than risking a duplicate send on retry —
+   * the trade-off explicitly asked for here. A failed send calls markNotificationFailed to
+   * release the claim so a later retry can actually go through. Currently unused (no per-mention
+   * Telegram sender exists any more — see README "Деплой на Vercel"), kept in case a notification
+   * path is reintroduced.
+   */
+  async claimForNotification(id: string): Promise<boolean> {
+    const result = await this.mentionsRepo
+      .createQueryBuilder()
+      .update(Mention)
+      .set({ notificationSent: true })
+      .where('id = :id AND notification_sent = false', { id })
+      .execute();
+    return (result.affected ?? 0) > 0;
+  }
+
+  async markNotificationFailed(id: string): Promise<void> {
+    await this.mentionsRepo.update(id, { notificationSent: false });
+  }
+
+  /**
+   * Machine classification write-back. Guarded by `WHERE sentiment_manual = false` at the DB
+   * level: if a human already edited this mention's sentiment (ФТ-11) between the classify job
+   * being queued and it finishing (e.g. a slow OpenAI response racing a manual edit), this no-ops
+   * instead of clobbering the human's choice — a manual edit must never be silently overwritten
+   * by a later automatic re-classification, regardless of timing.
+   */
+  async updateSentiment(id: string, sentiment: Sentiment, summary?: string | null): Promise<void> {
+    await this.mentionsRepo
+      .createQueryBuilder()
+      .update(Mention)
+      .set({ sentiment, sentimentManual: false, ...(summary !== undefined ? { summary } : {}) })
+      .where('id = :id AND sentiment_manual = false', { id })
+      .execute();
+  }
+
+  /** Human edit (ФТ-11) — always wins, and marks the mention so future auto-classification skips it. */
+  async updateSentimentManually(id: string, sentiment: Sentiment): Promise<Mention | null> {
+    const result = await this.mentionsRepo
+      .createQueryBuilder()
+      .update(Mention)
+      .set({ sentiment, sentimentManual: true })
+      .where('id = :id', { id })
+      .execute();
+    if (!result.affected) {
+      return null;
+    }
+    return this.findById(id);
   }
 
   private async findSimilarByContent(title: string, text: string, publishedAt: Date | null): Promise<Mention | null> {

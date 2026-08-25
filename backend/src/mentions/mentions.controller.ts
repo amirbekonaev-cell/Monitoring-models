@@ -1,5 +1,6 @@
-import { Controller, Get, Query } from '@nestjs/common';
+import { BadRequestException, Body, Controller, Get, NotFoundException, Param, Patch, Query } from '@nestjs/common';
 import { MentionsService } from './mentions.service';
+import { Sentiment } from './mention.entity';
 
 @Controller('mentions')
 export class MentionsController {
@@ -14,5 +15,20 @@ export class MentionsController {
       offset: parsedOffset,
     });
     return { items, total, limit: parsedLimit, offset: parsedOffset };
+  }
+
+  /** ФТ-11: ручная правка тональности. Всегда побеждает автоматику — см. MentionsService.updateSentiment. */
+  @Patch(':id/sentiment')
+  async updateSentiment(@Param('id') id: string, @Body('sentiment') sentiment: string) {
+    if (!Object.values(Sentiment).includes(sentiment as Sentiment)) {
+      throw new BadRequestException(
+        `Недопустимое значение тональности: "${sentiment}" (ожидается одно из: ${Object.values(Sentiment).join(', ')})`,
+      );
+    }
+    const updated = await this.mentionsService.updateSentimentManually(id, sentiment as Sentiment);
+    if (!updated) {
+      throw new NotFoundException(`Упоминание ${id} не найдено`);
+    }
+    return updated;
   }
 }
