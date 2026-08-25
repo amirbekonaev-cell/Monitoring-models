@@ -16,17 +16,6 @@ services:
       timeout: 5s
       retries: 10
 
-  redis:
-    image: redis:7-alpine
-    restart: unless-stopped
-    ports:
-      - '6379:6379'
-    healthcheck:
-      test: ['CMD', 'redis-cli', 'ping']
-      interval: 5s
-      timeout: 5s
-      retries: 10
-
   migrate:
     build:
       context: ./backend
@@ -35,11 +24,14 @@ services:
       - .env
     environment:
       DB_HOST: postgres
-      REDIS_HOST: redis
+    volumes:
+      # Read-only: lets scripts/import-sources.ts (run on demand, not part of this command)
+      # read docs/sources.txt without baking it into the image.
+      - ./docs:/app/docs:ro
     depends_on:
       postgres:
         condition: service_healthy
-    command: sh -c "npm run migration:run && npm run seed"
+    command: sh -c "npm run migration:run && npm run seed && npm run seed:keywords"
 
   backend:
     build:
@@ -49,13 +41,10 @@ services:
       - .env
     environment:
       DB_HOST: postgres
-      REDIS_HOST: redis
     ports:
       - '3000:3000'
     depends_on:
       postgres:
-        condition: service_healthy
-      redis:
         condition: service_healthy
       migrate:
         condition: service_completed_successfully
