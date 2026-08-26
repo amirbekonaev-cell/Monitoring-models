@@ -67,6 +67,8 @@ export class KeywordsService {
   }
 }
 
+type FtsConfig = 'russian' | 'english';
+
 /**
  * Matching rules:
  * - No active required/exact_phrase keywords at all -> everything passes (unfiltered feed,
@@ -76,8 +78,11 @@ export class KeywordsService {
  * - 'exact_phrase' keywords always match as a literal case-insensitive substring.
  * - 'required'/'minus' keywords with language='kk' or explicit manualForms match against
  *   [phrase, ...manualForms] as literal substrings (Postgres has no Kazakh FTS dictionary).
- * - 'required'/'minus' keywords with language='ru' (default) and no manualForms match via
- *   Postgres full-text search (to_tsvector('russian', ...) @@ plainto_tsquery(...)), which
+ * - 'required'/'minus' keywords with language='en' and no manualForms match via Postgres
+ *   full-text search using the 'english' config (to_tsvector('english', ...)), which handles
+ *   English word forms (plurals, basic suffixes) via the Porter stemmer.
+ * - 'required'/'minus' keywords with language='ru' (default, or anything other than 'kk'/'en')
+ *   and no manualForms match via Postgres full-text search using the 'russian' config, which
  *   handles Russian word forms/declensions automatically.
  */
 export class ActiveKeywordSet {
@@ -96,20 +101,24 @@ export class ActiveKeywordSet {
     return keyword.language === 'kk' || (keyword.manualForms?.length ?? 0) > 0;
   }
 
+  private ftsConfigFor(keyword: Keyword): FtsConfig {
+    return keyword.language === 'en' ? 'english' : 'russian';
+  }
+
   private literalMatch(haystack: string, keyword: Keyword): boolean {
     const lower = haystack.toLowerCase();
     const forms = [keyword.phrase, ...(keyword.manualForms ?? [])];
     return forms.some((form) => form.trim() && lower.includes(form.trim().toLowerCase()));
   }
 
-  private async ruFtsMatch(haystack: string, phrases: string[]): Promise<boolean[]> {
+  private async ftsMatch(haystack: string, phrases: string[], config: FtsConfig): Promise<boolean[]> {
     if (phrases.length === 0) {
       return [];
     }
     const rows: Array<{ idx: number; matched: boolean | string }> = await this.dataSource.query(
-      `SELECT ord - 1 as idx, to_tsvector('russian', $1) @@ plainto_tsquery('russian', kw) as matched
-       FROM unnest($2::text[]) WITH ORDINALITY AS t(kw, ord)`,
-      [haystack, phrases],
+      `SELECT ord - 1 as idx, to_tsvector($1::regconfig, $2) @@ plainto_tsquery($1::regconfig, kw) as matched
+       FROM unnest($3::text[]) WITH ORDINALITY AS t(kw, ord)`,
+      [config, haystack, phrases],
     );
     const result = new Array(phrases.length).fill(false);
     for (const row of rows) {
@@ -122,31 +131,50 @@ export class ActiveKeywordSet {
     const haystack = `${title}\n${text}`;
     const matchedKeywords: string[] = [];
 
-    // Split ru-FTS-eligible keywords out so we can batch them into one query.
-    const ruEligible = (type: KeywordType) =>
-      this.keywords.filter((k) => k.type === type && !this.usesManualForms(k));
-    const ruRequired = ruEligible(KeywordType.REQUIRED);
-    const ruMinus = ruEligible(KeywordType.MINUS);
+    // Split fts-eligible keywords out (by type and by fts config) so each config can be batched
+    // into a single query.
+    const ftsEligible = (type: KeywordType, config: FtsConfig) =>
+      this.keywords.filter((k) => k.type === type && !this.usesManualForms(k) && this.ftsConfigFor(k) === config);
+    const ruRequired = ftsEligible(KeywordType.REQUIRED, 'russian');
+    const enRequired = ftsEligible(KeywordType.REQUIRED, 'english');
+    const ruMinus = ftsEligible(KeywordType.MINUS, 'russian');
+    const enMinus = ftsEligible(KeywordType.MINUS, 'english');
 
-    const [ruRequiredMatches, ruMinusMatches] = await Promise.all([
-      this.ruFtsMatch(
+    const [ruRequiredMatches, enRequiredMatches, ruMinusMatches, enMinusMatches] = await Promise.all([
+      this.ftsMatch(
         haystack,
         ruRequired.map((k) => k.phrase),
+        'russian',
       ),
-      this.ruFtsMatch(
+      this.ftsMatch(
+        haystack,
+        enRequired.map((k) => k.phrase),
+        'english',
+      ),
+      this.ftsMatch(
         haystack,
         ruMinus.map((k) => k.phrase),
+        'russian',
+      ),
+      this.ftsMatch(
+        haystack,
+        enMinus.map((k) => k.phrase),
+        'english',
       ),
     ]);
 
     let positiveMatched = false;
 
-    ruRequired.forEach((k, i) => {
-      if (ruRequiredMatches[i]) {
-        positiveMatched = true;
-        matchedKeywords.push(k.phrase);
-      }
-    });
+    const applyRequiredFtsMatches = (group: Keyword[], matches: boolean[]) => {
+      group.forEach((k, i) => {
+        if (matches[i]) {
+          positiveMatched = true;
+          matchedKeywords.push(k.phrase);
+        }
+      });
+    };
+    applyRequiredFtsMatches(ruRequired, ruRequiredMatches);
+    applyRequiredFtsMatches(enRequired, enRequiredMatches);
 
     for (const k of this.keywords) {
       if (k.type === KeywordType.REQUIRED && this.usesManualForms(k)) {
@@ -164,11 +192,16 @@ export class ActiveKeywordSet {
     }
 
     let minusMatched = false;
-    ruMinus.forEach((k, i) => {
-      if (ruMinusMatches[i]) {
-        minusMatched = true;
-      }
-    });
+    const applyMinusFtsMatches = (group: Keyword[], matches: boolean[]) => {
+      group.forEach((k, i) => {
+        if (matches[i]) {
+          minusMatched = true;
+        }
+      });
+    };
+    applyMinusFtsMatches(ruMinus, ruMinusMatches);
+    applyMinusFtsMatches(enMinus, enMinusMatches);
+
     for (const k of this.keywords) {
       if (k.type === KeywordType.MINUS && this.usesManualForms(k) && this.literalMatch(haystack, k)) {
         minusMatched = true;

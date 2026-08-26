@@ -20,7 +20,7 @@ export class Keyword {
   @Column({ name: 'is_active', type: 'boolean', default: true })
   isActive: boolean;
 
-  /** 'ru' | 'kk' — which morphology strategy to use for matching. */
+  /** 'ru' | 'kk' | 'en' — which morphology strategy to use for matching. */
   @Column({ type: 'varchar', length: 2, default: 'ru' })
   language: string;
 

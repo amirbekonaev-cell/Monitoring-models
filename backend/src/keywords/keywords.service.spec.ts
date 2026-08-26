@@ -18,7 +18,7 @@ function makeKeyword(overrides: Partial<Keyword>): Keyword {
 function makeDataSourceMock(ftsMatches: Record<string, boolean>) {
   return {
     query: jest.fn(async (sql: string, params: unknown[]) => {
-      const [haystack, phrases] = params as [string, string[]];
+      const [, , phrases] = params as [string, string, string[]];
       return phrases.map((phrase, i) => ({ idx: i, matched: ftsMatches[phrase] ?? false }));
     }),
   } as unknown as DataSource;
@@ -149,6 +149,34 @@ describe('ActiveKeywordSet', () => {
     console.table(results);
 
     expect(results.every((r) => r.matched)).toBe(true);
+  });
+
+  it('matches an english required keyword via full-text search using the english config', async () => {
+    const dataSource = makeDataSourceMock({ astana: true });
+    const kw = makeKeyword({ phrase: 'astana', type: KeywordType.REQUIRED, language: 'en' });
+    const set = new ActiveKeywordSet([kw], dataSource);
+    const result = await set.match('Astana Hub launches new program', 'news text');
+    expect(result.matched).toBe(true);
+    expect(result.matchedKeywords).toContain('astana');
+    expect((dataSource.query as jest.Mock).mock.calls[0][1][0]).toBe('english');
+  });
+
+  it('excludes items matching an active english minus keyword', async () => {
+    const dataSource = makeDataSourceMock({ qazcloud: true, medic: true });
+    const required = makeKeyword({ phrase: 'qazcloud', type: KeywordType.REQUIRED, language: 'en' });
+    const minus = makeKeyword({ phrase: 'medic', type: KeywordType.MINUS, language: 'en' });
+    const set = new ActiveKeywordSet([required, minus], dataSource);
+    const result = await set.match('QazCloud partners with a medic clinic', 'news text');
+    expect(result.matched).toBe(false);
+  });
+
+  it('does not run english FTS for a default-language (russian) keyword', async () => {
+    const dataSource = makeDataSourceMock({ казахтелеком: true });
+    const kw = makeKeyword({ phrase: 'казахтелеком', type: KeywordType.REQUIRED, language: 'ru' });
+    const set = new ActiveKeywordSet([kw], dataSource);
+    await set.match('Казахтелекома обвинили в сбое', 'текст новости');
+    expect((dataSource.query as jest.Mock).mock.calls.length).toBe(1);
+    expect((dataSource.query as jest.Mock).mock.calls[0][1][0]).toBe('russian');
   });
 
   it('matches an exact_phrase keyword only as a literal substring', async () => {
