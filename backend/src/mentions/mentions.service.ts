@@ -53,6 +53,11 @@ const REPRINT_TEXT_SIMILARITY_THRESHOLD = 0.5;
 
 export type CreateMentionResult = 'inserted' | 'reprint' | 'duplicate';
 
+export interface CreateMentionAndClassifyResult {
+  result: CreateMentionResult;
+  sentiment: Sentiment;
+}
+
 @Injectable()
 export class MentionsService {
   private readonly logger = new Logger(MentionsService.name);
@@ -70,19 +75,61 @@ export class MentionsService {
    * reprint on the existing card instead of creating a new row.
    */
   async createIfNew(input: CreateMentionInput): Promise<CreateMentionResult> {
+    const { result, id } = await this.insertOrDedup(input);
+
+    if (result === 'inserted' && id) {
+      // Fire-and-forget, deliberately not awaited: a slow/failing OpenAI call must never delay the
+      // insert or its caller (RSS/Parser/Telegram/VK ingestion, or the onboarding "add by link"
+      // test collection). There's no queue/retry behind this any more — a failure is logged once
+      // and the mention stays at Sentiment.UNDEFINED (same permanent-error outcome
+      // SentimentAnalysisService already returns for a missing key or a bad response), rather than
+      // being retried later.
+      void this.classifySentimentInBackground(id);
+    }
+
+    return result;
+  }
+
+  /**
+   * Same insert/dedup logic as createIfNew, but for on-demand /search only (see
+   * OnDemandSearchService): waits for sentiment classification instead of firing it in the
+   * background, so the /search summary can show the real tone right away instead of always
+   * "не определена". Safe only because /search callers already tolerate extra latency (the
+   * Telegram handler uses Vercel's waitUntil() to stay alive for minutes) — every other ingestion
+   * path keeps using the fire-and-forget createIfNew() above, untouched.
+   */
+  async createIfNewAndClassify(input: CreateMentionInput): Promise<CreateMentionAndClassifyResult> {
+    const { result, id } = await this.insertOrDedup(input);
+
+    if (!id) {
+      return { result, sentiment: Sentiment.UNDEFINED };
+    }
+
+    if (result === 'inserted') {
+      await this.classifySentimentInBackground(id);
+    }
+
+    // For an already-known mention (duplicate/reprint), just read back whatever sentiment it
+    // already has rather than reclassifying it — findById() by the existing row's id, not by
+    // anything derived from `input`.
+    const mention = await this.findById(id);
+    return { result, sentiment: mention?.sentiment ?? Sentiment.UNDEFINED };
+  }
+
+  private async insertOrDedup(input: CreateMentionInput): Promise<{ result: CreateMentionResult; id: string }> {
     const isBackfill = input.isBackfill ?? false;
 
     if (!input.skipDedup) {
       const existingByHash = await this.mentionsRepo.findOne({ where: { hash: input.hash } });
       if (existingByHash) {
         await this.addReprintIfNewUrl(existingByHash, input);
-        return 'duplicate';
+        return { result: 'duplicate', id: existingByHash.id };
       }
 
       const similar = await this.findSimilarByContent(input.title, input.text, input.publishedAt);
       if (similar) {
         await this.addReprintIfNewUrl(similar, input);
-        return 'reprint';
+        return { result: 'reprint', id: similar.id };
       }
     }
 
@@ -122,17 +169,10 @@ export class MentionsService {
 
     const insertedId = result.identifiers?.[0]?.id as string | undefined;
     if (!insertedId) {
-      return 'duplicate';
+      return { result: 'duplicate', id: '' };
     }
 
-    // Fire-and-forget, deliberately not awaited: a slow/failing OpenAI call must never delay the
-    // insert or its caller (on-demand /search, or the onboarding "add by link" test collection).
-    // There's no queue/retry behind this any more — a failure is logged once and the mention stays
-    // at Sentiment.UNDEFINED (same permanent-error outcome SentimentAnalysisService already returns
-    // for a missing key or a bad response), rather than being retried later.
-    void this.classifySentimentInBackground(insertedId);
-
-    return 'inserted';
+    return { result: 'inserted', id: insertedId };
   }
 
   private async classifySentimentInBackground(mentionId: string): Promise<void> {

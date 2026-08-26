@@ -4,6 +4,7 @@ import { SettingsService } from '../../settings/settings.service';
 import { SourcesService } from '../../sources/sources.service';
 import { SourceKind, SourceStatus } from '../../sources/source.entity';
 import { OnDemandSearchService, OnDemandSearchSummary } from '../../search-on-demand/on-demand-search.service';
+import { Sentiment } from '../../mentions/mention.entity';
 
 type CommandHandler = (ctx: any) => Promise<void>;
 type ActionHandler = (ctx: any) => Promise<void>;
@@ -226,6 +227,7 @@ describe('TelegramBotService', () => {
           sourceLabel: 'kz-forum.example',
           publishedAt: new Date('2026-08-20T12:00:00Z'),
           status: 'new',
+          sentiment: Sentiment.POSITIVE,
         },
       ],
       sourcesFailed: [],
@@ -244,6 +246,62 @@ describe('TelegramBotService', () => {
     const [, message] = sendMessageMock.mock.calls[0];
     expect(message).toContain('kz-forum.example');
     expect(message).toContain('Всего найдено: 1');
+    expect(message).toContain('🟢 Позитив');
+  });
+
+  it('shows the correct sentiment emoji and label for each of the 4 sentiment values in the /search summary', async () => {
+    const onDemandSearchService = makeOnDemandSearchService({
+      totalMatched: 4,
+      newCount: 4,
+      knownCount: 0,
+      items: [
+        {
+          title: 'Позитивная находка',
+          url: 'https://example.com/positive',
+          sourceLabel: 'example.com',
+          publishedAt: null,
+          status: 'new',
+          sentiment: Sentiment.POSITIVE,
+        },
+        {
+          title: 'Негативная находка',
+          url: 'https://example.com/negative',
+          sourceLabel: 'example.com',
+          publishedAt: null,
+          status: 'new',
+          sentiment: Sentiment.NEGATIVE,
+        },
+        {
+          title: 'Нейтральная находка',
+          url: 'https://example.com/neutral',
+          sourceLabel: 'example.com',
+          publishedAt: null,
+          status: 'new',
+          sentiment: Sentiment.NEUTRAL,
+        },
+        {
+          title: 'Ещё не классифицированная находка',
+          url: 'https://example.com/undefined',
+          sourceLabel: 'example.com',
+          publishedAt: null,
+          status: 'new',
+          sentiment: Sentiment.UNDEFINED,
+        },
+      ],
+      sourcesFailed: [],
+      openAiWebSearchCalls: 1,
+    });
+    await boot('-1001', onDemandSearchService);
+    const ctx = makeCtx('-1001');
+
+    await actionHandlers.get('/^search_period:(\\d+)$/')!(ctx);
+    await flushPromises();
+
+    const [, message] = sendMessageMock.mock.calls[0];
+    expect(message).toContain('🟢 Позитив · ' + 'Позитивная находка');
+    expect(message).toContain('🔴 Негатив · ' + 'Негативная находка');
+    expect(message).toContain('🟡 Нейтрал · ' + 'Нейтральная находка');
+    expect(message).toContain('⚪ Не определена · ' + 'Ещё не классифицированная находка');
   });
 
   it('reports explicitly when nothing was found for the chosen period', async () => {

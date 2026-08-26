@@ -433,6 +433,95 @@ describe('MentionsService dedup', () => {
     expect(result).toEqual(updated);
   });
 
+  it('createIfNewAndClassify awaits classification (not fire-and-forget) and returns the real sentiment for a new mention', async () => {
+    const inserted = { id: 'new-id', title: 'Заголовок', text: 'Текст', url: 'https://example.com/a' } as Mention;
+    const classified = { ...inserted, sentiment: Sentiment.POSITIVE } as Mention;
+    const repo = {
+      findOne: jest
+        .fn()
+        // dedup hash lookup -> nothing
+        .mockResolvedValueOnce(null)
+        // findById() inside classifySentimentInBackground, before classify() runs
+        .mockResolvedValueOnce(inserted)
+        // createIfNewAndClassify's own findById() after classification completes
+        .mockResolvedValueOnce(classified),
+      createQueryBuilder: jest.fn(() => ({
+        insert: () => ({
+          into: () => ({
+            values: () => ({ orIgnore: () => ({ execute: async () => ({ identifiers: [{ id: 'new-id' }] }) }) }),
+          }),
+        }),
+        update: () => ({ set: () => ({ where: () => ({ execute: jest.fn(async () => ({ affected: 1 })) }) }) }),
+      })),
+      update: jest.fn(),
+    } as unknown as Repository<Mention>;
+
+    const dataSource = { query: jest.fn(async () => []) } as unknown as DataSource;
+    const sentimentAnalysisService = {
+      classify: jest.fn(async () => ({ sentiment: Sentiment.POSITIVE, reason: 'r', summary: 's' })),
+    } as unknown as SentimentAnalysisService;
+    const service = new MentionsService(repo, dataSource, sentimentAnalysisService);
+
+    const result = await service.createIfNewAndClassify(makeInput());
+
+    // No flushPromises() needed here — unlike createIfNew's fire-and-forget, this call must have
+    // already awaited classify() before resolving.
+    expect(sentimentAnalysisService.classify).toHaveBeenCalledWith(inserted.title, inserted.text, inserted.url);
+    expect(result).toEqual({ result: 'inserted', sentiment: Sentiment.POSITIVE });
+  });
+
+  it('createIfNewAndClassify reads back the already-stored sentiment for a known (duplicate) mention instead of reclassifying it', async () => {
+    const existing = {
+      id: 'existing-1',
+      url: 'https://other.com/b',
+      reprints: [],
+      sentiment: Sentiment.NEGATIVE,
+    } as unknown as Mention;
+    const repo = {
+      findOne: jest
+        .fn()
+        // hash dedup lookup -> existing mention
+        .mockResolvedValueOnce(existing)
+        // findById() by the existing mention's id, not by anything from `input`
+        .mockResolvedValueOnce(existing),
+      update: jest.fn(async () => undefined),
+    } as unknown as Repository<Mention>;
+
+    const dataSource = { query: jest.fn(async () => []) } as unknown as DataSource;
+    const sentimentAnalysisService = {
+      classify: jest.fn(),
+    } as unknown as SentimentAnalysisService;
+    const service = new MentionsService(repo, dataSource, sentimentAnalysisService);
+
+    const result = await service.createIfNewAndClassify(makeInput({ hash: 'hash-1', url: 'https://example.com/a' }));
+
+    expect(result).toEqual({ result: 'duplicate', sentiment: Sentiment.NEGATIVE });
+    expect(sentimentAnalysisService.classify).not.toHaveBeenCalled();
+  });
+
+  it('createIfNewAndClassify falls back to Sentiment.UNDEFINED when OPENAI_API_KEY is not configured, without throwing', async () => {
+    const inserted = { id: 'new-id', title: 't', text: 'x', url: 'https://example.com/a', sentiment: Sentiment.UNDEFINED } as Mention;
+    const repo = {
+      findOne: jest.fn().mockResolvedValueOnce(null).mockResolvedValueOnce(inserted),
+      createQueryBuilder: jest.fn(() => ({
+        insert: () => ({
+          into: () => ({
+            values: () => ({ orIgnore: () => ({ execute: async () => ({ identifiers: [{ id: 'new-id' }] }) }) }),
+          }),
+        }),
+      })),
+      update: jest.fn(),
+    } as unknown as Repository<Mention>;
+
+    const dataSource = { query: jest.fn(async () => []) } as unknown as DataSource;
+    // No SentimentAnalysisService injected at all — mirrors the OPENAI_API_KEY-not-set case.
+    const service = new MentionsService(repo, dataSource);
+
+    const result = await service.createIfNewAndClassify(makeInput());
+
+    expect(result).toEqual({ result: 'inserted', sentiment: Sentiment.UNDEFINED });
+  });
+
   it('updateSentimentManually returns null when the mention does not exist', async () => {
     const repo = {
       createQueryBuilder: jest.fn(() => ({

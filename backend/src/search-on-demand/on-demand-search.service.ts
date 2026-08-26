@@ -12,6 +12,7 @@ import { Source, SourceKind } from '../sources/source.entity';
 import { MentionSourceType } from '../mentions/mention.entity';
 import { CollectedItem } from '../common/collector-run.util';
 import { Keyword } from '../keywords/keyword.entity';
+import { Sentiment } from '../mentions/mention.entity';
 
 export interface OnDemandSearchResultItem {
   title: string;
@@ -20,6 +21,13 @@ export interface OnDemandSearchResultItem {
   publishedAt: Date | null;
   /** 'new' = this run actually inserted it; 'known' = it (or a near-duplicate) already existed. */
   status: 'new' | 'known';
+  /**
+   * Real classified tone, not always "не определена": /search uses
+   * MentionsService.createIfNewAndClassify (awaits classification) instead of the fire-and-forget
+   * createIfNew used by background collection — see that method's comment for why this is safe
+   * only here.
+   */
+  sentiment: Sentiment;
 }
 
 export interface OnDemandSearchSummary {
@@ -152,7 +160,7 @@ export class OnDemandSearchService {
 
             const sourceLabel = item.sourceLabel || source.name || this.domainOf(item.url);
 
-            const result = await this.mentionsService.createIfNew({
+            const { result, sentiment } = await this.mentionsService.createIfNewAndClassify({
               title: item.title,
               text: item.text,
               url: item.url,
@@ -178,6 +186,7 @@ export class OnDemandSearchService {
               sourceLabel,
               publishedAt: item.publishedAt,
               status: result === 'inserted' ? 'new' : 'known',
+              sentiment,
             });
           }
         } catch (error) {

@@ -7,6 +7,7 @@ import { SettingsService } from '../../settings/settings.service';
 import { SourcesService } from '../../sources/sources.service';
 import { SourceStatus } from '../../sources/source.entity';
 import { OnDemandSearchService, OnDemandSearchSummary } from '../../search-on-demand/on-demand-search.service';
+import { formatSentiment } from '../../sentiment/sentiment-display.util';
 
 interface ChannelStatus {
   lastSuccessAt: Date | null;
@@ -264,7 +265,7 @@ export class TelegramBotService implements OnModuleInit {
         : 'дата не определена';
       const knownTag = item.status === 'known' ? ' (уже было известно ранее)' : '';
       return (
-        `${index + 1}. ${escapeHtml(item.title)}${knownTag}\n` +
+        `${index + 1}. ${formatSentiment(item.sentiment)} · ${escapeHtml(item.title)}${knownTag}\n` +
         `Источник: ${escapeHtml(item.sourceLabel)}\n` +
         `Дата: ${published}\n` +
         item.url

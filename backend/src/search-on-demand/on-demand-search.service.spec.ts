@@ -10,6 +10,7 @@ import { VkService } from '../collectors/social/vk.service';
 import { OpenAiWebSearchService } from '../collectors/social-search/openai-web-search.service';
 import { Source, SourceKind, SourceStatus } from '../sources/source.entity';
 import { CollectedItem } from '../common/collector-run.util';
+import { Sentiment } from '../mentions/mention.entity';
 
 function daysAgo(days: number): Date {
   return new Date(Date.now() - days * 24 * 60 * 60 * 1000);
@@ -93,7 +94,9 @@ describe('OnDemandSearchService (/search command)', () => {
   it('applies the period cutoff best-effort: drops an item older than the window, keeps a recent one', async () => {
     const source = makeSource({ id: 'rss-1', type: SourceKind.RSS });
     const sourcesService = makeSourcesService({ [SourceKind.RSS]: [source] });
-    const mentionsService = { createIfNew: jest.fn(async () => 'inserted') } as unknown as MentionsService;
+    const mentionsService = {
+      createIfNewAndClassify: jest.fn(async () => ({ result: 'inserted', sentiment: Sentiment.UNDEFINED })),
+    } as unknown as MentionsService;
     const stubs = makeCollectorStubs({
       rss: [
         item({ hash: 'old', publishedAt: daysAgo(30), url: 'https://example.com/old' }),
@@ -105,13 +108,15 @@ describe('OnDemandSearchService (/search command)', () => {
 
     expect(summary.totalMatched).toBe(1);
     expect(summary.items[0].url).toBe('https://example.com/recent');
-    expect(mentionsService.createIfNew).toHaveBeenCalledTimes(1);
+    expect(mentionsService.createIfNewAndClassify).toHaveBeenCalledTimes(1);
   });
 
   it('keeps items with no publishedAt regardless of period (web search never returns a date)', async () => {
     const source = makeSource({ id: 'ws-1', type: SourceKind.SOCIAL_SEARCH_API, url: 'openai-search://web' });
     const sourcesService = makeSourcesService({ [SourceKind.SOCIAL_SEARCH_API]: [source] });
-    const mentionsService = { createIfNew: jest.fn(async () => 'inserted') } as unknown as MentionsService;
+    const mentionsService = {
+      createIfNewAndClassify: jest.fn(async () => ({ result: 'inserted', sentiment: Sentiment.UNDEFINED })),
+    } as unknown as MentionsService;
     const stubs = makeCollectorStubs({
       webSearch: [item({ hash: 'w1', publishedAt: null, url: 'https://kz-forum.example/1', sourceLabel: 'kz-forum.example' })],
     });
@@ -125,7 +130,9 @@ describe('OnDemandSearchService (/search command)', () => {
   it('counts exactly one OpenAI web search call per /search run regardless of period length', async () => {
     const source = makeSource({ id: 'ws-1', type: SourceKind.SOCIAL_SEARCH_API, url: 'openai-search://web' });
     const sourcesService = makeSourcesService({ [SourceKind.SOCIAL_SEARCH_API]: [source] });
-    const mentionsService = { createIfNew: jest.fn(async () => 'inserted') } as unknown as MentionsService;
+    const mentionsService = {
+      createIfNewAndClassify: jest.fn(async () => ({ result: 'inserted', sentiment: Sentiment.UNDEFINED })),
+    } as unknown as MentionsService;
     const stubs = makeCollectorStubs({ webSearch: [] });
 
     const summaryShort = await makeService(sourcesService, mentionsService, stubs).runSearch(1);
@@ -135,14 +142,14 @@ describe('OnDemandSearchService (/search command)', () => {
     expect(summaryLong.openAiWebSearchCalls).toBe(1);
   });
 
-  it('marks items as "known" vs "new" based on MentionsService.createIfNew, without dropping already-known items from the summary', async () => {
+  it('marks items as "known" vs "new" based on MentionsService.createIfNewAndClassify, without dropping already-known items from the summary', async () => {
     const source = makeSource({ id: 'rss-1', type: SourceKind.RSS });
     const sourcesService = makeSourcesService({ [SourceKind.RSS]: [source] });
     const mentionsService = {
-      createIfNew: jest
+      createIfNewAndClassify: jest
         .fn()
-        .mockResolvedValueOnce('inserted')
-        .mockResolvedValueOnce('duplicate'),
+        .mockResolvedValueOnce({ result: 'inserted', sentiment: Sentiment.POSITIVE })
+        .mockResolvedValueOnce({ result: 'duplicate', sentiment: Sentiment.NEGATIVE }),
     } as unknown as MentionsService;
     const stubs = makeCollectorStubs({
       rss: [
@@ -157,13 +164,33 @@ describe('OnDemandSearchService (/search command)', () => {
     expect(summary.newCount).toBe(1);
     expect(summary.knownCount).toBe(1);
     expect(summary.items.map((i) => i.status)).toEqual(['new', 'known']);
+    expect(summary.items.map((i) => i.sentiment)).toEqual([Sentiment.POSITIVE, Sentiment.NEGATIVE]);
+  });
+
+  it('uses MentionsService.createIfNewAndClassify (awaits classification) rather than createIfNew (fire-and-forget), so the real sentiment reaches the summary', async () => {
+    const source = makeSource({ id: 'rss-1', type: SourceKind.RSS });
+    const sourcesService = makeSourcesService({ [SourceKind.RSS]: [source] });
+    const mentionsService = {
+      createIfNewAndClassify: jest.fn(async () => ({ result: 'inserted', sentiment: Sentiment.NEUTRAL })),
+      createIfNew: jest.fn(async () => {
+        throw new Error('runSearch must not call the fire-and-forget createIfNew');
+      }),
+    } as unknown as MentionsService;
+    const stubs = makeCollectorStubs({ rss: [item({ hash: 'a' })] });
+
+    const summary = await makeService(sourcesService, mentionsService, stubs).runSearch(7);
+
+    expect(summary.items[0].sentiment).toBe(Sentiment.NEUTRAL);
+    expect(mentionsService.createIfNew).not.toHaveBeenCalled();
   });
 
   it('isolates a failing source: keeps results from the other sources/channels and reports the failure', async () => {
     const rssOk = makeSource({ id: 'rss-ok', type: SourceKind.RSS, url: 'https://ok.example/rss' });
     const rssBroken = makeSource({ id: 'rss-broken', type: SourceKind.RSS, url: 'https://broken.example/rss' });
     const sourcesService = makeSourcesService({ [SourceKind.RSS]: [rssOk, rssBroken] });
-    const mentionsService = { createIfNew: jest.fn(async () => 'inserted') } as unknown as MentionsService;
+    const mentionsService = {
+      createIfNewAndClassify: jest.fn(async () => ({ result: 'inserted', sentiment: Sentiment.UNDEFINED })),
+    } as unknown as MentionsService;
     const stubs = makeCollectorStubs({});
     (stubs.rssService.fetchFeed as jest.Mock).mockImplementation(async (url: string) => {
       if (url === 'https://broken.example/rss') {
@@ -186,7 +213,9 @@ describe('OnDemandSearchService (/search command)', () => {
       [SourceKind.RSS]: [rssSource],
       [SourceKind.SOCIAL_SEARCH_API]: [wsSource],
     });
-    const mentionsService = { createIfNew: jest.fn(async () => 'inserted') } as unknown as MentionsService;
+    const mentionsService = {
+      createIfNewAndClassify: jest.fn(async () => ({ result: 'inserted', sentiment: Sentiment.UNDEFINED })),
+    } as unknown as MentionsService;
     const stubs = makeCollectorStubs({
       rss: [item({ hash: 'rss-item' })],
       webSearch: [item({ hash: 'ws-item', sourceLabel: 'forum.example' })],
@@ -194,7 +223,7 @@ describe('OnDemandSearchService (/search command)', () => {
 
     await makeService(sourcesService, mentionsService, stubs).runSearch(7);
 
-    const calls = (mentionsService.createIfNew as jest.Mock).mock.calls.map((c) => c[0]);
+    const calls = (mentionsService.createIfNewAndClassify as jest.Mock).mock.calls.map((c) => c[0]);
     const rssCall = calls.find((c) => c.hash === 'rss-item');
     const wsCall = calls.find((c) => c.hash === 'ws-item');
     expect(rssCall.skipDedup).toBeUndefined();
@@ -204,7 +233,9 @@ describe('OnDemandSearchService (/search command)', () => {
   it('filters out items that do not match any active required/exact_phrase keyword', async () => {
     const source = makeSource({ id: 'rss-1', type: SourceKind.RSS });
     const sourcesService = makeSourcesService({ [SourceKind.RSS]: [source] });
-    const mentionsService = { createIfNew: jest.fn(async () => 'inserted') } as unknown as MentionsService;
+    const mentionsService = {
+      createIfNewAndClassify: jest.fn(async () => ({ result: 'inserted', sentiment: Sentiment.UNDEFINED })),
+    } as unknown as MentionsService;
     const stubs = makeCollectorStubs({ rss: [item({ hash: 'unrelated' })] });
     const set = { match: jest.fn(async () => ({ matched: false, matchedKeywords: [] })) };
     const keywordsService = {
@@ -215,6 +246,6 @@ describe('OnDemandSearchService (/search command)', () => {
     const summary = await makeService(sourcesService, mentionsService, stubs, keywordsService).runSearch(7);
 
     expect(summary.totalMatched).toBe(0);
-    expect(mentionsService.createIfNew).not.toHaveBeenCalled();
+    expect(mentionsService.createIfNewAndClassify).not.toHaveBeenCalled();
   });
 });
