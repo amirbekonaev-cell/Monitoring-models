@@ -190,7 +190,7 @@ describe('TelegramBotService', () => {
     expect(ctx.reply).toHaveBeenCalledWith('Эта команда доступна только в рабочей группе мониторинга.');
   });
 
-  it('/search from the configured group chat shows the 9 period buttons', async () => {
+  it('/search from the configured group chat shows the 5 period buttons, capped at a month', async () => {
     await boot('-1001');
     const ctx = makeCtx('-1001');
 
@@ -199,9 +199,9 @@ describe('TelegramBotService', () => {
     expect(ctx.reply).toHaveBeenCalled();
     const [, extra] = (ctx.reply as jest.Mock).mock.calls[0];
     const buttons = extra.reply_markup.inline_keyboard.flat();
-    expect(buttons).toHaveLength(9);
+    expect(buttons).toHaveLength(5);
     expect(buttons.map((b: any) => b.callback_data)).toEqual(
-      expect.arrayContaining(['search_period:1', 'search_period:365']),
+      expect.arrayContaining(['search_period:1', 'search_period:30']),
     );
   });
 

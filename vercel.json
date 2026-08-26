@@ -1,7 +1,7 @@
 {
   "functions": {
     "backend/**": {
-      "maxDuration": 300
+      "maxDuration": 60
     }
   }
 }

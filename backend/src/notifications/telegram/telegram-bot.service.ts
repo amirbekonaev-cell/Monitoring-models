@@ -20,16 +20,18 @@ interface SearchPeriodOption {
   label: string;
 }
 
+// Capped at "Месяц" (30 дней): the backend runs on Vercel's Hobby plan, which hard-caps every
+// function invocation at 60s regardless of vercel.json's maxDuration — a longer period (Полгода/
+// Год) sequentially queries every source plus a per-new-item OpenAI sentiment call and reliably
+// blows past that limit, silently killing the request with no reply at all (confirmed live: a
+// "Год" search left the chat with no response for 10+ minutes). Raise this back once the project
+// is on a plan where maxDuration=300 in vercel.json actually applies.
 const SEARCH_PERIOD_OPTIONS: SearchPeriodOption[] = [
   { days: 1, label: 'Сутки' },
   { days: 3, label: '3 дня' },
   { days: 7, label: 'Неделя' },
   { days: 14, label: 'Две недели' },
   { days: 30, label: 'Месяц' },
-  { days: 60, label: 'Два месяца' },
-  { days: 90, label: 'Три месяца' },
-  { days: 180, label: 'Полгода' },
-  { days: 365, label: 'Год' },
 ];
 
 const SEARCH_MESSAGE_CHAR_LIMIT = 3500;
