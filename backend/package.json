@@ -12,9 +12,11 @@
     "migration:generate": "npm run typeorm -- migration:generate",
     "seed": "ts-node -r tsconfig-paths/register src/seed/seed-sources.ts",
     "seed:keywords": "ts-node -r tsconfig-paths/register src/seed/seed-keywords.ts",
+    "seed:minus-keywords": "ts-node -r tsconfig-paths/register src/seed/seed-minus-keywords.ts",
     "get-chat-id": "ts-node -r tsconfig-paths/register src/scripts/get-chat-id.ts",
     "import-sources": "ts-node -r tsconfig-paths/register src/scripts/import-sources.ts",
     "classify-sentiment-backfill": "ts-node -r tsconfig-paths/register src/scripts/classify-sentiment-backfill.ts",
+    "cleanup-mentions": "ts-node -r tsconfig-paths/register src/scripts/cleanup-unrelated-mentions.ts",
     "set-webhook": "ts-node -r tsconfig-paths/register src/scripts/set-webhook.ts",
     "test": "jest",
     "test:watch": "jest --watch"
