@@ -13,6 +13,7 @@ import { MentionSourceType } from '../mentions/mention.entity';
 import { CollectedItem } from '../common/collector-run.util';
 import { Keyword } from '../keywords/keyword.entity';
 import { Sentiment } from '../mentions/mention.entity';
+import { fetchRssWithDeepScan } from '../collectors/rss/rss-deep-scan.util';
 
 export interface OnDemandSearchResultItem {
   title: string;
@@ -95,7 +96,17 @@ export class OnDemandSearchService {
         channelName: 'RSS',
         kind: SourceKind.RSS,
         sourceType: MentionSourceType.NEWS,
-        fetchItems: (source) => this.rssService.fetchFeed(source.url),
+        // RSS on its own only ever surfaces a feed's last N items (see CLAUDE.md task on RSS
+        // backfill depth) — layer the throttled sitemap/HTML-pagination deep pass on top so
+        // material that already scrolled out of the feed still gets picked up periodically.
+        fetchItems: (source) =>
+          fetchRssWithDeepScan({
+            source,
+            logger: this.logger,
+            rssService: this.rssService,
+            parserService: this.parserService,
+            sourcesService: this.sourcesService,
+          }),
       },
       {
         channelName: 'Parser',

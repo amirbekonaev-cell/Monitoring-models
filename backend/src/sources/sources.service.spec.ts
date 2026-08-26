@@ -17,3 +17,14 @@ describe('SourcesService.findActiveByType', () => {
     });
   });
 });
+
+describe('SourcesService.markDeepScanDone', () => {
+  it('stamps last_deep_scan_at with the current time, separately from last_success_at', async () => {
+    const repo = { update: jest.fn(async () => undefined) } as unknown as Repository<Source>;
+    const service = new SourcesService(repo);
+
+    await service.markDeepScanDone('src-1');
+
+    expect(repo.update).toHaveBeenCalledWith('src-1', { lastDeepScanAt: expect.any(Date) });
+  });
+});

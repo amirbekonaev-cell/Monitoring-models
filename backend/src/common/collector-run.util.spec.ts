@@ -15,6 +15,7 @@ function makeSource(sourceType: SourceKind, lastSuccessAt: Date | null = new Dat
     type: sourceType,
     status: SourceStatus.ACTIVE,
     lastSuccessAt,
+    lastDeepScanAt: null,
     lastError: null,
     createdBy: null,
     createdAt: new Date(),

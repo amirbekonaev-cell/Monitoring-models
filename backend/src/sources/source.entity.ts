@@ -36,6 +36,10 @@ export class Source {
   @Column({ name: 'last_success_at', type: 'timestamptz', nullable: true })
   lastSuccessAt: Date | null;
 
+  /** Last time this source went through the additional sitemap/HTML-pagination deep pass — see fetchRssWithDeepScan. */
+  @Column({ name: 'last_deep_scan_at', type: 'timestamptz', nullable: true })
+  lastDeepScanAt: Date | null;
+
   @Column({ name: 'last_error', type: 'text', nullable: true })
   lastError: string | null;
 

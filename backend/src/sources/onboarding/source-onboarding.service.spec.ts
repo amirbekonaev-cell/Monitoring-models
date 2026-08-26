@@ -58,6 +58,7 @@ describe('SourceOnboardingService', () => {
       type: SourceKind.RSS,
       status: SourceStatus.ACTIVE,
       lastSuccessAt: null,
+      lastDeepScanAt: null,
       lastError: null,
       createdBy: 'import-script',
       createdAt: new Date(),
@@ -73,6 +74,7 @@ describe('SourceOnboardingService', () => {
       findById: jest.fn(async () => ({ ...createdSource, lastSuccessAt: new Date(), lastError: null })),
       markSuccess: jest.fn(async () => undefined),
       markError: jest.fn(async () => undefined),
+      markDeepScanDone: jest.fn(async () => undefined),
     } as unknown as SourcesService;
     const mentionsService = {
       createIfNew: jest.fn(async () => 'inserted'),
@@ -82,6 +84,15 @@ describe('SourceOnboardingService', () => {
         { title: 'A', text: 'text', url: 'https://news.example/a', publishedAt: null, hash: 'h1' },
       ]),
     } as unknown as RssService;
+    // A brand-new source's first cycle also triggers the one-time sitemap/HTML-pagination
+    // backfill deep pass (see rss-deep-scan.util.ts) — stub it to a no-op so this test stays
+    // focused on the plain RSS path; deep-scan behavior itself is covered in
+    // rss-deep-scan.util.spec.ts.
+    const parserService = {
+      deepCollect: jest.fn(async () => []),
+      getBackfillMaxPages: jest.fn(() => 25),
+      getDefaultMaxPages: jest.fn(() => 5),
+    } as unknown as ParserService;
 
     const service = new SourceOnboardingService(
       detectService,
@@ -91,7 +102,7 @@ describe('SourceOnboardingService', () => {
       makeSettingsService(),
       rssService,
       {} as TelegramService,
-      {} as ParserService,
+      parserService,
       makePassthroughDomainExclusionService(),
     );
 
@@ -113,6 +124,7 @@ describe('SourceOnboardingService', () => {
       type: SourceKind.PARSER,
       status: SourceStatus.ACTIVE,
       lastSuccessAt: null,
+      lastDeepScanAt: null,
       lastError: null,
       createdBy: 'import-script',
       createdAt: new Date(),
@@ -161,6 +173,7 @@ describe('SourceOnboardingService', () => {
       type: SourceKind.RSS,
       status: SourceStatus.ACTIVE,
       lastSuccessAt: null,
+      lastDeepScanAt: null,
       lastError: null,
       createdBy: 'admin',
       createdAt: new Date(),

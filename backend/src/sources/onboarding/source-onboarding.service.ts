@@ -11,6 +11,7 @@ import { Source, SourceKind } from '../source.entity';
 import { MentionSourceType } from '../../mentions/mention.entity';
 import { runCollectionCycle } from '../../common/collector-run.util';
 import { DomainExclusionService } from '../../common/domain-exclusion.service';
+import { fetchRssWithDeepScan } from '../../collectors/rss/rss-deep-scan.util';
 
 const SOURCE_TYPE_TO_MENTION_TYPE: Record<SourceKind, MentionSourceType> = {
   [SourceKind.RSS]: MentionSourceType.NEWS,
@@ -91,7 +92,7 @@ export class SourceOnboardingService {
       keywordsService: this.keywordsService,
       settingsService: this.settingsService,
       sourceType: SOURCE_TYPE_TO_MENTION_TYPE[detection.type],
-      fetchItems: (s) => this.fetchByType(detection.type, s.url),
+      fetchItems: (s) => this.fetchByType(detection.type, s),
     });
 
     const refreshed = await this.sourcesService.findById(source.id);
@@ -130,14 +131,24 @@ export class SourceOnboardingService {
     };
   }
 
-  private fetchByType(type: SourceKind, url: string) {
+  private fetchByType(type: SourceKind, source: Source) {
     switch (type) {
+      // RSS on its own only ever surfaces a feed's last N items — layer the throttled sitemap/
+      // HTML-pagination deep pass on top so the source's one-time backfill (lastSuccessAt still
+      // null at this point, since this *is* that first cycle) actually reaches BACKFILL_DAYS back,
+      // not just however far the feed itself happens to go. See rss-deep-scan.util.ts.
       case SourceKind.RSS:
-        return this.rssService.fetchFeed(url);
+        return fetchRssWithDeepScan({
+          source,
+          logger: this.logger,
+          rssService: this.rssService,
+          parserService: this.parserService,
+          sourcesService: this.sourcesService,
+        });
       case SourceKind.TELEGRAM:
-        return this.telegramService.fetchChannel(url);
+        return this.telegramService.fetchChannel(source.url);
       case SourceKind.PARSER:
-        return this.parserService.fetchPage(url);
+        return this.parserService.fetchPage(source.url);
       default:
         throw new Error(`Добавление источника по ссылке не поддерживается для типа ${type}`);
     }

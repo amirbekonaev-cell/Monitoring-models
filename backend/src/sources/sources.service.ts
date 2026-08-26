@@ -68,6 +68,11 @@ export class SourcesService {
     });
   }
 
+  /** Records that the sitemap/HTML-pagination deep pass just completed — see fetchRssWithDeepScan. */
+  async markDeepScanDone(id: string): Promise<void> {
+    await this.sourcesRepo.update(id, { lastDeepScanAt: new Date() });
+  }
+
   /**
    * Some channels (К-1 search API) aren't "one row per link" like RSS/Telegram/parser —
    * there's one global search config. This makes sure exactly one such source row exists

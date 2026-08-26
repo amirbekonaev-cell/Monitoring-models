@@ -24,6 +24,9 @@ function makeSource(overrides: Partial<Source> = {}): Source {
     type: SourceKind.RSS,
     status: SourceStatus.ACTIVE,
     lastSuccessAt: new Date(),
+    // Recently deep-scanned by default so unrelated tests don't incidentally trigger the
+    // sitemap/HTML-pagination deep pass — that behavior is covered in rss-deep-scan.util.spec.ts.
+    lastDeepScanAt: new Date(),
     lastError: null,
     createdBy: null,
     createdAt: new Date(),
@@ -38,6 +41,7 @@ function makeSourcesService(byKind: Partial<Record<SourceKind, Source[]>>): Sour
     findActiveByType: jest.fn(async (kind: SourceKind) => byKind[kind] ?? []),
     markSuccess: jest.fn(async () => undefined),
     markError: jest.fn(async () => undefined),
+    markDeepScanDone: jest.fn(async () => undefined),
   } as unknown as SourcesService;
 }
 
@@ -63,7 +67,12 @@ function makeCollectorStubs(overrides: {
 }) {
   return {
     rssService: { fetchFeed: jest.fn(async () => overrides.rss ?? []) } as unknown as RssService,
-    parserService: { fetchPage: jest.fn(async () => overrides.parser ?? []) } as unknown as ParserService,
+    parserService: {
+      fetchPage: jest.fn(async () => overrides.parser ?? []),
+      deepCollect: jest.fn(async () => []),
+      getBackfillMaxPages: jest.fn(() => 25),
+      getDefaultMaxPages: jest.fn(() => 5),
+    } as unknown as ParserService,
     telegramService: { fetchChannel: jest.fn(async () => overrides.telegram ?? []) } as unknown as TelegramService,
     newsApiService: { search: jest.fn(async () => overrides.newsApi ?? []) } as unknown as NewsApiService,
     vkService: { search: jest.fn(async () => overrides.vk ?? []) } as unknown as VkService,
