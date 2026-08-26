@@ -147,6 +147,10 @@ export class OnDemandSearchService {
           if (channel.kind === SourceKind.SOCIAL_SEARCH_API) {
             openAiWebSearchCalls += 1;
           }
+          // /search is now the only thing that ever polls a source (background collection was
+          // removed for the Vercel deploy — see README "Деплой на Vercel"), so this is the only
+          // place left that can keep "Источники"'s last-success/status columns truthful.
+          await this.sourcesService.markSuccess(source.id);
 
           for (const item of fetched) {
             if (item.publishedAt && item.publishedAt < cutoff) {
@@ -191,8 +195,10 @@ export class OnDemandSearchService {
           }
         } catch (error) {
           const label = source.name || source.url;
-          sourcesFailed.push({ label, error: describeError(error) });
-          this.logger.error(`/search: источник "${label}" (${channel.channelName}) завершился ошибкой: ${describeError(error)}`);
+          const message = describeError(error);
+          sourcesFailed.push({ label, error: message });
+          await this.sourcesService.markError(source.id, message);
+          this.logger.error(`/search: источник "${label}" (${channel.channelName}) завершился ошибкой: ${message}`);
         }
       }
     }

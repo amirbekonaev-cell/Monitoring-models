@@ -36,6 +36,8 @@ function makeSource(overrides: Partial<Source> = {}): Source {
 function makeSourcesService(byKind: Partial<Record<SourceKind, Source[]>>): SourcesService {
   return {
     findActiveByType: jest.fn(async (kind: SourceKind) => byKind[kind] ?? []),
+    markSuccess: jest.fn(async () => undefined),
+    markError: jest.fn(async () => undefined),
   } as unknown as SourcesService;
 }
 
@@ -204,6 +206,8 @@ describe('OnDemandSearchService (/search command)', () => {
     expect(summary.totalMatched).toBe(1);
     expect(summary.sourcesFailed).toHaveLength(1);
     expect(summary.sourcesFailed[0].error).toBe('network timeout');
+    expect(sourcesService.markSuccess).toHaveBeenCalledWith('rss-ok');
+    expect(sourcesService.markError).toHaveBeenCalledWith('rss-broken', 'network timeout');
   });
 
   it('passes skipDedup: true only for the OpenAI web search channel, never for RSS', async () => {
