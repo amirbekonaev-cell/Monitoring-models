@@ -28,6 +28,15 @@ describe('cleanup-unrelated-mentions: containsFalsePositiveTerm', () => {
       false,
     );
   });
+
+  it('matches the English form "astana" — the Cyrillic stem does not cover Latin-script sources', () => {
+    expect(containsFalsePositiveTerm({ title: 'astana_hub - Цифровой технопарк', text: '' }, 'astana')).toBe(true);
+  });
+
+  it('matches "medical"/"medication" via the truncated English "medic" stem', () => {
+    expect(containsFalsePositiveTerm({ title: '', text: 'a new medical technology hub' }, 'medic')).toBe(true);
+    expect(containsFalsePositiveTerm({ title: 'Free medication for students', text: '' }, 'medic')).toBe(true);
+  });
 });
 
 describe('cleanup-unrelated-mentions: isBrandKeyword', () => {

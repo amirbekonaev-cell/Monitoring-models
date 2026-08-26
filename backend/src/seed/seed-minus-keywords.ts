@@ -13,10 +13,20 @@
  * because FTS turned out unreliable for exactly these two words on this project's real data:
  * `to_tsvector('russian', 'в Астане...') @@ plainto_tsquery('russian', 'Астана')` is false (misses
  * the prepositional case), and same for 'медицинская' against 'медицина' (misses the adjective
- * form). manualForms carries the truncated stem ("Астан"/"медицин", not the full word) — matching
- * cleanup-unrelated-mentions.ts's FALSE_POSITIVE_TERMS and the task's own "медицин%ловит
+ * form). manualForms carries the truncated Cyrillic stem ("Астан"/"медицин", not the full word) —
+ * matching cleanup-unrelated-mentions.ts's FALSE_POSITIVE_TERMS and the task's own "медицин%ловит
  * медицина/медицинский одним LIKE" hint — since Kazakh case suffixes append after the stem and
- * Russian declension of "Астана" only ever changes the final vowel, never the truncated stem.
+ * Russian declension of "Астана" only ever changes the final vowel, never the truncated stem. Also
+ * carries an English form for each ("Astana"/"medic") — real collected data includes English-
+ * language sources (e.g. astanahub.com, "Al-Sana in Kazakhstani universities"), and neither
+ * Cyrillic stem matches Latin script at all. "Astana" doesn't decline in English, so no truncation
+ * needed there; "medic" (not "medicine") is truncated the same way as the Cyrillic stem, to also
+ * catch "medical"/"medication"/"biomedical".
+ *
+ * Idempotent on manualForms too, not just on the row's existence: an existing row is updated with
+ * any form from MINUS_KEYWORDS it doesn't already have (e.g. re-running after English forms were
+ * added here backfills them onto a row created by an earlier version of this script), rather than
+ * silently skipping and leaving it stale.
  *
  * Usage: npm run seed:minus-keywords
  */
@@ -24,8 +34,8 @@ import { AppDataSource } from '../database/data-source';
 import { Keyword, KeywordType } from '../keywords/keyword.entity';
 
 const MINUS_KEYWORDS: Array<{ phrase: string; language: string; manualForms: string[] }> = [
-  { phrase: 'Астана', language: 'ru', manualForms: ['Астан'] },
-  { phrase: 'медицина', language: 'ru', manualForms: ['медицин'] },
+  { phrase: 'Астана', language: 'ru', manualForms: ['Астан', 'Astana'] },
+  { phrase: 'медицина', language: 'ru', manualForms: ['медицин', 'medic'] },
 ];
 
 async function run(): Promise<void> {
@@ -35,7 +45,13 @@ async function run(): Promise<void> {
   for (const seed of MINUS_KEYWORDS) {
     const existing = await repo.findOne({ where: { phrase: seed.phrase, type: KeywordType.MINUS } });
     if (existing) {
-      console.log(`skip (already exists): ${seed.phrase} (minus)`);
+      const missingForms = seed.manualForms.filter((form) => !existing.manualForms.includes(form));
+      if (missingForms.length === 0) {
+        console.log(`skip (already exists, forms up to date): ${seed.phrase} (minus)`);
+        continue;
+      }
+      await repo.update(existing.id, { manualForms: [...existing.manualForms, ...missingForms] });
+      console.log(`updated minus keyword: ${seed.phrase} (added forms: ${missingForms.join(', ')})`);
       continue;
     }
     await repo.save(

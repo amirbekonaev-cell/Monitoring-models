@@ -29,7 +29,14 @@ const SAMPLE_SIZE = 5;
 // data: the full word "%астана%" catches 51 rows; the truncated stem "%астан%" below catches 102 —
 // every one of the extra 51 checked manually and is a genuine Astana-city false positive (traffic,
 // weather, elections, the Astana cycling team, astana_hub, Astana.kz), none of them QazCloud.
-export const FALSE_POSITIVE_TERMS = ['астан', 'медицин'];
+//
+// Also includes an English form of each — neither Cyrillic stem matches Latin script at all, and
+// production has real English-language false positives ("astana_hub", "Al-Sana in Kazakhstani
+// universities" whose text mentions "medicine"/"medical"). "Astana" doesn't decline in English, so
+// no truncation needed; "medic" (not "medicine") is truncated the same way, to also catch
+// "medical"/"medication"/"biomedical". Matches the manualForms seeded onto the MINUS keywords in
+// seed-minus-keywords.ts — keep the two in sync.
+export const FALSE_POSITIVE_TERMS = ['астан', 'медицин', 'astana', 'medic'];
 
 export function containsFalsePositiveTerm(mention: Pick<Mention, 'title' | 'text'>, term: string): boolean {
   const haystack = `${mention.title}\n${mention.text}`.toLowerCase();
