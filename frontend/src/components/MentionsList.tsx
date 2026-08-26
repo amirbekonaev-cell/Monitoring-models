@@ -15,7 +15,7 @@ const SENTIMENT_LABEL: Record<string, string> = {
 const SENTIMENT_COLOR: Record<string, string> = {
   positive: '#2e7d32',
   negative: '#c62828',
-  neutral: '#9e9e9e',
+  neutral: '#f9a825',
   undefined: '#616161',
 };
 
