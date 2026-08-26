@@ -1,0 +1,55 @@
+# Список источников для scripts/import-sources.ts — один URL на строку.
+# Тип (RSS / универсальный парсер / Telegram) определяется автоматически по тому же
+# алгоритму, что и в форме "Добавить по ссылке" (см. README, раздел "Источники (US-2)").
+#
+# Строки, начинающиеся с "#", и пустые строки игнорируются.
+#
+# Когда появятся подобранные вручную Telegram-каналы (t.me/<channel>) или соцсети —
+# добавьте их отдельными строками ниже и попросите повторно запустить импорт:
+# npm run import-sources (из backend/, или через docker compose run --rm migrate).
+
+https://qazcloud.kz/
+https://bluescreen.kz/
+https://kz.kursiv.media/
+https://aikyn.kz/
+https://sknews.kz/
+https://rail-news.kz/
+
+https://skstore.kz/
+https://tiktok.com/
+https://the-tech.kz/
+https://liter.kz/
+https://digitalbusiness.kz/
+https://365info.kz/
+https://profit.kz/
+https://the-tenge.kz/
+https://dknews.kz/
+https://railways.kz/
+https://kokshetau.asia/
+https://inbusiness.kz/
+https://baq.kz/
+https://mordorintelligence.com/
+
+https://kpmg.com/
+https://qazaqpress.kz/
+https://infozakon.kz/
+https://vk.com/
+https://kyzylorda-news.kz/
+https://yujanka.kz/
+https://prodengi.kz/
+https://optimism.kz/
+https://aqmeshit-aptalygy.kz/
+https://ru.sputnik.kz/
+https://astanahub.com/
+https://www.bes.media/
+https://bizmedia.kz/
+https://its-world.kz/
+https://matritca.kz/
+https://astanatv.kz/
+https://linkedin.com/
+https://ekaraganda.kz/
+https://itsx.kz/
+https://qaz.infozakon.kz/
+https://sk.kz/
+https://baribar.kz/
+https://aleminform.kz/
