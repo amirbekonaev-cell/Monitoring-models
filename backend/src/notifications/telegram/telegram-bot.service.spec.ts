@@ -316,7 +316,7 @@ describe('TelegramBotService', () => {
     expect(message).toContain('новых упоминаний не найдено');
   });
 
-  it('acknowledges the button press and returns immediately, without waiting for the search to finish', async () => {
+  it('waits for the search to finish before the handler resolves, so the DB connection stays open for the whole search', async () => {
     let resolveSearch!: (summary: OnDemandSearchSummary) => void;
     const slowOnDemandSearchService = {
       runSearch: jest.fn(() => new Promise<OnDemandSearchSummary>((resolve) => (resolveSearch = resolve))),
@@ -324,12 +324,18 @@ describe('TelegramBotService', () => {
     await boot('-1001', slowOnDemandSearchService);
     const ctx = makeCtx('-1001');
 
-    // The handler itself must resolve right after acknowledging the button, even though
-    // runSearch() hasn't resolved yet — this is exactly what stops a slow/long search from
-    // ever tripping Telegraf's internal per-update handler timeout again.
-    await actionHandlers.get('/^search_period:(\\d+)$/')!(ctx);
+    // The handler must NOT resolve until runSearch() does — this deploy runs the backend as a
+    // Vercel "Container" function that tears down the process right after the webhook responds,
+    // so a fire-and-forget search used to get its DB connection killed mid-flight
+    // (TypeORM "Driver not Connected"). Awaiting here keeps the process alive for the whole search.
+    let handlerResolved = false;
+    const handlerPromise = actionHandlers.get('/^search_period:(\\d+)$/')!(ctx).then(() => {
+      handlerResolved = true;
+    });
+    await flushPromises();
 
     expect(ctx.answerCbQuery).toHaveBeenCalled();
+    expect(handlerResolved).toBe(false);
     expect(sendMessageMock).not.toHaveBeenCalled();
 
     resolveSearch({
@@ -341,8 +347,9 @@ describe('TelegramBotService', () => {
       sourcesFailed: [],
       openAiWebSearchCalls: 1,
     });
-    await flushPromises();
+    await handlerPromise;
 
+    expect(handlerResolved).toBe(true);
     expect(sendMessageMock).toHaveBeenCalled();
   });
 

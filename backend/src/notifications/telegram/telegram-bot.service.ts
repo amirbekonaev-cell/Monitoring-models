@@ -2,7 +2,6 @@ import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { Context, Markup, Telegraf } from 'telegraf';
 import { Update } from 'telegraf/types';
-import { waitUntil } from '@vercel/functions';
 import { SettingsService } from '../../settings/settings.service';
 import { SourcesService } from '../../sources/sources.service';
 import { SourceStatus } from '../../sources/source.entity';
@@ -199,23 +198,16 @@ export class TelegramBotService implements OnModuleInit {
         return;
       }
 
-      // Deliberately not awaited before responding to the webhook request: runSearch() can take
-      // minutes for a wide period (several channels queried sequentially), and Telegram expects a
-      // fast webhook ack, not a multi-minute HTTP response. On Vercel this alone isn't enough,
-      // though — see waitUntil() below.
-      //
-      // Why waitUntil() (@vercel/functions) and not "await runSearch() before responding, with a
-      // bigger vercel.json maxDuration": awaiting here would make the whole Express/Nest instance
-      // behind every route (including simple GET /mentions calls from the frontend) sit under
-      // whatever maxDuration a rare "Год" search needs — one stuck OpenAI/site call on /search
-      // would then tie up a function instance, and its billed duration, for that entire ceiling on
-      // an unrelated request path too. waitUntil() keeps the webhook response itself fast (matches
-      // what Telegram expects) while telling the Vercel runtime to keep *this* invocation alive
-      // until the promise below settles — still bounded by vercel.json's maxDuration (raise it for
-      // the long search periods, see README "Деплой на Vercel"), just without forcing every other
-      // route to pay for that same ceiling. Outside Vercel (local dev, docker-compose) it's a
-      // no-op wrapper that just runs the promise anyway.
-      waitUntil(this.runOnDemandSearchAndReport(ctx.telegram, chatId, days, label));
+      // Awaited before responding to the webhook request. Previously this ran via waitUntil()
+      // (@vercel/functions) as fire-and-forget, relying on the platform to keep the instance alive
+      // past the webhook response — but this deploy runs the backend as a Vercel "Container"
+      // function, which spins up a fresh process per request (see the full Nest bootstrap log on
+      // every single call) and tears it down right after the response is sent, regardless of
+      // waitUntil(). That killed the DB connection mid-search (TypeORM "Driver not Connected")
+      // before the background work could finish. Awaiting here keeps the process alive for the
+      // whole search — bounded by vercel.json's maxDuration (300s), same ceiling the old approach
+      // relied on anyway.
+      await this.runOnDemandSearchAndReport(ctx.telegram, chatId, days, label);
     });
   }
 
