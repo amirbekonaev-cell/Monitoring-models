@@ -264,6 +264,23 @@ describe('OnDemandSearchService (/search command)', () => {
     expect(mentionsService.createIfNewAndClassify).not.toHaveBeenCalled();
   });
 
+  it('bounds the RSS deep pass with a per-source time budget — regression test: an unbounded RSS deep pass previously ate the entire shared /search time budget by itself, timing out every other source in every channel', async () => {
+    const source = makeSource({ id: 'rss-1', type: SourceKind.RSS, lastSuccessAt: null, lastDeepScanAt: null });
+    const sourcesService = makeSourcesService({ [SourceKind.RSS]: [source] });
+    const mentionsService = {
+      createIfNewAndClassify: jest.fn(async () => ({ result: 'inserted', sentiment: Sentiment.UNDEFINED })),
+    } as unknown as MentionsService;
+    const stubs = makeCollectorStubs({ rss: [item({ hash: 'a' })] });
+
+    await makeService(sourcesService, mentionsService, stubs).runSearch(7);
+
+    expect(stubs.parserService.deepCollect).toHaveBeenCalledWith(
+      source.url,
+      expect.any(Date),
+      expect.objectContaining({ deadline: expect.any(Number), maxArticles: expect.any(Number), crawlDelayMs: expect.any(Number) }),
+    );
+  });
+
   it('routes PARSER sources through the sitemap/HTML-pagination deep pass (deepCollect), not the bare fetchPage() single-article fetch — see CLAUDE.md task on PARSER sources never crawling the real site', async () => {
     const source = makeSource({
       id: 'parser-1',

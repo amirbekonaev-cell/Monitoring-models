@@ -183,6 +183,11 @@ export class SourceOnboardingService {
           rssService: this.rssService,
           parserService: this.parserService,
           sourcesService: this.sourcesService,
+          // Same reasoning as the PARSER branch above: this HTTP request is also bound by
+          // Vercel's 60s Hobby cap, and an unbounded deep pass on a brand-new RSS source's first
+          // (full BACKFILL_DAYS) cycle can run long — see the incident note in
+          // rss-deep-scan.util.ts.
+          budget: { deadline: Date.now() + PARSER_ONBOARDING_TIME_BUDGET_MS },
         });
       case SourceKind.TELEGRAM:
         return this.telegramService.fetchChannel(source.url);

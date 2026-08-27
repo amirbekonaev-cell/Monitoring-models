@@ -2,7 +2,7 @@ import { Logger } from '@nestjs/common';
 import { Source } from '../../sources/source.entity';
 import { SourcesService } from '../../sources/sources.service';
 import { RssService } from './rss.service';
-import { ParserService } from '../parser/parser.service';
+import { ParserService, DeepScanBudget } from '../parser/parser.service';
 import { CollectedItem } from '../../common/collector-run.util';
 
 // How often we re-run the sitemap/HTML-pagination deep pass for a source that's already been
@@ -32,6 +32,15 @@ function getBackfillDays(): number {
  *
  * Used by both SourceOnboardingService (one-time test collection) and OnDemandSearchService
  * (/search) so the two never drift — same reasoning as runCollectionCycle.
+ *
+ * `budget` is optional and, unlike fetchParserWithDeepScan, has no default — omitting it means the
+ * deep pass runs unbounded, same as before this field existed. **Every caller inside /search must
+ * pass one.** A real incident confirmed why: with no budget here, a single RSS source that happened
+ * to be due for its deep scan (dozens of sequential HTTP fetches) silently ate the *entire*
+ * /search-wide SEARCH_TIME_BUDGET_MS by itself, before any other source — RSS, Parser, Telegram,
+ * NewsAPI, VK, even the OpenAI web search channel — got a turn, so every one of them showed up as
+ * "не удалось опросить" even though nothing was actually broken. See
+ * on-demand-search.service.ts and README "Бюджет времени /search".
  */
 export async function fetchRssWithDeepScan(params: {
   source: Source;
@@ -39,8 +48,9 @@ export async function fetchRssWithDeepScan(params: {
   rssService: RssService;
   parserService: ParserService;
   sourcesService: SourcesService;
+  budget?: DeepScanBudget;
 }): Promise<CollectedItem[]> {
-  const { source, logger, rssService, parserService, sourcesService } = params;
+  const { source, logger, rssService, parserService, sourcesService, budget } = params;
 
   const feedItems = await rssService.fetchFeed(source.url);
 
@@ -66,7 +76,10 @@ export async function fetchRssWithDeepScan(params: {
   const maxPages = isFullBackfillPass ? parserService.getBackfillMaxPages() : parserService.getDefaultMaxPages();
 
   try {
-    const { items: deepItems } = await parserService.deepCollect(source.url, cutoff, { fallbackMaxPages: maxPages });
+    const { items: deepItems } = await parserService.deepCollect(source.url, cutoff, {
+      fallbackMaxPages: maxPages,
+      ...budget,
+    });
     // Only recorded on a completed pass (even a zero-result one) — a thrown error below skips
     // this, so a transient failure gets retried on the next cycle instead of being throttled away.
     await sourcesService.markDeepScanDone(source.id);

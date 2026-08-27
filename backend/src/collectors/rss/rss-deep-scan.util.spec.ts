@@ -131,6 +131,35 @@ describe('fetchRssWithDeepScan', () => {
     expect(sourcesService.markDeepScanDone).not.toHaveBeenCalled();
   });
 
+  it('passes the budget (deadline/maxArticles/crawlDelayMs) straight through to deepCollect — regression test: an unbounded RSS deep pass previously ate the entire shared /search time budget by itself, timing out every other source', async () => {
+    const source = makeSource({ lastSuccessAt: null, lastDeepScanAt: null });
+    const rssService = { fetchFeed: jest.fn(async () => []) } as unknown as RssService;
+    const parserService = makeParserService();
+    const sourcesService = makeSourcesService();
+    const budget = { deadline: Date.now() + 5000, maxArticles: 3, crawlDelayMs: 100 };
+
+    await fetchRssWithDeepScan({ source, logger: new Logger('test'), rssService, parserService, sourcesService, budget });
+
+    expect(parserService.deepCollect).toHaveBeenCalledWith(source.url, expect.any(Date), expect.objectContaining(budget));
+  });
+
+  it('still runs the deep pass unbounded when budget is omitted (backward compatible — no caller outside /search is required to pass one)', async () => {
+    const source = makeSource({ lastSuccessAt: null, lastDeepScanAt: null });
+    const rssService = { fetchFeed: jest.fn(async () => []) } as unknown as RssService;
+    const parserService = makeParserService();
+    const sourcesService = makeSourcesService();
+
+    await fetchRssWithDeepScan({ source, logger: new Logger('test'), rssService, parserService, sourcesService });
+
+    expect(parserService.deepCollect).toHaveBeenCalledWith(
+      source.url,
+      expect.any(Date),
+      expect.objectContaining({ fallbackMaxPages: 25 }),
+    );
+    const passedOptions = (parserService.deepCollect as jest.Mock).mock.calls[0][2];
+    expect(passedOptions.deadline).toBeUndefined();
+  });
+
   it('propagates an RSS feed failure as-is (the fast path failing is a real source error, not something to swallow)', async () => {
     const source = makeSource();
     const rssService = {

@@ -23,21 +23,28 @@ import { fetchParserWithDeepScan } from '../collectors/parser/parser-deep-scan.u
 // sending the Telegram reply itself. See README "Бюджет времени /search".
 const SEARCH_TIME_BUDGET_MS = parseInt(process.env.SEARCH_TIME_BUDGET_MS || '45000', 10);
 
-// Per-source cap on the parser deep-scan pass (sitemap/HTML-pagination) specifically — several
-// PARSER sources can become "due" for their deep pass in the same /search call (see
-// fetchParserWithDeepScan's throttling), and one slow/huge site must not be able to eat the whole
-// SEARCH_TIME_BUDGET_MS on its own, starving every source queued up after it.
+// Per-source cap on the ParserService.deepCollect() sitemap/HTML-pagination pass — shared by BOTH
+// the RSS channel (RSS's deep pass on top of its feed) and the Parser channel (a PARSER source's
+// only path), since both ultimately call the exact same deepCollect(). Several sources of either
+// kind can become "due" for their deep pass in the same /search call, and one slow/huge site must
+// not be able to eat the whole SEARCH_TIME_BUDGET_MS on its own, starving every source queued up
+// after it — this was a real incident: with RSS's deep pass left unbounded, a single due RSS
+// source silently consumed the entire /search budget by itself before anything else got a turn,
+// making every other source (RSS, Parser, Telegram, NewsAPI, VK, OpenAI web search alike) show up
+// as "не удалось опросить" even though nothing was actually broken.
 const PARSER_SOURCE_TIME_BUDGET_MS = parseInt(process.env.PARSER_ONDEMAND_SOURCE_BUDGET_MS || '10000', 10);
 
-// Reduced article cap for the routine /search deep pass — PARSER_MAX_ARTICLES_PER_CRAWL/
-// PARSER_MAX_SITEMAP_ARTICLE_URLS (60 by default, see parser.service.ts) are sized for a one-time
-// backfill of a *single* source (onboarding's "Добавить по ссылке"), not for however many PARSER
-// sources happen to be due this /search call while sharing one time budget between them.
+// Reduced article cap for the routine /search deep pass (RSS's and Parser's alike) —
+// PARSER_MAX_ARTICLES_PER_CRAWL/PARSER_MAX_SITEMAP_ARTICLE_URLS (60 by default, see
+// parser.service.ts) are sized for a one-time backfill of a *single* source (onboarding's
+// «Добавить по ссылке»), not for however many sources happen to be due this /search call while
+// sharing one time budget between them.
 const PARSER_ONDEMAND_MAX_ARTICLES = parseInt(process.env.PARSER_ONDEMAND_MAX_ARTICLES || '15', 10);
 
 // Tighter (but still non-zero, to avoid hammering a site from a server IP) crawl delay for the
-// server-triggered /search pass — PARSER_CRAWL_DELAY_MS's polite 400ms default is fine for a
-// one-off onboarding crawl but adds up across several due sources sharing SEARCH_TIME_BUDGET_MS.
+// server-triggered /search pass (RSS's and Parser's deep pass alike) — PARSER_CRAWL_DELAY_MS's
+// polite 400ms default is fine for a one-off onboarding crawl but adds up across several due
+// sources sharing SEARCH_TIME_BUDGET_MS.
 const PARSER_ONDEMAND_CRAWL_DELAY_MS = parseInt(process.env.PARSER_ONDEMAND_CRAWL_DELAY_MS || '150', 10);
 
 const TIMEOUT_SKIP_MESSAGE =
@@ -132,6 +139,13 @@ export class OnDemandSearchService {
         // RSS on its own only ever surfaces a feed's last N items (see CLAUDE.md task on RSS
         // backfill depth) — layer the throttled sitemap/HTML-pagination deep pass on top so
         // material that already scrolled out of the feed still gets picked up periodically.
+        //
+        // budget is NOT optional here even though fetchRssWithDeepScan allows omitting it — see
+        // the incident note on that function. Reuses the exact same PARSER_ONDEMAND_* knobs as the
+        // Parser channel below (not separate RSS-specific ones): both ultimately call the same
+        // ParserService.deepCollect(), and RSS being first in `channels` means it's the one most
+        // likely to eat the whole budget if left unbounded — confirmed live (see README "Бюджет
+        // времени /search").
         fetchItems: (source) =>
           fetchRssWithDeepScan({
             source,
@@ -139,6 +153,11 @@ export class OnDemandSearchService {
             rssService: this.rssService,
             parserService: this.parserService,
             sourcesService: this.sourcesService,
+            budget: {
+              deadline: Math.min(deadline, Date.now() + PARSER_SOURCE_TIME_BUDGET_MS),
+              maxArticles: PARSER_ONDEMAND_MAX_ARTICLES,
+              crawlDelayMs: PARSER_ONDEMAND_CRAWL_DELAY_MS,
+            },
           }),
       },
       {
