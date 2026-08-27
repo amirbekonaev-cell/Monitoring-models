@@ -23,6 +23,22 @@ import { fetchParserWithDeepScan } from '../collectors/parser/parser-deep-scan.u
 // sending the Telegram reply itself. See README "Бюджет времени /search".
 const SEARCH_TIME_BUDGET_MS = parseInt(process.env.SEARCH_TIME_BUDGET_MS || '45000', 10);
 
+// Reserved sub-budget for the two deep-scan channels (RSS, Parser) combined — see the incident
+// note below. Telegram/NewsAPI/VK/OpenAI web search are all fast, single-call channels (no
+// sitemap/crawl involved) that would normally finish in well under a second each; without this
+// reservation, RSS+Parser working through a big backlog of "due" sources could burn the *entire*
+// SEARCH_TIME_BUDGET_MS before the loop ever reaches them, starving every one of those cheap
+// channels for no reason. Real incident: right after this feature's migration, every existing
+// source had last_deep_scan_at = NULL, so on the very first /search call after deploy *every*
+// source (RSS and Parser alike) was simultaneously "due" for its one-time full-BACKFILL_DAYS deep
+// pass — the shared budget could only fit a handful of them (~45s / up to 10s each), and every
+// channel queued up afterwards, deep-scan or not, got marked skipped-by-timeout. Capping RSS+Parser
+// to their own sub-budget guarantees the remaining ~15s always reach the cheap channels — it does
+// NOT fix the backlog itself (that drains gradually over several /search calls as processed
+// sources stop being "due" for RSS_DEEP_SCAN_INTERVAL_HOURS), but it stops one problem
+// (a deep-scan backlog) from masking an unrelated one (VK/NewsAPI/Telegram/OpenAI never running).
+const DEEP_SCAN_PHASE_BUDGET_MS = parseInt(process.env.SEARCH_DEEP_SCAN_PHASE_BUDGET_MS || '30000', 10);
+
 // Per-source cap on the ParserService.deepCollect() sitemap/HTML-pagination pass — shared by BOTH
 // the RSS channel (RSS's deep pass on top of its feed) and the Parser channel (a PARSER source's
 // only path), since both ultimately call the exact same deepCollect(). Several sources of either
@@ -84,6 +100,15 @@ interface ChannelSpec {
   fetchItems: (source: Source, keywords: Keyword[]) => Promise<CollectedItem[]>;
   /** See CreateMentionInput.skipDedup — only the consolidated OpenAI web search channel sets this. */
   skipDedup?: boolean;
+  /**
+   * RSS and Parser only — both can trigger ParserService.deepCollect() (sitemap/HTML-pagination),
+   * which is the only per-source work in /search slow enough to matter. Channels with this unset
+   * are checked against the full runSearch()-wide deadline; these two are checked against the
+   * tighter DEEP_SCAN_PHASE_BUDGET_MS instead, so a deep-scan backlog can never starve the fast,
+   * single-call channels (Telegram/NewsAPI/VK/OpenAI) queued up after them — see the incident note
+   * on DEEP_SCAN_PHASE_BUDGET_MS above.
+   */
+  isDeepScanChannel?: boolean;
 }
 
 function describeError(error: unknown): string {
@@ -126,6 +151,9 @@ export class OnDemandSearchService {
     // Hard deadline for this whole call — checked before every source, across every channel, not
     // just Parser's. See SEARCH_TIME_BUDGET_MS above and README "Бюджет времени /search".
     const deadline = startedAt + SEARCH_TIME_BUDGET_MS;
+    // Tighter deadline used only for the two deep-scan channels (RSS, Parser) — see
+    // DEEP_SCAN_PHASE_BUDGET_MS above. Never later than the overall deadline.
+    const deepScanPhaseDeadline = Math.min(deadline, startedAt + DEEP_SCAN_PHASE_BUDGET_MS);
 
     const activeKeywords = (await this.keywordsService.findAll()).filter((k) => k.isActive);
     const keywordSet = await this.keywordsService.loadActiveKeywordSet();
@@ -136,6 +164,7 @@ export class OnDemandSearchService {
         channelName: 'RSS',
         kind: SourceKind.RSS,
         sourceType: MentionSourceType.NEWS,
+        isDeepScanChannel: true,
         // RSS on its own only ever surfaces a feed's last N items (see CLAUDE.md task on RSS
         // backfill depth) — layer the throttled sitemap/HTML-pagination deep pass on top so
         // material that already scrolled out of the feed still gets picked up periodically.
@@ -154,7 +183,7 @@ export class OnDemandSearchService {
             parserService: this.parserService,
             sourcesService: this.sourcesService,
             budget: {
-              deadline: Math.min(deadline, Date.now() + PARSER_SOURCE_TIME_BUDGET_MS),
+              deadline: Math.min(deepScanPhaseDeadline, Date.now() + PARSER_SOURCE_TIME_BUDGET_MS),
               maxArticles: PARSER_ONDEMAND_MAX_ARTICLES,
               crawlDelayMs: PARSER_ONDEMAND_CRAWL_DELAY_MS,
             },
@@ -164,6 +193,7 @@ export class OnDemandSearchService {
         channelName: 'Parser',
         kind: SourceKind.PARSER,
         sourceType: MentionSourceType.OTHER,
+        isDeepScanChannel: true,
         // A PARSER source has no RSS feed at all (that's *why* it's PARSER, not RSS — see
         // source-detect.service.ts), so fetchPage() alone only ever parsed the source's own URL as
         // if it were a single article — no real article on the site was ever read. This layers the
@@ -178,7 +208,7 @@ export class OnDemandSearchService {
             parserService: this.parserService,
             sourcesService: this.sourcesService,
             budget: {
-              deadline: Math.min(deadline, Date.now() + PARSER_SOURCE_TIME_BUDGET_MS),
+              deadline: Math.min(deepScanPhaseDeadline, Date.now() + PARSER_SOURCE_TIME_BUDGET_MS),
               maxArticles: PARSER_ONDEMAND_MAX_ARTICLES,
               crawlDelayMs: PARSER_ONDEMAND_CRAWL_DELAY_MS,
             },
@@ -222,6 +252,10 @@ export class OnDemandSearchService {
 
     for (const channel of channels) {
       const sources = await this.sourcesService.findActiveByType(channel.kind);
+      // RSS/Parser get the tighter phase deadline (reserves time for the cheap channels below
+      // them); every other channel is checked against the full overall deadline — see
+      // DEEP_SCAN_PHASE_BUDGET_MS above.
+      const channelDeadline = channel.isDeepScanChannel ? deepScanPhaseDeadline : deadline;
 
       for (const source of sources) {
         // Checked before every single source, across every channel (not just Parser's deep scan)
@@ -229,7 +263,7 @@ export class OnDemandSearchService {
         // TelegramBotService.runOnDemandSearchAndReport), so an exhausted budget marks whatever's
         // left as skipped instead of continuing to run and risking Vercel killing the invocation
         // mid-request with no response at all — see README "Бюджет времени /search".
-        if (Date.now() >= deadline) {
+        if (Date.now() >= channelDeadline) {
           sourcesSkippedByTimeout += 1;
           const label = source.name || source.url;
           sourcesFailed.push({ label, error: TIMEOUT_SKIP_MESSAGE });

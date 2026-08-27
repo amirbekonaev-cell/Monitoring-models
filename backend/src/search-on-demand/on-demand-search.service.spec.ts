@@ -355,4 +355,37 @@ describe('OnDemandSearchService (/search command)', () => {
       dateNowSpy.mockRestore();
     }
   });
+
+  it('reserves time for the cheap channels (Telegram/NewsAPI/VK/OpenAI) even when RSS/Parser exhaust their own deep-scan phase budget — regression test for a real incident where a backlog of "due" RSS/Parser sources right after this feature deployed (every last_deep_scan_at was NULL) burned the entire /search budget, so even fast single-call channels queued up after them never ran at all', async () => {
+    // Simulated wall-clock: jumped forward past the (default 30s) deep-scan phase budget while
+    // "fetching" the RSS source, but still well inside the (default 45s) overall budget — the
+    // Telegram source queued up after RSS must still get processed.
+    let now = Date.now();
+    const dateNowSpy = jest.spyOn(Date, 'now').mockImplementation(() => now);
+
+    try {
+      const rssSource = makeSource({ id: 'rss-1', type: SourceKind.RSS, url: 'https://a.example/rss' });
+      const telegramSource = makeSource({ id: 'tg-1', type: SourceKind.TELEGRAM, url: 'https://t.me/s/example', name: 'TG' });
+      const sourcesService = makeSourcesService({
+        [SourceKind.RSS]: [rssSource],
+        [SourceKind.TELEGRAM]: [telegramSource],
+      });
+      const mentionsService = {
+        createIfNewAndClassify: jest.fn(async () => ({ result: 'inserted', sentiment: Sentiment.UNDEFINED })),
+      } as unknown as MentionsService;
+      const stubs = makeCollectorStubs({ telegram: [item({ hash: 'tg-item', url: 'https://t.me/example/1' })] });
+      (stubs.rssService.fetchFeed as jest.Mock).mockImplementation(async () => {
+        now += 31_000; // past the 30s deep-scan phase budget, but well under the 45s overall one
+        return [];
+      });
+
+      const summary = await makeService(sourcesService, mentionsService, stubs).runSearch(7);
+
+      expect(summary.sourcesFailed).toEqual([]); // RSS found nothing but wasn't skipped either
+      expect(summary.items.map((i) => i.url)).toEqual(['https://t.me/example/1']);
+      expect(stubs.telegramService.fetchChannel).toHaveBeenCalledWith(telegramSource.url);
+    } finally {
+      dateNowSpy.mockRestore();
+    }
+  });
 });
