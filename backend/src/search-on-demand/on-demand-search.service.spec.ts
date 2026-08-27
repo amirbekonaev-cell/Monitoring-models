@@ -68,8 +68,10 @@ function makeCollectorStubs(overrides: {
   return {
     rssService: { fetchFeed: jest.fn(async () => overrides.rss ?? []) } as unknown as RssService,
     parserService: {
+      // No longer called by the 'Parser' channel (see fetchParserWithDeepScan) — kept here only
+      // because ParserService's real shape includes it and other code casts against it.
       fetchPage: jest.fn(async () => overrides.parser ?? []),
-      deepCollect: jest.fn(async () => []),
+      deepCollect: jest.fn(async () => ({ items: overrides.parser ?? [], strategy: 'sitemap' })),
       getBackfillMaxPages: jest.fn(() => 25),
       getDefaultMaxPages: jest.fn(() => 5),
     } as unknown as ParserService,
@@ -260,5 +262,80 @@ describe('OnDemandSearchService (/search command)', () => {
 
     expect(summary.totalMatched).toBe(0);
     expect(mentionsService.createIfNewAndClassify).not.toHaveBeenCalled();
+  });
+
+  it('routes PARSER sources through the sitemap/HTML-pagination deep pass (deepCollect), not the bare fetchPage() single-article fetch — see CLAUDE.md task on PARSER sources never crawling the real site', async () => {
+    const source = makeSource({
+      id: 'parser-1',
+      type: SourceKind.PARSER,
+      url: 'https://sknews.example/',
+      lastSuccessAt: null,
+      lastDeepScanAt: null,
+    });
+    const sourcesService = makeSourcesService({ [SourceKind.PARSER]: [source] });
+    const mentionsService = {
+      createIfNewAndClassify: jest.fn(async () => ({ result: 'inserted', sentiment: Sentiment.UNDEFINED })),
+    } as unknown as MentionsService;
+    const stubs = makeCollectorStubs({ parser: [item({ hash: 'p1', url: 'https://sknews.example/article-1' })] });
+
+    const summary = await makeService(sourcesService, mentionsService, stubs).runSearch(7);
+
+    expect(stubs.parserService.deepCollect).toHaveBeenCalledTimes(1);
+    expect(stubs.parserService.fetchPage).not.toHaveBeenCalled();
+    expect(summary.items.map((i) => i.url)).toEqual(['https://sknews.example/article-1']);
+    expect(sourcesService.markDeepScanDone).toHaveBeenCalledWith('parser-1');
+  });
+
+  it('passes a reduced per-source article cap and crawl delay (not the onboarding-sized defaults) to the PARSER deep pass, since /search can run it for several due sources inside one shared time budget', async () => {
+    const source = makeSource({ id: 'parser-1', type: SourceKind.PARSER, lastSuccessAt: null, lastDeepScanAt: null });
+    const sourcesService = makeSourcesService({ [SourceKind.PARSER]: [source] });
+    const mentionsService = {
+      createIfNewAndClassify: jest.fn(async () => ({ result: 'inserted', sentiment: Sentiment.UNDEFINED })),
+    } as unknown as MentionsService;
+    const stubs = makeCollectorStubs({});
+
+    await makeService(sourcesService, mentionsService, stubs).runSearch(7);
+
+    expect(stubs.parserService.deepCollect).toHaveBeenCalledWith(
+      source.url,
+      expect.any(Date),
+      expect.objectContaining({ maxArticles: expect.any(Number), crawlDelayMs: expect.any(Number), deadline: expect.any(Number) }),
+    );
+  });
+
+  it('stops processing once the shared /search time budget is exhausted, marks the remaining sources as skipped-by-timeout, and still returns a full summary instead of throwing', async () => {
+    // Simulated wall-clock: real Date.now() at the start, then jumped forward past the (default
+    // 45s) SEARCH_TIME_BUDGET_MS while "fetching" the first source — long enough that the second
+    // source must be skipped, without this test actually waiting 45 real seconds.
+    let now = Date.now();
+    const dateNowSpy = jest.spyOn(Date, 'now').mockImplementation(() => now);
+
+    try {
+      const sourceA = makeSource({ id: 'rss-a', type: SourceKind.RSS, url: 'https://a.example/rss' });
+      const sourceB = makeSource({ id: 'rss-b', type: SourceKind.RSS, url: 'https://b.example/rss', name: 'B' });
+      const sourcesService = makeSourcesService({ [SourceKind.RSS]: [sourceA, sourceB] });
+      const mentionsService = {
+        createIfNewAndClassify: jest.fn(async () => ({ result: 'inserted', sentiment: Sentiment.UNDEFINED })),
+      } as unknown as MentionsService;
+      const stubs = makeCollectorStubs({});
+      (stubs.rssService.fetchFeed as jest.Mock).mockImplementation(async (url: string) => {
+        if (url === sourceA.url) {
+          now += 46_000; // blow past the default 45s budget while source A is "in flight"
+          return [item({ hash: 'a-item', url: 'https://a.example/a' })];
+        }
+        return [item({ hash: 'b-item', url: 'https://b.example/a' })];
+      });
+
+      const summary = await makeService(sourcesService, mentionsService, stubs).runSearch(7);
+
+      expect(summary.items.map((i) => i.url)).toEqual(['https://a.example/a']);
+      expect(summary.sourcesFailed).toHaveLength(1);
+      expect(summary.sourcesFailed[0].label).toBe('B');
+      expect(summary.sourcesFailed[0].error).toMatch(/не хватило времени/);
+      // A timeout skip is not a source-side failure — must not be reported/logged as one.
+      expect(sourcesService.markError).not.toHaveBeenCalled();
+    } finally {
+      dateNowSpy.mockRestore();
+    }
   });
 });

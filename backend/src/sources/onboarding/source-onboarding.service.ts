@@ -9,9 +9,18 @@ import { TelegramService } from '../../collectors/telegram/telegram.service';
 import { ParserService } from '../../collectors/parser/parser.service';
 import { Source, SourceKind } from '../source.entity';
 import { MentionSourceType } from '../../mentions/mention.entity';
-import { runCollectionCycle } from '../../common/collector-run.util';
+import { runCollectionCycle, CollectedItem } from '../../common/collector-run.util';
 import { DomainExclusionService } from '../../common/domain-exclusion.service';
 import { fetchRssWithDeepScan } from '../../collectors/rss/rss-deep-scan.util';
+import { fetchParserWithDeepScan, describeParserDeepScanNote } from '../../collectors/parser/parser-deep-scan.util';
+import { ParserDeepScanStrategy } from '../../collectors/parser/parser.service';
+
+// Onboarding's "Добавить по ссылке" is its own single Vercel Hobby request (60s hard cap — see
+// telegram-bot.service.ts), same as /search, but only ever runs the deep pass for exactly one
+// brand-new source — so unlike PARSER_ONDEMAND_SOURCE_BUDGET_MS in on-demand-search.service.ts
+// (which has to be split across however many sources are due in one shared /search call), this can
+// afford to use most of the whole request's budget on that one source.
+const PARSER_ONBOARDING_TIME_BUDGET_MS = parseInt(process.env.PARSER_ONBOARDING_SOURCE_BUDGET_MS || '45000', 10);
 
 const SOURCE_TYPE_TO_MENTION_TYPE: Record<SourceKind, MentionSourceType> = {
   [SourceKind.RSS]: MentionSourceType.NEWS,
@@ -32,6 +41,12 @@ export interface AddByLinkResult {
   itemsNew?: number;
   itemsFilteredByKeywords?: number;
   message: string;
+  /**
+   * Only set for SourceKind.PARSER — which deep-scan path (sitemap/HTML-pagination/neither) the
+   * one-time test collection actually took, so an admin adding a source by link can see *why*
+   * without reading the backend log. See parser-deep-scan.util.ts's describeParserDeepScanNote.
+   */
+  deepScanNote?: string;
 }
 
 /**
@@ -81,6 +96,11 @@ export class SourceOnboardingService {
       createdBy,
     });
 
+    // Only meaningful for SourceKind.PARSER — captured via closure since fetchItems below must
+    // keep returning a plain Promise<CollectedItem[]> for runCollectionCycle, with no room to also
+    // hand back which deep-scan strategy ran.
+    let parserDeepScanStrategy: ParserDeepScanStrategy | null = null;
+
     // Immediate test collection: whoever added the source sees right away whether it actually
     // works and what it finds — no waiting for the next scheduled cycle, no stack traces.
     const summary = await runCollectionCycle({
@@ -92,10 +112,27 @@ export class SourceOnboardingService {
       keywordsService: this.keywordsService,
       settingsService: this.settingsService,
       sourceType: SOURCE_TYPE_TO_MENTION_TYPE[detection.type],
-      fetchItems: (s) => this.fetchByType(detection.type, s),
+      fetchItems: async (s) => {
+        if (detection.type === SourceKind.PARSER) {
+          const result = await fetchParserWithDeepScan({
+            source: s,
+            logger: this.logger,
+            parserService: this.parserService,
+            sourcesService: this.sourcesService,
+            budget: { deadline: Date.now() + PARSER_ONBOARDING_TIME_BUDGET_MS },
+          });
+          parserDeepScanStrategy = result.strategy;
+          return result.items;
+        }
+        return this.fetchByType(detection.type, s);
+      },
     });
 
     const refreshed = await this.sourcesService.findById(source.id);
+    const deepScanNote =
+      detection.type === SourceKind.PARSER && parserDeepScanStrategy
+        ? describeParserDeepScanNote(parserDeepScanStrategy, summary.itemsFound)
+        : undefined;
 
     if (summary.paused) {
       return {
@@ -113,6 +150,7 @@ export class SourceOnboardingService {
         source: refreshed,
         type: detection.type,
         ok: false,
+        deepScanNote,
         message: refreshed?.lastError ?? 'Не удалось подключиться к источнику',
       };
     }
@@ -124,6 +162,7 @@ export class SourceOnboardingService {
       itemsFound: summary.itemsFound,
       itemsNew: summary.itemsNew,
       itemsFilteredByKeywords: summary.itemsFilteredByKeywords,
+      deepScanNote,
       message:
         summary.itemsFound === 0
           ? 'Источник подключён, но при первом сборе материалов не нашлось — попробуем ещё раз по расписанию.'
@@ -131,7 +170,7 @@ export class SourceOnboardingService {
     };
   }
 
-  private fetchByType(type: SourceKind, source: Source) {
+  private fetchByType(type: SourceKind, source: Source): Promise<CollectedItem[]> {
     switch (type) {
       // RSS on its own only ever surfaces a feed's last N items — layer the throttled sitemap/
       // HTML-pagination deep pass on top so the source's one-time backfill (lastSuccessAt still
@@ -147,8 +186,9 @@ export class SourceOnboardingService {
         });
       case SourceKind.TELEGRAM:
         return this.telegramService.fetchChannel(source.url);
-      case SourceKind.PARSER:
-        return this.parserService.fetchPage(source.url);
+      // SourceKind.PARSER is handled directly in addByLink()'s fetchItems closure, not here — it
+      // needs to capture fetchParserWithDeepScan's `strategy` for deepScanNote, which this
+      // method's Promise<CollectedItem[]> return type has no room for.
       default:
         throw new Error(`Добавление источника по ссылке не поддерживается для типа ${type}`);
     }

@@ -29,7 +29,7 @@ export function SourcesPage() {
   const [url, setUrl] = useState('');
   const [name, setName] = useState('');
   const [submitting, setSubmitting] = useState(false);
-  const [feedback, setFeedback] = useState<{ ok: boolean; message: string } | null>(null);
+  const [feedback, setFeedback] = useState<{ ok: boolean; message: string; deepScanNote?: string } | null>(null);
 
   async function load() {
     try {
@@ -54,7 +54,7 @@ export function SourcesPage() {
     setFeedback(null);
     try {
       const result = await addSource(url.trim(), name.trim() || undefined);
-      setFeedback({ ok: result.ok, message: result.message });
+      setFeedback({ ok: result.ok, message: result.message, deepScanNote: result.deepScanNote });
       setUrl('');
       setName('');
       await load();
@@ -104,7 +104,12 @@ export function SourcesPage() {
       </form>
 
       {feedback && (
-        <p style={{ color: feedback.ok ? '#1a7f37' : '#cf222e', marginBottom: 16 }}>{feedback.message}</p>
+        <div style={{ marginBottom: 16 }}>
+          <p style={{ color: feedback.ok ? '#1a7f37' : '#cf222e', margin: 0 }}>{feedback.message}</p>
+          {feedback.deepScanNote && (
+            <p style={{ color: '#666', fontSize: 13, margin: '4px 0 0' }}>{feedback.deepScanNote}</p>
+          )}
+        </div>
       )}
 
       {loading && <p>Загрузка…</p>}

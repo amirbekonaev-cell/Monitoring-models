@@ -39,6 +39,40 @@ const MAX_SITEMAP_FILES = parseInt(process.env.PARSER_MAX_SITEMAP_FILES || '20',
 // tuned independently, but same order of magnitude by default.
 const MAX_SITEMAP_ARTICLE_URLS = parseInt(process.env.PARSER_MAX_SITEMAP_ARTICLE_URLS || '60', 10);
 
+/**
+ * Which path `deepCollect()` actually took to find articles — surfaced back to callers (see
+ * parser-deep-scan.util.ts) so an admin adding a PARSER source by link can see *why* it did or
+ * didn't find anything, instead of that only ever showing up in the backend log. 'skipped' and
+ * 'error' are not produced by deepCollect() itself — they're states the calling deep-scan util
+ * adds on top (throttled by last_deep_scan_at, or the whole pass threw) — but live in the same
+ * type so one function describes all of them.
+ */
+export type ParserDeepScanStrategy = 'sitemap' | 'html-pagination' | 'none' | 'skipped' | 'error';
+
+export interface ParserDeepScanOutcome {
+  items: CollectedItem[];
+  strategy: ParserDeepScanStrategy;
+}
+
+/**
+ * Extra knobs shared by `crawlSite()`/`deepCollect()`'s HTML-pagination and sitemap paths, all
+ * optional so every existing call site (RSS's deep pass, onboarding's one-time backfill) keeps
+ * its current behavior by just omitting them:
+ * - `deadline`: hard wall-clock stop (Date.now()-based ms timestamp). The Vercel Hobby plan caps
+ *   every request at 60s (see telegram-bot.service.ts) and /search shares one such request across
+ *   every source in every channel — a single slow/huge site must not be able to run past its
+ *   budget just because it still has sitemap files or listing pages left to walk.
+ * - `maxArticles` / `crawlDelayMs`: override the module-level MAX_ARTICLES_PER_CRAWL/
+ *   MAX_SITEMAP_ARTICLE_URLS/CRAWL_DELAY_MS defaults, which are sized for a one-time backfill of a
+ *   single source (onboarding) — /search's routine pass needs smaller ones since it can run this
+ *   for several "due" sources inside the same shared time budget. See on-demand-search.service.ts.
+ */
+export interface DeepScanBudget {
+  deadline?: number;
+  maxArticles?: number;
+  crawlDelayMs?: number;
+}
+
 @Injectable()
 export class ParserService {
   private readonly logger = new Logger(ParserService.name);
@@ -109,11 +143,15 @@ export class ParserService {
    * pagination (rel="next", "следующая"/"далее" link text, ?page=N, /page/N/) up to `maxPages`
    * listing pages, then parses every discovered article link via parseArticlePage(). One
    * unreachable article or listing page is logged and skipped — the whole crawl doesn't fail
-   * (same error isolation as runCollectionCycle). A polite delay (CRAWL_DELAY_MS) is kept between
-   * requests.
+   * (same error isolation as runCollectionCycle). A polite delay (CRAWL_DELAY_MS, or
+   * `budget.crawlDelayMs`) is kept between requests. `budget.deadline`, if given, stops both the
+   * listing walk and the article-parsing pass early — whatever was already collected/parsed is
+   * still returned, this is a soft cutoff, not a failure.
    */
-  async crawlSite(baseUrl: string, options: { maxPages: number }): Promise<CollectedItem[]> {
+  async crawlSite(baseUrl: string, options: { maxPages: number } & DeepScanBudget): Promise<CollectedItem[]> {
     const maxPages = Math.max(1, options.maxPages || DEFAULT_MAX_PAGES);
+    const maxArticles = options.maxArticles ?? MAX_ARTICLES_PER_CRAWL;
+    const crawlDelayMs = options.crawlDelayMs ?? CRAWL_DELAY_MS;
     const seenListingUrls = new Set<string>();
     const articleUrls = new Set<string>();
 
@@ -121,6 +159,11 @@ export class ParserService {
     let pagesVisited = 0;
 
     while (currentUrl && pagesVisited < maxPages && !seenListingUrls.has(currentUrl)) {
+      if (this.isPastDeadline(options.deadline)) {
+        this.logger.warn(`crawlSite: бюджет времени исчерпан — останавливаю обход листинга ${baseUrl} на странице ${pagesVisited + 1}`);
+        break;
+      }
+
       seenListingUrls.add(currentUrl);
       pagesVisited += 1;
 
@@ -135,25 +178,31 @@ export class ParserService {
 
       for (const link of this.extractArticleLinks($, currentUrl)) {
         articleUrls.add(link);
-        if (articleUrls.size >= MAX_ARTICLES_PER_CRAWL) {
+        if (articleUrls.size >= maxArticles) {
           break;
         }
       }
 
       currentUrl = this.findNextPageUrl($, currentUrl);
       if (currentUrl) {
-        await this.delay(CRAWL_DELAY_MS);
+        await this.delay(crawlDelayMs);
       }
     }
 
     const items: CollectedItem[] = [];
-    for (const url of Array.from(articleUrls).slice(0, MAX_ARTICLES_PER_CRAWL)) {
+    for (const url of Array.from(articleUrls).slice(0, maxArticles)) {
+      if (this.isPastDeadline(options.deadline)) {
+        this.logger.warn(
+          `crawlSite: бюджет времени исчерпан — останавливаю разбор материалов ${baseUrl}, собрано ${items.length} из ${articleUrls.size}`,
+        );
+        break;
+      }
       try {
         items.push(await this.parseArticlePage(url));
       } catch (error) {
         this.logger.warn(`crawlSite: не удалось разобрать материал ${url}: ${String(error)}`);
       }
-      await this.delay(CRAWL_DELAY_MS);
+      await this.delay(crawlDelayMs);
     }
 
     return items;
@@ -248,12 +297,22 @@ export class ParserService {
    * there is no reliable way to tell which sub-sitemap is newest, so only the last few (as listed)
    * are checked rather than all of them — best-effort, bounded, not exhaustive.
    */
-  private async collectUrlsFromSitemaps(rootUrls: string[], cutoff: Date): Promise<string[]> {
+  private async collectUrlsFromSitemaps(
+    rootUrls: string[],
+    cutoff: Date,
+    budget: Pick<DeepScanBudget, 'deadline' | 'maxArticles'> = {},
+  ): Promise<string[]> {
+    const maxArticleUrls = budget.maxArticles ?? MAX_SITEMAP_ARTICLE_URLS;
     const urls: string[] = [];
     const queue: string[] = [...rootUrls];
     let sitemapsVisited = 0;
 
-    while (queue.length > 0 && urls.length < MAX_SITEMAP_ARTICLE_URLS && sitemapsVisited < MAX_SITEMAP_FILES) {
+    while (queue.length > 0 && urls.length < maxArticleUrls && sitemapsVisited < MAX_SITEMAP_FILES) {
+      if (this.isPastDeadline(budget.deadline)) {
+        this.logger.warn(`collectUrlsFromSitemaps: бюджет времени исчерпан — собрано ${urls.length} ссылок, останавливаю обход sitemap`);
+        break;
+      }
+
       const sitemapUrl = queue.shift() as string;
       sitemapsVisited += 1;
 
@@ -295,7 +354,7 @@ export class ParserService {
         const effectiveDate = lastmodDate && !Number.isNaN(lastmodDate.getTime()) ? lastmodDate : this.extractDateFromUrl(u.loc);
         if (effectiveDate && effectiveDate < cutoff) continue;
         urls.push(u.loc);
-        if (urls.length >= MAX_SITEMAP_ARTICLE_URLS) break;
+        if (urls.length >= maxArticleUrls) break;
       }
     }
 
@@ -304,20 +363,29 @@ export class ParserService {
 
   /**
    * The "deep" К-5 pass added on top of RSS (see fetchRssWithDeepScan) or run standalone for a
-   * К-5 source: prefers the site's sitemap (cheap to prune by `<lastmod>`, usually the complete
-   * article archive) and only falls back to walking the HTML listing/pagination
-   * (`crawlSite`) when no sitemap could be found or it yielded no article URLs at all. Never
-   * throws — a site with neither a usable sitemap nor parseable pagination (e.g. a JS-rendered
-   * `/news` page with no server-side links, seen on infozakon.kz) is a legitimate outcome, not a
-   * failure: it's logged clearly and an empty result is returned so the source stays healthy
-   * (ФТ-2 — this must never take down the fast RSS/parser fetch it's layered on top of).
+   * pure К-5 source with no RSS feed at all (see parser-deep-scan.util.ts): prefers the site's
+   * sitemap (cheap to prune by `<lastmod>`, usually the complete article archive) and only falls
+   * back to walking the HTML listing/pagination (`crawlSite`) when no sitemap could be found or it
+   * yielded no article URLs at all. Never throws — a site with neither a usable sitemap nor
+   * parseable pagination (e.g. a JS-rendered `/news` page with no server-side links, seen on
+   * infozakon.kz) is a legitimate outcome, not a failure: it's logged clearly and an empty result
+   * is returned so the source stays healthy (ФТ-2 — this must never take down the fast RSS/parser
+   * fetch it's layered on top of). Returns which path actually produced the result (`strategy`) —
+   * see ParserDeepScanStrategy — so a caller can surface *why* to a human, not just log it.
+   *
+   * `options` also carries an optional time/size budget (see DeepScanBudget) — both call sites sit
+   * inside a single Vercel Hobby request capped at 60s (see telegram-bot.service.ts), and /search's
+   * routine pass in particular shares that budget across every source that's due this call.
    */
-  async deepCollect(baseUrl: string, cutoff: Date, options: { fallbackMaxPages: number }): Promise<CollectedItem[]> {
+  async deepCollect(baseUrl: string, cutoff: Date, options: { fallbackMaxPages: number } & DeepScanBudget): Promise<ParserDeepScanOutcome> {
     let articleUrls: string[] = [];
     try {
       const sitemapRoots = await this.discoverSitemaps(baseUrl);
       if (sitemapRoots.length > 0) {
-        articleUrls = await this.collectUrlsFromSitemaps(sitemapRoots, cutoff);
+        articleUrls = await this.collectUrlsFromSitemaps(sitemapRoots, cutoff, {
+          deadline: options.deadline,
+          maxArticles: options.maxArticles,
+        });
       }
     } catch (error) {
       this.logger.warn(`deepCollect: обход sitemap не удался для ${baseUrl}: ${String(error)}`);
@@ -327,33 +395,58 @@ export class ParserService {
       this.logger.log(
         `deepCollect(${baseUrl}): использован sitemap — ${articleUrls.length} ссылок на статьи новее ${cutoff.toISOString().slice(0, 10)}`,
       );
+      const crawlDelayMs = options.crawlDelayMs ?? CRAWL_DELAY_MS;
       const items: CollectedItem[] = [];
       for (const url of articleUrls) {
+        if (this.isPastDeadline(options.deadline)) {
+          this.logger.warn(
+            `deepCollect: бюджет времени исчерпан — останавливаю разбор статей sitemap для ${baseUrl}, собрано ${items.length} из ${articleUrls.length}`,
+          );
+          break;
+        }
         try {
           items.push(await this.parseArticlePage(url));
         } catch (error) {
           this.logger.warn(`deepCollect: не удалось разобрать материал ${url}: ${String(error)}`);
         }
-        await this.delay(CRAWL_DELAY_MS);
+        await this.delay(crawlDelayMs);
       }
-      return items;
+      return { items, strategy: 'sitemap' };
+    }
+
+    if (this.isPastDeadline(options.deadline)) {
+      this.logger.warn(`deepCollect(${baseUrl}): бюджет времени уже исчерпан до резервной HTML-пагинации — пропускаю`);
+      return { items: [], strategy: 'none' };
     }
 
     try {
-      const crawled = await this.crawlSite(baseUrl, { maxPages: options.fallbackMaxPages });
+      const crawled = await this.crawlSite(baseUrl, {
+        maxPages: options.fallbackMaxPages,
+        deadline: options.deadline,
+        maxArticles: options.maxArticles,
+        crawlDelayMs: options.crawlDelayMs,
+      });
       if (crawled.length > 0) {
         this.logger.log(`deepCollect(${baseUrl}): sitemap не найден/пуст — использована HTML-пагинация, найдено ${crawled.length}`);
-        return crawled;
+        return { items: crawled, strategy: 'html-pagination' };
       }
     } catch (error) {
       this.logger.warn(`deepCollect: резервная HTML-пагинация тоже не удалась для ${baseUrl}: ${String(error)}`);
-      return [];
+      return { items: [], strategy: 'none' };
     }
 
     this.logger.warn(
       `deepCollect(${baseUrl}): sitemap не найден и HTML-пагинация не дала ссылок на статьи (возможно, раздел новостей рендерится через JS) — глубокий обход недоступен для этого источника, работает только быстрый канал (RSS/одна страница)`,
     );
-    return [];
+    return { items: [], strategy: 'none' };
+  }
+
+  /** Shared wall-clock check for every loop in crawlSite()/collectUrlsFromSitemaps()/deepCollect()
+   *  that can otherwise run for as long as there are pages/sitemaps/articles left — see
+   *  DeepScanBudget.deadline. No deadline means no cap (existing callers keep running to
+   *  completion, same as before this budget was added). */
+  private isPastDeadline(deadline?: number): boolean {
+    return deadline !== undefined && Date.now() >= deadline;
   }
 
   private findNextPageUrl($: cheerio.CheerioAPI, currentUrl: string): string | null {

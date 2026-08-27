@@ -20,6 +20,8 @@ export interface AddSourceResponse {
   itemsFound?: number;
   itemsNew?: number;
   itemsFilteredByKeywords?: number;
+  /** Only set for type 'parser' — which deep-scan path (sitemap/HTML-pagination/neither) ran. */
+  deepScanNote?: string;
 }
 
 const API_URL = import.meta.env.VITE_API_URL ?? 'http://localhost:3000';

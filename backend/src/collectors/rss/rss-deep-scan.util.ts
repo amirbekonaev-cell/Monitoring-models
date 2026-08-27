@@ -66,7 +66,7 @@ export async function fetchRssWithDeepScan(params: {
   const maxPages = isFullBackfillPass ? parserService.getBackfillMaxPages() : parserService.getDefaultMaxPages();
 
   try {
-    const deepItems = await parserService.deepCollect(source.url, cutoff, { fallbackMaxPages: maxPages });
+    const { items: deepItems } = await parserService.deepCollect(source.url, cutoff, { fallbackMaxPages: maxPages });
     // Only recorded on a completed pass (even a zero-result one) — a thrown error below skips
     // this, so a transient failure gets retried on the next cycle instead of being throttled away.
     await sourcesService.markDeepScanDone(source.id);

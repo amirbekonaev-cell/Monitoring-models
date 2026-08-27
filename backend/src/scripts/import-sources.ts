@@ -82,7 +82,8 @@ async function main(): Promise<void> {
       if (result.ok) {
         console.log(
           `OK    ${url} -> тип=${result.type}, найдено=${result.itemsFound}, новых=${result.itemsNew}, ` +
-            `отфильтровано ключевыми словами=${result.itemsFilteredByKeywords}`,
+            `отфильтровано ключевыми словами=${result.itemsFilteredByKeywords}` +
+            (result.deepScanNote ? ` (${result.deepScanNote})` : ''),
         );
       } else {
         console.log(`ERROR ${url} -> тип=${result.type}, причина: ${result.message}`);

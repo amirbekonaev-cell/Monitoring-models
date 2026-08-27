@@ -89,7 +89,7 @@ describe('SourceOnboardingService', () => {
     // focused on the plain RSS path; deep-scan behavior itself is covered in
     // rss-deep-scan.util.spec.ts.
     const parserService = {
-      deepCollect: jest.fn(async () => []),
+      deepCollect: jest.fn(async () => ({ items: [], strategy: 'none' })),
       getBackfillMaxPages: jest.fn(() => 25),
       getDefaultMaxPages: jest.fn(() => 5),
     } as unknown as ParserService;
@@ -117,9 +117,63 @@ describe('SourceOnboardingService', () => {
   });
 
   it('reports a clear reason (not a stack trace) when the test collection fails', async () => {
+    // RSS, not PARSER: RSS's fast feed fetch is a real primary path whose failure is a genuine
+    // source error (see rss-deep-scan.util.ts — only the *deep pass* on top of it is isolated).
+    // PARSER's own error handling (deepCollect failing) is intentionally different — see
+    // "PARSER: a failing deep pass degrades to itemsFound: 0 instead of ok: false" below and
+    // CLAUDE.md task ФТ-2 reasoning.
     const createdSource = {
       id: 'src-2',
-      url: 'https://broken.example',
+      url: 'https://broken.example/rss',
+      name: null,
+      type: SourceKind.RSS,
+      status: SourceStatus.ACTIVE,
+      lastSuccessAt: null,
+      lastDeepScanAt: null,
+      lastError: null,
+      createdBy: 'import-script',
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    };
+
+    const detectService = {
+      detect: jest.fn(async () => ({ type: SourceKind.RSS, resolvedUrl: createdSource.url })),
+    } as unknown as SourceDetectService;
+    const sourcesService = {
+      findByUrl: jest.fn(async () => null),
+      create: jest.fn(async () => createdSource),
+      findById: jest.fn(async () => ({ ...createdSource, lastError: 'HTTP 404' })),
+      markSuccess: jest.fn(async () => undefined),
+      markError: jest.fn(async () => undefined),
+    } as unknown as SourcesService;
+    const rssService = {
+      fetchFeed: jest.fn(async () => {
+        throw new Error('HTTP 404');
+      }),
+    } as unknown as RssService;
+
+    const service = new SourceOnboardingService(
+      detectService,
+      sourcesService,
+      {} as MentionsService,
+      makeKeywordsService(),
+      makeSettingsService(),
+      rssService,
+      {} as TelegramService,
+      {} as ParserService,
+      makePassthroughDomainExclusionService(),
+    );
+
+    const result = await service.addByLink('broken.example', null, 'import-script');
+
+    expect(result.ok).toBe(false);
+    expect(result.message).toBe('HTTP 404');
+  });
+
+  it('routes a PARSER source through fetchParserWithDeepScan (not the bare fetchPage() single-article fetch) and reports which deep-scan path ran via deepScanNote', async () => {
+    const createdSource = {
+      id: 'src-parser-1',
+      url: 'https://sknews.example/',
       name: null,
       type: SourceKind.PARSER,
       status: SourceStatus.ACTIVE,
@@ -137,14 +191,78 @@ describe('SourceOnboardingService', () => {
     const sourcesService = {
       findByUrl: jest.fn(async () => null),
       create: jest.fn(async () => createdSource),
-      findById: jest.fn(async () => ({ ...createdSource, lastError: 'HTTP 404' })),
+      findById: jest.fn(async () => ({ ...createdSource, lastSuccessAt: new Date() })),
       markSuccess: jest.fn(async () => undefined),
       markError: jest.fn(async () => undefined),
+      markDeepScanDone: jest.fn(async () => undefined),
     } as unknown as SourcesService;
     const parserService = {
       fetchPage: jest.fn(async () => {
-        throw new Error('HTTP 404');
+        throw new Error('fetchPage must not be called for a PARSER source any more');
       }),
+      deepCollect: jest.fn(async () => ({
+        items: [{ title: 'A', text: 'text', url: 'https://sknews.example/article-1', publishedAt: null, hash: 'h1' }],
+        strategy: 'sitemap',
+      })),
+      getBackfillMaxPages: jest.fn(() => 25),
+      getDefaultMaxPages: jest.fn(() => 5),
+    } as unknown as ParserService;
+
+    const service = new SourceOnboardingService(
+      detectService,
+      sourcesService,
+      { createIfNew: jest.fn(async () => 'inserted') } as unknown as MentionsService,
+      makeKeywordsService(),
+      makeSettingsService(),
+      {} as RssService,
+      {} as TelegramService,
+      parserService,
+      makePassthroughDomainExclusionService(),
+    );
+
+    const result = await service.addByLink('sknews.example', null, 'import-script');
+
+    expect(parserService.fetchPage).not.toHaveBeenCalled();
+    expect(parserService.deepCollect).toHaveBeenCalledTimes(1);
+    expect(sourcesService.markDeepScanDone).toHaveBeenCalledWith('src-parser-1');
+    expect(result.ok).toBe(true);
+    expect(result.itemsFound).toBe(1);
+    expect(result.deepScanNote).toContain('sitemap');
+  });
+
+  it('PARSER: a failing deep pass degrades to itemsFound: 0 (not ok: false) — an admin still sees the source added, with the error surfaced via deepScanNote instead of lastError', async () => {
+    const createdSource = {
+      id: 'src-parser-2',
+      url: 'https://broken-parser.example/',
+      name: null,
+      type: SourceKind.PARSER,
+      status: SourceStatus.ACTIVE,
+      lastSuccessAt: null,
+      lastDeepScanAt: null,
+      lastError: null,
+      createdBy: 'import-script',
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    };
+
+    const detectService = {
+      detect: jest.fn(async () => ({ type: SourceKind.PARSER, resolvedUrl: createdSource.url })),
+    } as unknown as SourceDetectService;
+    const sourcesService = {
+      findByUrl: jest.fn(async () => null),
+      create: jest.fn(async () => createdSource),
+      findById: jest.fn(async () => ({ ...createdSource, lastSuccessAt: new Date() })),
+      markSuccess: jest.fn(async () => undefined),
+      markError: jest.fn(async () => undefined),
+      markDeepScanDone: jest.fn(async () => undefined),
+    } as unknown as SourcesService;
+    const parserService = {
+      fetchPage: jest.fn(),
+      deepCollect: jest.fn(async () => {
+        throw new Error('DNS lookup failed');
+      }),
+      getBackfillMaxPages: jest.fn(() => 25),
+      getDefaultMaxPages: jest.fn(() => 5),
     } as unknown as ParserService;
 
     const service = new SourceOnboardingService(
@@ -159,10 +277,12 @@ describe('SourceOnboardingService', () => {
       makePassthroughDomainExclusionService(),
     );
 
-    const result = await service.addByLink('broken.example', null, 'import-script');
+    const result = await service.addByLink('broken-parser.example', null, 'import-script');
 
-    expect(result.ok).toBe(false);
-    expect(result.message).toBe('HTTP 404');
+    expect(sourcesService.markDeepScanDone).not.toHaveBeenCalled();
+    expect(result.ok).toBe(true);
+    expect(result.itemsFound).toBe(0);
+    expect(result.deepScanNote).toContain('ошибкой');
   });
 
   it('reports collection is paused (not "0 found") when adding a source while /pause is active', async () => {

@@ -29,7 +29,7 @@ function item(overrides: Partial<CollectedItem> = {}): CollectedItem {
 
 function makeParserService(deepItems: CollectedItem[] = [], deepCollectImpl?: jest.Mock) {
   return {
-    deepCollect: deepCollectImpl ?? jest.fn(async () => deepItems),
+    deepCollect: deepCollectImpl ?? jest.fn(async () => ({ items: deepItems, strategy: 'sitemap' })),
     getBackfillMaxPages: jest.fn(() => 25),
     getDefaultMaxPages: jest.fn(() => 5),
   } as unknown as ParserService;
