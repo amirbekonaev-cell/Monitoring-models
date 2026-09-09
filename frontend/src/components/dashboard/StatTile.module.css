@@ -1,0 +1,28 @@
+.tile {
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  padding: var(--space-4);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+.label {
+  font-size: 12.5px;
+  color: var(--color-ink-muted);
+}
+
+.value {
+  font-family: var(--font-serif);
+  font-weight: 600;
+  font-size: 38px;
+  line-height: 1.1;
+  font-variant-numeric: tabular-nums;
+}
+
+.change {
+  font-size: 12.5px;
+  color: var(--color-ink-muted);
+  font-variant-numeric: tabular-nums;
+}

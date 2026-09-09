@@ -1,0 +1,118 @@
+/*
+ * Дизайн-токены. Единственное место, где определяются цвета/шрифты/шкала отступов/радиусы/тень —
+ * компоненты используют только переменные ниже, новых значений в CSS-модулях не заводим.
+ * Цвета тональности (--sentiment-*) держим в синхроне с ../styles/theme.ts (recharts требует
+ * литералы hex, а не css var()).
+ */
+
+:root {
+  /* Нейтральная шкала */
+  --color-bg: #eef1f5;
+  --color-surface: #ffffff;
+  --color-surface-sunken: #f7f8fa;
+  --color-border: #dbe0e6;
+  --color-ink: #1c2733;
+  --color-ink-muted: #5b6472;
+
+  /* Единственный интерактивный акцент во всём интерфейсе */
+  --color-accent: #2c4a86;
+  --color-accent-soft: #e4eaf5;
+
+  /* Тональность — одни и те же значения в бейджах ленты, графиках дашборда и легендах.
+     neutral намеренно совпадает с --color-ink-muted: нейтральная тональность = «нет сигнала». */
+  --sentiment-positive: #1f7a5c;
+  --sentiment-positive-soft: #e1f0ea;
+  --sentiment-negative: #a63a50;
+  --sentiment-negative-soft: #f6e5e9;
+  --sentiment-neutral: #5b6472;
+  --sentiment-neutral-soft: #e9ebee;
+  --sentiment-unknown: #9aa1ac;
+  --sentiment-unknown-soft: #f2f3f5;
+
+  /* Отступы — единая шкала 4·8·12·16·24·32 */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 24px;
+  --space-6: 32px;
+
+  /* Радиусы — только два значения */
+  --radius-sm: 4px;
+  --radius-md: 8px;
+
+  /* Единственная тень в системе — только для всплывающих элементов (dropdown/поповер) */
+  --shadow-popover: 0 4px 16px rgba(28, 39, 51, 0.16);
+
+  /* Типографика */
+  --font-serif: 'IBM Plex Serif', Georgia, 'Times New Roman', serif;
+  --font-sans:
+    'IBM Plex Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+
+  color-scheme: light;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  background: var(--color-bg);
+  color: var(--color-ink);
+  font-family: var(--font-sans);
+  font-size: 14px;
+  line-height: 1.45;
+  -webkit-font-smoothing: antialiased;
+}
+
+#root {
+  min-height: 100vh;
+}
+
+h1,
+h2,
+h3 {
+  font-family: var(--font-serif);
+  font-weight: 600;
+  margin: 0;
+  color: var(--color-ink);
+}
+
+a {
+  color: var(--color-accent);
+}
+
+button,
+input,
+select {
+  font: inherit;
+  color: inherit;
+}
+
+table {
+  border-collapse: collapse;
+}
+
+/* Единый видимый фокус — на кнопках/ссылках/полях/селектах, никогда не убирается. */
+:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
+  border-radius: var(--radius-sm);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}

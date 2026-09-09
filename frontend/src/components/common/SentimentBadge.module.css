@@ -1,0 +1,46 @@
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  padding: 2px var(--space-2);
+  border-radius: var(--radius-sm);
+  font-size: 12.5px;
+  font-weight: 500;
+  white-space: nowrap;
+}
+
+.badge.positive {
+  color: var(--sentiment-positive);
+  background: var(--sentiment-positive-soft);
+}
+
+.badge.negative {
+  color: var(--sentiment-negative);
+  background: var(--sentiment-negative-soft);
+}
+
+.badge.neutral {
+  color: var(--sentiment-neutral);
+  background: var(--sentiment-neutral-soft);
+}
+
+/* «не определена» — контур, не заливка: визуально это отсутствие данных, а не четвёртый
+   полноценный цвет наравне с позитивом/негативом/нейтралом. */
+.badge.undefined {
+  color: var(--sentiment-unknown);
+  background: transparent;
+  border: 1px dashed var(--sentiment-unknown);
+}
+
+.dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+  flex-shrink: 0;
+}
+
+.badge.undefined .dot {
+  background: transparent;
+  border: 1px solid currentColor;
+}
