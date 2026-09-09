@@ -1,0 +1,9 @@
+.wrapper {
+  width: 100%;
+  height: 220px;
+}
+
+.empty {
+  color: var(--color-ink-muted);
+  font-size: 13px;
+}

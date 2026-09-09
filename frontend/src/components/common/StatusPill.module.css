@@ -1,0 +1,36 @@
+.pill {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.active .dot {
+  background: var(--sentiment-positive);
+}
+.active {
+  color: var(--sentiment-positive);
+}
+
+.error .dot {
+  background: var(--sentiment-negative);
+}
+.error {
+  color: var(--sentiment-negative);
+}
+
+.disabled .dot {
+  background: transparent;
+  border: 1px solid var(--color-ink-muted);
+}
+.disabled {
+  color: var(--color-ink-muted);
+}

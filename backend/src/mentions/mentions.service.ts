@@ -1,8 +1,9 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { createHash, randomUUID } from 'crypto';
-import { DataSource, Repository } from 'typeorm';
-import { Mention, Sentiment } from './mention.entity';
+import { DataSource, Repository, SelectQueryBuilder } from 'typeorm';
+import { Mention, MentionSourceType, Sentiment } from './mention.entity';
+import { Source } from '../sources/source.entity';
 import { SentimentAnalysisService } from '../sentiment/sentiment-analysis.service';
 
 export interface CreateMentionInput {
@@ -33,9 +34,38 @@ export interface CreateMentionInput {
   skipDedup?: boolean;
 }
 
-export interface FindMentionsQuery {
+/** Filters shared by the feed list and the dashboard stats aggregation — kept in one place so
+ *  neither reimplements the WHERE clause. `dateFrom`/`dateTo` compare against
+ *  COALESCE(published_at, found_at): some collectors never learn a publish date, and falling
+ *  back to when we found the item keeps those mentions filterable instead of invisible. */
+export interface MentionFilters {
+  sentiment?: Sentiment;
+  sourceId?: string;
+  sourceType?: MentionSourceType;
+  language?: string;
+  search?: string;
+  dateFrom?: Date;
+  dateTo?: Date;
+}
+
+export interface FindMentionsQuery extends MentionFilters {
   limit: number;
   offset: number;
+}
+
+export interface MentionsStatsQuery extends MentionFilters {
+  dateFrom: Date;
+  dateTo: Date;
+}
+
+export interface MentionsStats {
+  total: number;
+  previousTotal: number;
+  /** null when there's nothing in the previous period to compare against (division by zero). */
+  changePercent: number | null;
+  byDay: { date: string; count: number }[];
+  bySentiment: Record<Sentiment, number>;
+  topSources: { sourceId: string | null; name: string | null; count: number }[];
 }
 
 /**
@@ -316,16 +346,113 @@ export class MentionsService {
     this.logger.log(`Reprint recorded on mention ${existing.id}: ${input.url}`);
   }
 
+  private applyFilters(qb: SelectQueryBuilder<Mention>, filters: MentionFilters): void {
+    if (filters.sentiment) {
+      qb.andWhere('m.sentiment = :sentiment', { sentiment: filters.sentiment });
+    }
+    if (filters.sourceId) {
+      qb.andWhere('m.sourceId = :sourceId', { sourceId: filters.sourceId });
+    }
+    if (filters.sourceType) {
+      qb.andWhere('m.sourceType = :sourceType', { sourceType: filters.sourceType });
+    }
+    if (filters.language) {
+      qb.andWhere('m.language = :language', { language: filters.language });
+    }
+    if (filters.search) {
+      qb.andWhere('(m.title ILIKE :search OR m.text ILIKE :search)', { search: `%${filters.search}%` });
+    }
+    if (filters.dateFrom) {
+      qb.andWhere('COALESCE(m.publishedAt, m.foundAt) >= :dateFrom', { dateFrom: filters.dateFrom });
+    }
+    if (filters.dateTo) {
+      qb.andWhere('COALESCE(m.publishedAt, m.foundAt) <= :dateTo', { dateTo: filters.dateTo });
+    }
+  }
+
   async findRecent(query: FindMentionsQuery): Promise<{ items: Mention[]; total: number }> {
-    const [items, total] = await this.mentionsRepo.findAndCount({
-      order: { publishedAt: 'DESC', foundAt: 'DESC' },
-      take: query.limit,
-      skip: query.offset,
-    });
+    const qb = this.mentionsRepo
+      .createQueryBuilder('m')
+      .orderBy('m.publishedAt', 'DESC')
+      .addOrderBy('m.foundAt', 'DESC')
+      .take(query.limit)
+      .skip(query.offset);
+    this.applyFilters(qb, query);
+    const [items, total] = await qb.getManyAndCount();
     return { items, total };
   }
 
   async countBySource(sourceId: string): Promise<number> {
     return this.mentionsRepo.count({ where: { sourceId } });
+  }
+
+  /**
+   * Dashboard aggregation: total + % change vs. the immediately preceding period of the same
+   * length, a per-day count series, a sentiment breakdown, and the top 10 sources — all under
+   * the same filters as findRecent, so the dashboard and the feed never disagree about what
+   * "matches the current filters" means.
+   */
+  async getStats(query: MentionsStatsQuery): Promise<MentionsStats> {
+    const durationMs = query.dateTo.getTime() - query.dateFrom.getTime();
+    const previous: MentionFilters = {
+      ...query,
+      dateFrom: new Date(query.dateFrom.getTime() - durationMs - 1),
+      dateTo: new Date(query.dateFrom.getTime() - 1),
+    };
+
+    const totalQb = this.mentionsRepo.createQueryBuilder('m');
+    this.applyFilters(totalQb, query);
+    const total = await totalQb.getCount();
+
+    const previousQb = this.mentionsRepo.createQueryBuilder('m');
+    this.applyFilters(previousQb, previous);
+    const previousTotal = await previousQb.getCount();
+
+    const changePercent = previousTotal === 0 ? null : Math.round(((total - previousTotal) / previousTotal) * 1000) / 10;
+
+    const byDayQb = this.mentionsRepo
+      .createQueryBuilder('m')
+      .select('DATE(COALESCE(m.publishedAt, m.foundAt))::text', 'date')
+      .addSelect('COUNT(*)', 'count')
+      .groupBy('date')
+      .orderBy('date', 'ASC');
+    this.applyFilters(byDayQb, query);
+    const byDayRaw = await byDayQb.getRawMany<{ date: string; count: string }>();
+    const byDay = byDayRaw.map((row) => ({ date: row.date, count: parseInt(row.count, 10) }));
+
+    const bySentimentQb = this.mentionsRepo
+      .createQueryBuilder('m')
+      .select('m.sentiment', 'sentiment')
+      .addSelect('COUNT(*)', 'count')
+      .groupBy('m.sentiment');
+    this.applyFilters(bySentimentQb, query);
+    const bySentimentRaw = await bySentimentQb.getRawMany<{ sentiment: Sentiment; count: string }>();
+    const bySentiment = Object.values(Sentiment).reduce(
+      (acc, sentiment) => ({ ...acc, [sentiment]: 0 }),
+      {} as Record<Sentiment, number>,
+    );
+    for (const row of bySentimentRaw) {
+      bySentiment[row.sentiment] = parseInt(row.count, 10);
+    }
+
+    const topSourcesQb = this.mentionsRepo
+      .createQueryBuilder('m')
+      .leftJoin(Source, 's', 's.id = m.sourceId')
+      .select('m.sourceId', 'sourceId')
+      .addSelect('s.name', 'name')
+      .addSelect('COUNT(*)', 'count')
+      .groupBy('m.sourceId')
+      .addGroupBy('s.name')
+      .orderBy('count', 'DESC')
+      .limit(10);
+    this.applyFilters(topSourcesQb, query);
+    const topSourcesRaw = await topSourcesQb.getRawMany<{ sourceId: string | null; name: string | null; count: string }>();
+    const topSources = topSourcesRaw.map((row) => ({
+      sourceId: row.sourceId,
+      name: row.name,
+      count: parseInt(row.count, 10),
+    }));
+
+    return { total, previousTotal, changePercent, byDay, bySentiment, topSources };
   }
 }

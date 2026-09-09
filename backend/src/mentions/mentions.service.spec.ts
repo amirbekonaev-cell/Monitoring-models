@@ -538,3 +538,132 @@ describe('MentionsService dedup', () => {
     expect(repo.findOne).not.toHaveBeenCalled();
   });
 });
+
+/** Chainable stand-in for TypeORM's SelectQueryBuilder — every builder method returns the same
+ *  object (as the real one does), so calls can be composed the way MentionsService composes
+ *  them; only the terminal methods (getManyAndCount/getCount/getRawMany) are given real results. */
+function makeQueryBuilderMock(overrides: Record<string, unknown> = {}) {
+  const qb: Record<string, jest.Mock> = {};
+  for (const method of ['select', 'addSelect', 'where', 'andWhere', 'orderBy', 'addOrderBy', 'groupBy', 'addGroupBy', 'leftJoin', 'take', 'skip', 'limit']) {
+    qb[method] = jest.fn(() => qb);
+  }
+  qb.getManyAndCount = jest.fn(async () => [[], 0]);
+  qb.getCount = jest.fn(async () => 0);
+  qb.getRawMany = jest.fn(async () => []);
+  Object.assign(qb, overrides);
+  return qb;
+}
+
+describe('MentionsService filters & stats', () => {
+  it('findRecent turns every provided filter into an andWhere clause', async () => {
+    const qb = makeQueryBuilderMock({ getManyAndCount: jest.fn(async () => [[{ id: 'm-1' }], 1]) });
+    const repo = { createQueryBuilder: jest.fn(() => qb) } as unknown as Repository<Mention>;
+    const dataSource = {} as unknown as DataSource;
+    const service = new MentionsService(repo, dataSource);
+
+    const dateFrom = new Date('2026-08-01T00:00:00Z');
+    const dateTo = new Date('2026-08-31T23:59:59Z');
+    const result = await service.findRecent({
+      limit: 25,
+      offset: 0,
+      sentiment: Sentiment.POSITIVE,
+      sourceId: 'src-1',
+      sourceType: 'news' as Mention['sourceType'],
+      language: 'ru',
+      search: 'QazCloud',
+      dateFrom,
+      dateTo,
+    });
+
+    expect(result).toEqual({ items: [{ id: 'm-1' }], total: 1 });
+    expect(qb.andWhere).toHaveBeenCalledWith('m.sentiment = :sentiment', { sentiment: Sentiment.POSITIVE });
+    expect(qb.andWhere).toHaveBeenCalledWith('m.sourceId = :sourceId', { sourceId: 'src-1' });
+    expect(qb.andWhere).toHaveBeenCalledWith('m.sourceType = :sourceType', { sourceType: 'news' });
+    expect(qb.andWhere).toHaveBeenCalledWith('m.language = :language', { language: 'ru' });
+    expect(qb.andWhere).toHaveBeenCalledWith('(m.title ILIKE :search OR m.text ILIKE :search)', { search: '%QazCloud%' });
+    expect(qb.andWhere).toHaveBeenCalledWith('COALESCE(m.publishedAt, m.foundAt) >= :dateFrom', { dateFrom });
+    expect(qb.andWhere).toHaveBeenCalledWith('COALESCE(m.publishedAt, m.foundAt) <= :dateTo', { dateTo });
+    expect(qb.take).toHaveBeenCalledWith(25);
+    expect(qb.skip).toHaveBeenCalledWith(0);
+  });
+
+  it('findRecent adds no filter clauses when none are given (back-compat: limit/offset only)', async () => {
+    const qb = makeQueryBuilderMock();
+    const repo = { createQueryBuilder: jest.fn(() => qb) } as unknown as Repository<Mention>;
+    const dataSource = {} as unknown as DataSource;
+    const service = new MentionsService(repo, dataSource);
+
+    await service.findRecent({ limit: 50, offset: 0 });
+
+    expect(qb.andWhere).not.toHaveBeenCalled();
+  });
+
+  it('getStats computes total, previousTotal, changePercent, byDay, bySentiment and topSources', async () => {
+    const totalQb = makeQueryBuilderMock({ getCount: jest.fn(async () => 12) });
+    const previousQb = makeQueryBuilderMock({ getCount: jest.fn(async () => 8) });
+    const byDayQb = makeQueryBuilderMock({
+      getRawMany: jest.fn(async () => [
+        { date: '2026-09-01', count: '5' },
+        { date: '2026-09-02', count: '7' },
+      ]),
+    });
+    const bySentimentQb = makeQueryBuilderMock({
+      getRawMany: jest.fn(async () => [
+        { sentiment: Sentiment.POSITIVE, count: '9' },
+        { sentiment: Sentiment.NEGATIVE, count: '3' },
+      ]),
+    });
+    const topSourcesQb = makeQueryBuilderMock({
+      getRawMany: jest.fn(async () => [{ sourceId: 'src-1', name: 'tengrinews.kz', count: '10' }]),
+    });
+    const queue = [totalQb, previousQb, byDayQb, bySentimentQb, topSourcesQb];
+    const repo = { createQueryBuilder: jest.fn(() => queue.shift()) } as unknown as Repository<Mention>;
+    const dataSource = {} as unknown as DataSource;
+    const service = new MentionsService(repo, dataSource);
+
+    const dateFrom = new Date('2026-09-01T00:00:00Z');
+    const dateTo = new Date('2026-09-08T00:00:00Z');
+    const stats = await service.getStats({ dateFrom, dateTo });
+
+    expect(stats.total).toBe(12);
+    expect(stats.previousTotal).toBe(8);
+    expect(stats.changePercent).toBe(50); // (12 - 8) / 8 * 100
+    expect(stats.byDay).toEqual([
+      { date: '2026-09-01', count: 5 },
+      { date: '2026-09-02', count: 7 },
+    ]);
+    expect(stats.bySentiment).toEqual({ positive: 9, negative: 3, neutral: 0, undefined: 0 });
+    expect(stats.topSources).toEqual([{ sourceId: 'src-1', name: 'tengrinews.kz', count: 10 }]);
+
+    // The "previous" period is the same duration, immediately before dateFrom.
+    const durationMs = dateTo.getTime() - dateFrom.getTime();
+    expect(previousQb.andWhere).toHaveBeenCalledWith('COALESCE(m.publishedAt, m.foundAt) >= :dateFrom', {
+      dateFrom: new Date(dateFrom.getTime() - durationMs - 1),
+    });
+    expect(previousQb.andWhere).toHaveBeenCalledWith('COALESCE(m.publishedAt, m.foundAt) <= :dateTo', {
+      dateTo: new Date(dateFrom.getTime() - 1),
+    });
+  });
+
+  it('getStats returns changePercent = null when the previous period had zero mentions (avoids division by zero)', async () => {
+    const queue = [
+      makeQueryBuilderMock({ getCount: jest.fn(async () => 5) }),
+      makeQueryBuilderMock({ getCount: jest.fn(async () => 0) }),
+      makeQueryBuilderMock(),
+      makeQueryBuilderMock(),
+      makeQueryBuilderMock(),
+    ];
+    const repo = { createQueryBuilder: jest.fn(() => queue.shift()) } as unknown as Repository<Mention>;
+    const dataSource = {} as unknown as DataSource;
+    const service = new MentionsService(repo, dataSource);
+
+    const stats = await service.getStats({
+      dateFrom: new Date('2026-09-01T00:00:00Z'),
+      dateTo: new Date('2026-09-08T00:00:00Z'),
+    });
+
+    expect(stats.total).toBe(5);
+    expect(stats.previousTotal).toBe(0);
+    expect(stats.changePercent).toBeNull();
+  });
+});
