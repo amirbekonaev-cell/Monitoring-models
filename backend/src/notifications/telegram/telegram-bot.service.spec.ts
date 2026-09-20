@@ -1,10 +1,9 @@
 import { ConfigService } from '@nestjs/config';
 import { TelegramBotService } from './telegram-bot.service';
-import { SettingsService } from '../../settings/settings.service';
-import { SourcesService } from '../../sources/sources.service';
-import { SourceKind, SourceStatus } from '../../sources/source.entity';
-import { OnDemandSearchService, OnDemandSearchSummary } from '../../search-on-demand/on-demand-search.service';
+import { CuratedSearchService, CuratedSearchResult, CuratedMentionView, PoolStats } from '../../curated/curated-search.service';
+import { CuratedLinkStatus } from '../../curated/curated-link.entity';
 import { Sentiment } from '../../mentions/mention.entity';
+import { DEFAULT_SEARCH_PERIOD_DAYS } from '../../curated/search-period.util';
 
 type CommandHandler = (ctx: any) => Promise<void>;
 type ActionHandler = (ctx: any) => Promise<void>;
@@ -30,77 +29,95 @@ jest.mock('telegraf', () => {
   };
 });
 
-jest.mock('@vercel/functions', () => ({
-  // Outside Vercel, waitUntil() has no runtime to extend — the real package's own behaviour when
-  // there's no request context is to just run the promise; this mock does the same so tests can
-  // await the same flushPromises() pattern regardless of how the search was kicked off.
-  waitUntil: (promise: Promise<unknown>) => {
-    promise.catch(() => undefined);
-  },
-}));
-
-/** Flushes pending microtasks — needed because the /search period handler deliberately does NOT
- * await the on-demand search (see TelegramBotService), so its result lands a few ticks later. */
-function flushPromises(): Promise<void> {
-  return new Promise((resolve) => setImmediate(resolve));
-}
-
 function makeConfig(chatId = '-1001'): ConfigService {
-  return {
-    get: jest.fn((key: string) => (key === 'telegramBot.token' ? 'tok' : key === 'telegramBot.chatId' ? chatId : '')),
-  } as unknown as ConfigService;
+  const values: Record<string, unknown> = {
+    'telegramBot.token': 'tok',
+    'telegramBot.chatId': chatId,
+    'curated.periodDays': [...DEFAULT_SEARCH_PERIOD_DAYS],
+    'curated.timezone': 'Asia/Almaty',
+    'curated.messageCharLimit': 3500,
+  };
+  return { get: jest.fn((key: string) => values[key]) } as unknown as ConfigService;
 }
 
-function makeCtx(chatId: number | string | undefined, username = 'admin') {
+function makeCtx(chatId: number | string | undefined, overrides: Record<string, unknown> = {}) {
   return {
     chat: chatId === undefined ? undefined : { id: chatId },
-    from: { id: 42, username },
+    from: { id: 42, username: 'admin' },
     reply: jest.fn(async () => undefined),
     answerCbQuery: jest.fn(async () => undefined),
     editMessageText: jest.fn(async () => undefined),
+    editMessageReplyMarkup: jest.fn(async () => undefined),
     telegram: { sendMessage: sendMessageMock },
     match: ['search_period:7', '7'],
+    ...overrides,
   };
 }
 
-function makeSourcesService(): SourcesService {
+function makePoolStats(overrides: Partial<PoolStats> = {}): PoolStats {
   return {
-    findAll: jest.fn(async () => [
-      {
-        id: 's1',
-        url: 'https://a.example/rss',
-        type: SourceKind.RSS,
-        status: SourceStatus.ACTIVE,
-        lastSuccessAt: new Date('2026-08-21T10:00:00Z'),
-      },
-      {
-        id: 's2',
-        url: 'https://b.example',
-        type: SourceKind.PARSER,
-        status: SourceStatus.ERROR,
-        lastSuccessAt: null,
-      },
-    ]),
-  } as unknown as SourcesService;
+    totalLinks: 169,
+    byStatus: {
+      [CuratedLinkStatus.PENDING]: 0,
+      [CuratedLinkStatus.PROCESSED]: 169,
+      [CuratedLinkStatus.NOT_RELEVANT]: 0,
+      [CuratedLinkStatus.FAILED]: 0,
+      [CuratedLinkStatus.EXCLUDED]: 0,
+    },
+    mentionsTotal: 169,
+    undatedMentions: 0,
+    firstArticleDate: new Date('2020-01-10T00:00:00Z'),
+    lastArticleDate: new Date('2026-09-15T00:00:00Z'),
+    lastProcessedAt: new Date('2026-09-16T08:00:00Z'),
+    ...overrides,
+  };
 }
 
-function makeOnDemandSearchService(summary?: Partial<OnDemandSearchSummary>): OnDemandSearchService {
-  const defaultSummary: OnDemandSearchSummary = {
+function makeSearchResult(overrides: Partial<CuratedSearchResult> = {}): CuratedSearchResult {
+  return {
     periodDays: 7,
-    totalMatched: 0,
-    newCount: 0,
-    knownCount: 0,
-    items: [],
-    sourcesFailed: [],
-    openAiWebSearchCalls: 1,
-    ...summary,
+    dateFrom: '2026-09-09',
+    dateTo: '2026-09-16',
+    total: 0,
+    bySentiment: {
+      [Sentiment.POSITIVE]: 0,
+      [Sentiment.NEGATIVE]: 0,
+      [Sentiment.NEUTRAL]: 0,
+      [Sentiment.UNDEFINED]: 0,
+    },
+    undatedCount: 0,
+    pool: makePoolStats(),
+    ...overrides,
   };
-  return {
-    runSearch: jest.fn(async () => defaultSummary),
-  } as unknown as OnDemandSearchService;
 }
 
-describe('TelegramBotService', () => {
+function makeMentionView(overrides: Partial<CuratedMentionView> = {}): CuratedMentionView {
+  return {
+    id: 'm-1',
+    title: 'QazCloud упомянут в статье',
+    sourceLabel: 'Подборка материалов',
+    publishedAt: new Date('2026-09-14T10:00:00Z'),
+    sentiment: Sentiment.POSITIVE,
+    summary: 'Короткий пересказ статьи.',
+    snippet: null,
+    ...overrides,
+  };
+}
+
+function makeCuratedSearchService(config: {
+  pool?: Partial<PoolStats>;
+  searchResult?: Partial<CuratedSearchResult>;
+  page?: CuratedMentionView[];
+} = {}): CuratedSearchService {
+  const pool = makePoolStats(config.pool);
+  return {
+    getPoolStats: jest.fn(async () => pool),
+    search: jest.fn(async (periodDays: number) => makeSearchResult({ periodDays, pool, ...config.searchResult })),
+    findPage: jest.fn(async () => config.page ?? []),
+  } as unknown as CuratedSearchService;
+}
+
+describe('TelegramBotService (closed-pool bot)', () => {
   beforeEach(() => {
     commandHandlers.clear();
     actionHandlers.clear();
@@ -112,32 +129,20 @@ describe('TelegramBotService', () => {
 
   async function boot(
     chatId = '-1001',
-    onDemandSearchService: OnDemandSearchService = makeOnDemandSearchService(),
-  ): Promise<{
-    service: TelegramBotService;
-    settingsService: SettingsService;
-    onDemandSearchService: OnDemandSearchService;
-  }> {
-    const settingsService = {
-      isCollectionEnabled: jest.fn(async () => true),
-      setCollectionEnabled: jest.fn(async () => undefined),
-    } as unknown as SettingsService;
-    const service = new TelegramBotService(makeConfig(chatId), settingsService, makeSourcesService(), onDemandSearchService);
+    curatedSearchService: CuratedSearchService = makeCuratedSearchService(),
+  ): Promise<{ service: TelegramBotService; curatedSearchService: CuratedSearchService }> {
+    const service = new TelegramBotService(makeConfig(chatId), curatedSearchService);
     await service.onModuleInit();
-    return { service, settingsService, onDemandSearchService };
+    return { service, curatedSearchService };
   }
 
   it('registers /status and /search on init, without starting a long-poll connection', async () => {
     await boot();
     expect(commandHandlers.has('status')).toBe(true);
     expect(commandHandlers.has('search')).toBe(true);
-    // No /pause, /resume any more — there's no background collection left for them to control
-    // (see README "Деплой на Vercel").
     expect(commandHandlers.has('pause')).toBe(false);
     expect(commandHandlers.has('resume')).toBe(false);
     expect(setMyCommandsMock).toHaveBeenCalled();
-    // A single slow/throwing update handler must never be able to take the shared webhook
-    // endpoint down for every future update too.
     expect(catchMock).toHaveBeenCalled();
   });
 
@@ -151,216 +156,340 @@ describe('TelegramBotService', () => {
   });
 
   it('throws from handleUpdate when TELEGRAM_BOT_TOKEN was never configured', async () => {
-    const settingsService = { isCollectionEnabled: jest.fn(async () => true) } as unknown as SettingsService;
     const config = { get: jest.fn(() => '') } as unknown as ConfigService;
-    const service = new TelegramBotService(config, settingsService, makeSourcesService(), makeOnDemandSearchService());
+    const service = new TelegramBotService(config, makeCuratedSearchService());
     await service.onModuleInit();
 
     await expect(service.handleUpdate({} as any)).rejects.toThrow('TELEGRAM_BOT_TOKEN');
   });
 
-  it('/status reports current state and per-channel last success', async () => {
-    await boot('-1001');
-    const ctx = makeCtx('-1001');
-
-    await commandHandlers.get('status')!(ctx);
-
-    const replied = (ctx.reply as jest.Mock).mock.calls[0]?.[0] as string;
-    expect(replied).toContain('включён');
-    expect(replied).toContain(SourceKind.RSS);
-    expect(replied).toContain(SourceKind.PARSER);
-  });
-
-  it('rejects /status from a chat that is not the configured group (e.g. a DM to the bot)', async () => {
-    const { settingsService } = await boot('-1001');
-    const dmCtx = makeCtx('999999'); // some other chat_id, e.g. a private DM
-
-    await commandHandlers.get('status')!(dmCtx);
-
-    expect(settingsService.isCollectionEnabled).not.toHaveBeenCalled();
-    expect(dmCtx.reply).toHaveBeenCalledWith('Эта команда доступна только в рабочей группе мониторинга.');
-  });
-
-  it('rejects commands when chat is entirely missing from the update', async () => {
-    await boot('-1001');
-    const ctx = makeCtx(undefined);
-
-    await commandHandlers.get('status')!(ctx);
-
-    expect(ctx.reply).toHaveBeenCalledWith('Эта команда доступна только в рабочей группе мониторинга.');
-  });
-
-  it('/search from the configured group chat shows the 5 period buttons, capped at a month', async () => {
-    await boot('-1001');
-    const ctx = makeCtx('-1001');
-
-    await commandHandlers.get('search')!(ctx);
-
-    expect(ctx.reply).toHaveBeenCalled();
-    const [, extra] = (ctx.reply as jest.Mock).mock.calls[0];
-    const buttons = extra.reply_markup.inline_keyboard.flat();
-    expect(buttons).toHaveLength(5);
-    expect(buttons.map((b: any) => b.callback_data)).toEqual(
-      expect.arrayContaining(['search_period:1', 'search_period:30']),
-    );
-  });
-
-  it('rejects /search from a chat that is not the configured group', async () => {
-    await boot('-1001');
-    const dmCtx = makeCtx('999999');
-
-    await commandHandlers.get('search')!(dmCtx);
-
-    expect(dmCtx.reply).toHaveBeenCalledWith('Эта команда доступна только в рабочей группе мониторинга.');
-  });
-
-  it('picking a period runs the combined on-demand search and reports a summary in chat', async () => {
-    const onDemandSearchService = makeOnDemandSearchService({
-      periodDays: 7,
-      totalMatched: 1,
-      newCount: 1,
-      knownCount: 0,
-      items: [
-        {
-          title: 'QazCloud упомянут на форуме',
-          url: 'https://kz-forum.example/thread/1',
-          sourceLabel: 'kz-forum.example',
-          publishedAt: new Date('2026-08-20T12:00:00Z'),
-          status: 'new',
-          sentiment: Sentiment.POSITIVE,
+  describe('/status', () => {
+    it('reports pool statistics with no URLs and no per-channel breakdown', async () => {
+      const curatedSearchService = makeCuratedSearchService({
+        pool: {
+          totalLinks: 169,
+          byStatus: {
+            [CuratedLinkStatus.PENDING]: 3,
+            [CuratedLinkStatus.PROCESSED]: 160,
+            [CuratedLinkStatus.NOT_RELEVANT]: 5,
+            [CuratedLinkStatus.FAILED]: 1,
+            [CuratedLinkStatus.EXCLUDED]: 0,
+          },
+          mentionsTotal: 160,
+          undatedMentions: 2,
         },
-      ],
-      sourcesFailed: [],
-      openAiWebSearchCalls: 1,
+      });
+      await boot('-1001', curatedSearchService);
+      const ctx = makeCtx('-1001');
+
+      await commandHandlers.get('status')!(ctx);
+
+      expect(curatedSearchService.getPoolStats).toHaveBeenCalled();
+      const replied = (ctx.reply as jest.Mock).mock.calls[0]?.[0] as string;
+      expect(replied).toContain('169 всего');
+      expect(replied).toContain('обработано 160');
+      expect(replied).toContain('не релевантны 5');
+      expect(replied).toContain('с ошибкой 1');
+      expect(replied).toContain('в очереди 3');
+      expect(replied).toContain('Без даты: 2');
+      expect(replied).not.toMatch(/https?:\/\//);
     });
-    await boot('-1001', onDemandSearchService);
-    const ctx = makeCtx('-1001');
 
-    await actionHandlers.get('/^search_period:(\\d+)$/')!(ctx);
-    await flushPromises();
+    it('rejects /status from a chat that is not the configured group (e.g. a DM to the bot)', async () => {
+      const { curatedSearchService } = await boot('-1001');
+      const dmCtx = makeCtx('999999');
 
-    expect(ctx.answerCbQuery).toHaveBeenCalled();
-    expect(ctx.editMessageText).toHaveBeenCalledWith(expect.stringContaining('Ищу за последние 7 дней'));
-    expect(onDemandSearchService.runSearch).toHaveBeenCalledWith(7);
-    expect(sendMessageMock).toHaveBeenCalled();
-    const [, message] = sendMessageMock.mock.calls[0];
-    expect(message).toContain('kz-forum.example');
-    expect(message).toContain('Всего найдено: 1');
-    expect(message).toContain('🟢 Позитив');
-  });
+      await commandHandlers.get('status')!(dmCtx);
 
-  it('shows the correct sentiment emoji and label for each of the 4 sentiment values in the /search summary', async () => {
-    const onDemandSearchService = makeOnDemandSearchService({
-      totalMatched: 4,
-      newCount: 4,
-      knownCount: 0,
-      items: [
-        {
-          title: 'Позитивная находка',
-          url: 'https://example.com/positive',
-          sourceLabel: 'example.com',
-          publishedAt: null,
-          status: 'new',
-          sentiment: Sentiment.POSITIVE,
-        },
-        {
-          title: 'Негативная находка',
-          url: 'https://example.com/negative',
-          sourceLabel: 'example.com',
-          publishedAt: null,
-          status: 'new',
-          sentiment: Sentiment.NEGATIVE,
-        },
-        {
-          title: 'Нейтральная находка',
-          url: 'https://example.com/neutral',
-          sourceLabel: 'example.com',
-          publishedAt: null,
-          status: 'new',
-          sentiment: Sentiment.NEUTRAL,
-        },
-        {
-          title: 'Ещё не классифицированная находка',
-          url: 'https://example.com/undefined',
-          sourceLabel: 'example.com',
-          publishedAt: null,
-          status: 'new',
-          sentiment: Sentiment.UNDEFINED,
-        },
-      ],
-      sourcesFailed: [],
-      openAiWebSearchCalls: 1,
+      expect(curatedSearchService.getPoolStats).not.toHaveBeenCalled();
+      expect(dmCtx.reply).toHaveBeenCalledWith('Эта команда доступна только в рабочей группе мониторинга.');
     });
-    await boot('-1001', onDemandSearchService);
-    const ctx = makeCtx('-1001');
 
-    await actionHandlers.get('/^search_period:(\\d+)$/')!(ctx);
-    await flushPromises();
+    it('rejects commands when chat is entirely missing from the update', async () => {
+      await boot('-1001');
+      const ctx = makeCtx(undefined);
 
-    const [, message] = sendMessageMock.mock.calls[0];
-    expect(message).toContain('🟢 Позитив · ' + 'Позитивная находка');
-    expect(message).toContain('🔴 Негатив · ' + 'Негативная находка');
-    expect(message).toContain('🟡 Нейтрал · ' + 'Нейтральная находка');
-    expect(message).toContain('⚪ Не определена · ' + 'Ещё не классифицированная находка');
-  });
+      await commandHandlers.get('status')!(ctx);
 
-  it('reports explicitly when nothing was found for the chosen period', async () => {
-    const onDemandSearchService = makeOnDemandSearchService({ totalMatched: 0 });
-    await boot('-1001', onDemandSearchService);
-    const ctx = makeCtx('-1001');
-
-    await actionHandlers.get('/^search_period:(\\d+)$/')!(ctx);
-    await flushPromises();
-
-    const [, message] = sendMessageMock.mock.calls[0];
-    expect(message).toContain('новых упоминаний не найдено');
-  });
-
-  it('waits for the search to finish before the handler resolves, so the DB connection stays open for the whole search', async () => {
-    let resolveSearch!: (summary: OnDemandSearchSummary) => void;
-    const slowOnDemandSearchService = {
-      runSearch: jest.fn(() => new Promise<OnDemandSearchSummary>((resolve) => (resolveSearch = resolve))),
-    } as unknown as OnDemandSearchService;
-    await boot('-1001', slowOnDemandSearchService);
-    const ctx = makeCtx('-1001');
-
-    // The handler must NOT resolve until runSearch() does — this deploy runs the backend as a
-    // Vercel "Container" function that tears down the process right after the webhook responds,
-    // so a fire-and-forget search used to get its DB connection killed mid-flight
-    // (TypeORM "Driver not Connected"). Awaiting here keeps the process alive for the whole search.
-    let handlerResolved = false;
-    const handlerPromise = actionHandlers.get('/^search_period:(\\d+)$/')!(ctx).then(() => {
-      handlerResolved = true;
+      expect(ctx.reply).toHaveBeenCalledWith('Эта команда доступна только в рабочей группе мониторинга.');
     });
-    await flushPromises();
-
-    expect(ctx.answerCbQuery).toHaveBeenCalled();
-    expect(handlerResolved).toBe(false);
-    expect(sendMessageMock).not.toHaveBeenCalled();
-
-    resolveSearch({
-      periodDays: 7,
-      totalMatched: 0,
-      newCount: 0,
-      knownCount: 0,
-      items: [],
-      sourcesFailed: [],
-      openAiWebSearchCalls: 1,
-    });
-    await handlerPromise;
-
-    expect(handlerResolved).toBe(true);
-    expect(sendMessageMock).toHaveBeenCalled();
   });
 
-  it('rejects the period-picker callback from an unauthorized chat', async () => {
-    const onDemandSearchService = makeOnDemandSearchService();
-    await boot('-1001', onDemandSearchService);
-    const ctx = makeCtx('999999');
+  describe('/search command (period picker)', () => {
+    it('shows one button per configured SEARCH_PERIOD_DAYS entry', async () => {
+      await boot('-1001');
+      const ctx = makeCtx('-1001');
 
-    await actionHandlers.get('/^search_period:(\\d+)$/')!(ctx);
+      await commandHandlers.get('search')!(ctx);
 
-    expect(onDemandSearchService.runSearch).not.toHaveBeenCalled();
-    expect(ctx.answerCbQuery).toHaveBeenCalledWith('Эта команда доступна только в рабочей группе мониторинга.');
+      expect(ctx.reply).toHaveBeenCalledWith(
+        'За какой период показать упоминания из пула ссылок?',
+        expect.anything(),
+      );
+      const [, extra] = (ctx.reply as jest.Mock).mock.calls[0];
+      const buttons = extra.reply_markup.inline_keyboard.flat();
+      expect(buttons).toHaveLength(DEFAULT_SEARCH_PERIOD_DAYS.length);
+      expect(buttons.map((b: any) => b.callback_data)).toEqual(
+        expect.arrayContaining(['search_period:1', 'search_period:730']),
+      );
+      expect(buttons.map((b: any) => b.text)).toEqual(expect.arrayContaining(['Сутки', '2 года']));
+    });
+
+    it('rejects /search from a chat that is not the configured group', async () => {
+      await boot('-1001');
+      const dmCtx = makeCtx('999999');
+
+      await commandHandlers.get('search')!(dmCtx);
+
+      expect(dmCtx.reply).toHaveBeenCalledWith('Эта команда доступна только в рабочей группе мониторинга.');
+    });
+  });
+
+  describe('search_period callback', () => {
+    it('rejects the callback from an unauthorized chat without ever touching the curated pool', async () => {
+      const { curatedSearchService } = await boot('-1001');
+      const ctx = makeCtx('999999');
+
+      await actionHandlers.get('/^search_period:(\\d+)$/')!(ctx);
+
+      expect(curatedSearchService.search).not.toHaveBeenCalled();
+      expect(ctx.answerCbQuery).toHaveBeenCalledWith('Эта команда доступна только в рабочей группе мониторинга.');
+    });
+
+    it('answers "Неизвестный период" for a days value outside SEARCH_PERIOD_DAYS, without searching', async () => {
+      const { curatedSearchService } = await boot('-1001');
+      const ctx = makeCtx('-1001', { match: ['search_period:999999', '999999'] });
+
+      await actionHandlers.get('/^search_period:(\\d+)$/')!(ctx);
+
+      expect(ctx.answerCbQuery).toHaveBeenCalledWith('Неизвестный период');
+      expect(curatedSearchService.search).not.toHaveBeenCalled();
+    });
+
+    it('never calls any collector service — /search only ever touches CuratedSearchService', async () => {
+      const curatedSearchService = makeCuratedSearchService();
+      await boot('-1001', curatedSearchService);
+      const ctx = makeCtx('-1001');
+
+      await actionHandlers.get('/^search_period:(\\d+)$/')!(ctx);
+
+      // The mock constructor takes no collector dependencies at all — this test's real assertion
+      // is structural (see the constructor signature in telegram-bot.service.ts): TelegramBotService
+      // no longer has a way to reach RSS/Parser/Telegram/NewsAPI/VK/OpenAI web search from /search.
+      expect(curatedSearchService.search).toHaveBeenCalledWith(7, expect.any(Date));
+    });
+
+    it('answers, edits the prompt message with the resolved date window, then sends the header + first page', async () => {
+      const curatedSearchService = makeCuratedSearchService({
+        searchResult: {
+          total: 1,
+          bySentiment: {
+            [Sentiment.POSITIVE]: 1,
+            [Sentiment.NEGATIVE]: 0,
+            [Sentiment.NEUTRAL]: 0,
+            [Sentiment.UNDEFINED]: 0,
+          },
+        },
+        page: [makeMentionView({ title: 'QazCloud упомянут на форуме', sentiment: Sentiment.POSITIVE })],
+      });
+      await boot('-1001', curatedSearchService);
+      const ctx = makeCtx('-1001');
+
+      await actionHandlers.get('/^search_period:(\\d+)$/')!(ctx);
+
+      expect(ctx.answerCbQuery).toHaveBeenCalled();
+      expect(ctx.editMessageText).toHaveBeenCalledWith(expect.stringContaining('Период: Неделя'));
+      expect(ctx.editMessageText).toHaveBeenCalledWith(expect.stringContaining('09.09.2026'));
+      expect(sendMessageMock).toHaveBeenCalled();
+      const [, message, extra] = sendMessageMock.mock.calls[0] as [unknown, string, any];
+      expect(message).toContain('Упоминания за Неделя');
+      expect(message).toContain('Всего: 1');
+      expect(message).toContain('🟢 1');
+      expect(message).toContain('QazCloud упомянут на форуме');
+      expect(extra.parse_mode).toBe('HTML');
+      expect(message).not.toMatch(/https?:\/\//);
+    });
+
+    it('reports the empty-pool text when the pool has no processed mentions at all', async () => {
+      const curatedSearchService = makeCuratedSearchService({
+        pool: { totalLinks: 0, mentionsTotal: 0, byStatus: { [CuratedLinkStatus.PENDING]: 0, [CuratedLinkStatus.PROCESSED]: 0, [CuratedLinkStatus.NOT_RELEVANT]: 0, [CuratedLinkStatus.FAILED]: 0, [CuratedLinkStatus.EXCLUDED]: 0 }, firstArticleDate: null, lastArticleDate: null, lastProcessedAt: null },
+        searchResult: { total: 0 },
+      });
+      await boot('-1001', curatedSearchService);
+      const ctx = makeCtx('-1001');
+
+      await actionHandlers.get('/^search_period:(\\d+)$/')!(ctx);
+
+      const [, message] = sendMessageMock.mock.calls[0];
+      expect(message).toBe('Пул ссылок пуст или ещё не обработан.');
+    });
+
+    it('reports an explicit "nothing in this period" text (with processed count + freshest date) when the pool has data but this window is empty', async () => {
+      const curatedSearchService = makeCuratedSearchService({
+        pool: { byStatus: { [CuratedLinkStatus.PENDING]: 0, [CuratedLinkStatus.PROCESSED]: 169, [CuratedLinkStatus.NOT_RELEVANT]: 0, [CuratedLinkStatus.FAILED]: 0, [CuratedLinkStatus.EXCLUDED]: 0 }, lastArticleDate: new Date('2026-08-01T00:00:00Z') },
+        searchResult: { total: 0 },
+      });
+      await boot('-1001', curatedSearchService);
+      const ctx = makeCtx('-1001');
+
+      await actionHandlers.get('/^search_period:(\\d+)$/')!(ctx);
+
+      const [, message] = sendMessageMock.mock.calls[0];
+      expect(message).toContain('упоминаний в пуле ссылок не найдено');
+      expect(message).toContain('Обработано ссылок: 169');
+      expect(message).toContain('01.08.2026');
+      expect(message).not.toMatch(/https?:\/\//);
+    });
+
+    it('mentions the undated count and the pending/failed queue in the header when present', async () => {
+      const curatedSearchService = makeCuratedSearchService({
+        searchResult: {
+          total: 1,
+          undatedCount: 4,
+          pool: makePoolStats({
+            byStatus: {
+              [CuratedLinkStatus.PENDING]: 2,
+              [CuratedLinkStatus.PROCESSED]: 165,
+              [CuratedLinkStatus.NOT_RELEVANT]: 0,
+              [CuratedLinkStatus.FAILED]: 1,
+              [CuratedLinkStatus.EXCLUDED]: 0,
+            },
+          }),
+        },
+        page: [makeMentionView()],
+      });
+      await boot('-1001', curatedSearchService);
+      const ctx = makeCtx('-1001');
+
+      await actionHandlers.get('/^search_period:(\\d+)$/')!(ctx);
+
+      const [, message] = sendMessageMock.mock.calls[0];
+      expect(message).toContain('Без даты публикации (в выборки по периоду не входят): 4');
+      expect(message).toContain('В очереди на обработку: 2 · с ошибкой: 1');
+    });
+
+    it('shows the correct sentiment emoji for each item and a "Показать ещё" button when more remain', async () => {
+      const items = Array.from({ length: 3 }, (_, i) =>
+        makeMentionView({ id: `m-${i}`, title: `Находка ${i}`, sentiment: Sentiment.NEUTRAL }),
+      );
+      const curatedSearchService = makeCuratedSearchService({
+        searchResult: { total: 50 }, // far more than the 3 items "fetched" below -> more remain
+        page: items,
+      });
+      await boot('-1001', curatedSearchService);
+      const ctx = makeCtx('-1001');
+
+      await actionHandlers.get('/^search_period:(\\d+)$/')!(ctx);
+
+      const [, message, extra] = sendMessageMock.mock.calls[0] as [unknown, string, any];
+      expect(message).toContain('🟡 Нейтрал · Находка 0');
+      const button = extra.reply_markup.inline_keyboard[0][0];
+      expect(button.text).toContain('Показать ещё');
+      expect(button.text).toContain('47'); // 50 total - 3 shown
+      expect(button.callback_data).toBe('search_more:7:3');
+    });
+
+    it('does not throw and reports a clear error (no stack trace, no URL) when the DB read fails', async () => {
+      const curatedSearchService = {
+        getPoolStats: jest.fn(async () => makePoolStats()),
+        search: jest.fn(async () => {
+          throw new Error('connection terminated unexpectedly');
+        }),
+        findPage: jest.fn(async () => []),
+      } as unknown as CuratedSearchService;
+      await boot('-1001', curatedSearchService);
+      const ctx = makeCtx('-1001');
+
+      await actionHandlers.get('/^search_period:(\\d+)$/')!(ctx);
+
+      const [, message] = sendMessageMock.mock.calls[0];
+      expect(message).toContain('Не удалось выполнить поиск');
+      expect(message).toContain('connection terminated unexpectedly');
+      expect(message).not.toMatch(/at .+\(.+:\d+:\d+\)/); // no stack-trace-shaped line
+    });
+
+    it('waits for the search to finish before the handler resolves (no fire-and-forget, no waitUntil)', async () => {
+      let resolveSearch!: (result: CuratedSearchResult) => void;
+      const slowCuratedSearchService = {
+        getPoolStats: jest.fn(async () => makePoolStats()),
+        search: jest.fn(() => new Promise<CuratedSearchResult>((resolve) => (resolveSearch = resolve))),
+        findPage: jest.fn(async () => []),
+      } as unknown as CuratedSearchService;
+      await boot('-1001', slowCuratedSearchService);
+      const ctx = makeCtx('-1001');
+
+      let handlerResolved = false;
+      const handlerPromise = actionHandlers.get('/^search_period:(\\d+)$/')!(ctx).then(() => {
+        handlerResolved = true;
+      });
+      await new Promise((resolve) => setImmediate(resolve));
+
+      expect(ctx.answerCbQuery).toHaveBeenCalled();
+      expect(handlerResolved).toBe(false);
+      expect(sendMessageMock).not.toHaveBeenCalled();
+
+      resolveSearch(makeSearchResult({ total: 0 }));
+      await handlerPromise;
+
+      expect(handlerResolved).toBe(true);
+      expect(sendMessageMock).toHaveBeenCalled();
+    });
+  });
+
+  describe('search_more callback (pagination)', () => {
+    function makeMoreCtx(chatId: number | string | undefined, days: number, offset: number) {
+      return makeCtx(chatId, { match: [`search_more:${days}:${offset}`, String(days), String(offset)] });
+    }
+
+    it('rejects the callback from an unauthorized chat', async () => {
+      const { curatedSearchService } = await boot('-1001');
+      const ctx = makeMoreCtx('999999', 7, 3);
+
+      await actionHandlers.get('/^search_more:(\\d+):(\\d+)$/')!(ctx);
+
+      expect(curatedSearchService.findPage).not.toHaveBeenCalled();
+      expect(ctx.answerCbQuery).toHaveBeenCalledWith('Эта команда доступна только в рабочей группе мониторинга.');
+    });
+
+    it('answers "Некорректный запрос" for a days value outside SEARCH_PERIOD_DAYS', async () => {
+      const { curatedSearchService } = await boot('-1001');
+      const ctx = makeMoreCtx('-1001', 999999, 0);
+
+      await actionHandlers.get('/^search_more:(\\d+):(\\d+)$/')!(ctx);
+
+      expect(ctx.answerCbQuery).toHaveBeenCalledWith('Некорректный запрос');
+      expect(curatedSearchService.findPage).not.toHaveBeenCalled();
+    });
+
+    it('clears the keyboard on the previous message, fetches the next page at the given offset, and reports the correct remaining count', async () => {
+      const items = [makeMentionView({ id: 'm-4', title: 'Находка 4' })];
+      const curatedSearchService = makeCuratedSearchService({
+        searchResult: { total: 5 },
+        page: items,
+      });
+      await boot('-1001', curatedSearchService);
+      const ctx = makeMoreCtx('-1001', 7, 4);
+
+      await actionHandlers.get('/^search_more:(\\d+):(\\d+)$/')!(ctx);
+
+      expect(ctx.answerCbQuery).toHaveBeenCalled();
+      expect(ctx.editMessageReplyMarkup).toHaveBeenCalledWith({ inline_keyboard: [] });
+      expect(curatedSearchService.findPage).toHaveBeenCalledWith(7, 4, expect.any(Number), expect.any(Date));
+      const [, message, extra] = sendMessageMock.mock.calls[0] as [unknown, string, any];
+      expect(message).toContain('5. '); // startIndex = offset + 1
+      expect(message).toContain('Находка 4');
+      expect(extra.reply_markup).toBeUndefined(); // 4 (offset) + 1 (shown) = 5 = total -> nothing left
+    });
+
+    it('sends a "no more records" message instead of an empty Telegram message when the offset is already past the end', async () => {
+      const curatedSearchService = makeCuratedSearchService({ searchResult: { total: 2 }, page: [] });
+      await boot('-1001', curatedSearchService);
+      const ctx = makeMoreCtx('-1001', 7, 2);
+
+      await actionHandlers.get('/^search_more:(\\d+):(\\d+)$/')!(ctx);
+
+      const [, message] = sendMessageMock.mock.calls[0];
+      expect(message).toBe('Больше записей нет.');
+    });
   });
 });
