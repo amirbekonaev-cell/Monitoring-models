@@ -1,4 +1,5 @@
 import { resolveDbConfig } from './database.util';
+import { parseSearchPeriodDays } from '../curated/search-period.util';
 
 export default () => ({
   port: parseInt(process.env.PORT || '3000', 10),
@@ -73,6 +74,19 @@ export default () => ({
     // process.env in collector-run.util.ts (a plain function, not part of Nest DI) — kept here
     // too so the schema/default is documented in one place alongside every other setting.
     days: parseInt(process.env.BACKFILL_DAYS || '60', 10),
+  },
+  curated: {
+    // /search and /status now read only this closed pool of pre-vetted links (see
+    // CuratedSearchService) — no network/collector calls happen during either command any more.
+    // Calendar-day window boundaries (dateFrom/dateTo) are computed in this timezone, not UTC —
+    // see curated-date.util.ts.
+    timezone: process.env.SEARCH_TIMEZONE || 'Asia/Almaty',
+    // /search period picker buttons — see search-period.util.ts for validation/defaults/labels.
+    periodDays: parseSearchPeriodDays(process.env.SEARCH_PERIOD_DAYS),
+    // Greedy per-message packing limit for the /search results list (Telegram messages are
+    // capped ~4096 chars) — a page holds as many items as fit under this, then a "Показать ещё"
+    // button loads the rest.
+    messageCharLimit: parseInt(process.env.SEARCH_MESSAGE_CHAR_LIMIT || '3500', 10),
   },
   excludedDomains: {
     // Comma-separated domain blacklist (each entry also covers its subdomains) — a domain here

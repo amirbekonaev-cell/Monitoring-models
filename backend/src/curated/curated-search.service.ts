@@ -1,0 +1,200 @@
+import { Injectable } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
+import { InjectRepository } from '@nestjs/typeorm';
+import { Repository } from 'typeorm';
+import { Mention, Sentiment } from '../mentions/mention.entity';
+import { CuratedLink, CuratedLinkStatus } from './curated-link.entity';
+import { subtractCalendarDays, zonedDateString } from './curated-date.util';
+import { truncateText } from './text.util';
+
+export const CURATED_DEFAULT_SOURCE_LABEL = 'Подборка материалов';
+const SUMMARY_DISPLAY_LENGTH = 250;
+const SNIPPET_DISPLAY_LENGTH = 200;
+/** Generous enough to cover any realistic /search message page (see curated-message.util.ts's
+ *  greedy packing) without an extra round-trip — the whole pool is a few hundred links at most. */
+const PAGE_FETCH_LIMIT = 500;
+
+export interface PoolStats {
+  totalLinks: number;
+  byStatus: Record<CuratedLinkStatus, number>;
+  mentionsTotal: number;
+  undatedMentions: number;
+  firstArticleDate: Date | null;
+  lastArticleDate: Date | null;
+  lastProcessedAt: Date | null;
+}
+
+export interface CuratedSearchResult {
+  periodDays: number;
+  /** Calendar dates ("YYYY-MM-DD") in the configured timezone — see curated-date.util.ts. */
+  dateFrom: string;
+  dateTo: string;
+  total: number;
+  bySentiment: Record<Sentiment, number>;
+  /** Curated mentions with no publishedAt at all — never inside any period window, counted here instead. */
+  undatedCount: number;
+  pool: PoolStats;
+}
+
+export interface CuratedMentionView {
+  id: string;
+  title: string;
+  sourceLabel: string;
+  publishedAt: Date | null;
+  sentiment: Sentiment;
+  /** Pre-truncated (~250 chars) LLM summary, or null when the mention has none yet. */
+  summary: string | null;
+  /** Pre-truncated (~200 chars) fallback built from the raw text — the message formatter uses
+   *  this only when `summary` is null. */
+  snippet: string | null;
+}
+
+/**
+ * Read-only view over the closed pool of pre-vetted links (`curated_links` + the `mentions` rows
+ * they produced) — the only thing /search and /status touch. Never queries any collector, never
+ * does network I/O; every method here is a DB read. Never selects `mentions.url`/`mentions.reprints`
+ * — those columns must never reach a Telegram message (see README "Приватность").
+ *
+ * Extended by ПРОМПТ 2's ingestion script (which owns writing to `curated_links`/inserting the
+ * mentions themselves) — this service's public method signatures are a contract for that script's
+ * callers too, so avoid changing them without a reason that touches both prompts.
+ */
+@Injectable()
+export class CuratedSearchService {
+  constructor(
+    @InjectRepository(Mention)
+    private readonly mentionsRepo: Repository<Mention>,
+    @InjectRepository(CuratedLink)
+    private readonly curatedLinksRepo: Repository<CuratedLink>,
+    private readonly config: ConfigService,
+  ) {}
+
+  private get timezone(): string {
+    return this.config.get<string>('curated.timezone') || 'Asia/Almaty';
+  }
+
+  private dateWindow(periodDays: number, now: Date): { tz: string; dateFrom: string; dateTo: string } {
+    const tz = this.timezone;
+    const dateTo = zonedDateString(now, tz);
+    const dateFrom = subtractCalendarDays(dateTo, periodDays);
+    return { tz, dateFrom, dateTo };
+  }
+
+  /** Mentions produced by the pool, dated, inside the calendar-day window in the configured timezone. */
+  private inWindowQuery(tz: string, dateFrom: string, dateTo: string) {
+    return this.mentionsRepo
+      .createQueryBuilder('m')
+      .where('m.curatedLinkId IS NOT NULL')
+      .andWhere('m.publishedAt IS NOT NULL')
+      // published_at is timestamptz; casting to ::date only after shifting to `tz` is what makes
+      // the boundary a calendar midnight in Asia/Almaty, not UTC — see curated-date.util.ts.
+      .andWhere('(m.publishedAt AT TIME ZONE :tz)::date BETWEEN :dateFrom AND :dateTo', { tz, dateFrom, dateTo });
+  }
+
+  async search(periodDays: number, now: Date = new Date()): Promise<CuratedSearchResult> {
+    const { tz, dateFrom, dateTo } = this.dateWindow(periodDays, now);
+
+    const total = await this.inWindowQuery(tz, dateFrom, dateTo).getCount();
+
+    const bySentimentRaw = await this.inWindowQuery(tz, dateFrom, dateTo)
+      .select('m.sentiment', 'sentiment')
+      .addSelect('COUNT(*)', 'count')
+      .groupBy('m.sentiment')
+      .getRawMany<{ sentiment: Sentiment; count: string }>();
+    const bySentiment = zeroedSentimentRecord();
+    for (const row of bySentimentRaw) {
+      bySentiment[row.sentiment] = parseInt(row.count, 10);
+    }
+
+    const undatedCount = await this.mentionsRepo
+      .createQueryBuilder('m')
+      .where('m.curatedLinkId IS NOT NULL')
+      .andWhere('m.publishedAt IS NULL')
+      .getCount();
+
+    const pool = await this.getPoolStats();
+
+    return { periodDays, dateFrom, dateTo, total, bySentiment, undatedCount, pool };
+  }
+
+  /**
+   * One page of dated, in-window curated mentions, `published_at DESC, id ASC`. `offset` counts
+   * from the start of the whole (unpaginated) window, matching the running total /search's
+   * "Показать ещё" button reports — not from any previous page.
+   */
+  async findPage(periodDays: number, offset: number, limit: number, now: Date = new Date()): Promise<CuratedMentionView[]> {
+    const { tz, dateFrom, dateTo } = this.dateWindow(periodDays, now);
+
+    const rows = await this.inWindowQuery(tz, dateFrom, dateTo)
+      .select(['m.id', 'm.title', 'm.sourceLabel', 'm.publishedAt', 'm.sentiment', 'm.summary', 'm.text'])
+      .orderBy('m.publishedAt', 'DESC')
+      .addOrderBy('m.id', 'ASC')
+      .offset(offset)
+      .limit(Math.min(limit, PAGE_FETCH_LIMIT))
+      .getMany();
+
+    return rows.map((m) => ({
+      id: m.id,
+      title: m.title,
+      sourceLabel: m.sourceLabel ?? CURATED_DEFAULT_SOURCE_LABEL,
+      publishedAt: m.publishedAt,
+      sentiment: m.sentiment,
+      summary: m.summary ? truncateText(m.summary, SUMMARY_DISPLAY_LENGTH) : null,
+      snippet: m.text ? truncateText(m.text, SNIPPET_DISPLAY_LENGTH) : null,
+    }));
+  }
+
+  async getPoolStats(): Promise<PoolStats> {
+    const totalLinks = await this.curatedLinksRepo.count();
+
+    const byStatusRaw = await this.curatedLinksRepo
+      .createQueryBuilder('c')
+      .select('c.status', 'status')
+      .addSelect('COUNT(*)', 'count')
+      .groupBy('c.status')
+      .getRawMany<{ status: CuratedLinkStatus; count: string }>();
+    const byStatus = zeroedStatusRecord();
+    for (const row of byStatusRaw) {
+      byStatus[row.status] = parseInt(row.count, 10);
+    }
+
+    const mentionsTotal = await this.mentionsRepo.createQueryBuilder('m').where('m.curatedLinkId IS NOT NULL').getCount();
+
+    const undatedMentions = await this.mentionsRepo
+      .createQueryBuilder('m')
+      .where('m.curatedLinkId IS NOT NULL')
+      .andWhere('m.publishedAt IS NULL')
+      .getCount();
+
+    const dateRange = await this.mentionsRepo
+      .createQueryBuilder('m')
+      .select('MIN(m.publishedAt)', 'first')
+      .addSelect('MAX(m.publishedAt)', 'last')
+      .where('m.curatedLinkId IS NOT NULL')
+      .andWhere('m.publishedAt IS NOT NULL')
+      .getRawOne<{ first: Date | null; last: Date | null }>();
+
+    const lastProcessed = await this.curatedLinksRepo
+      .createQueryBuilder('c')
+      .select('MAX(c.processedAt)', 'lastProcessedAt')
+      .getRawOne<{ lastProcessedAt: Date | null }>();
+
+    return {
+      totalLinks,
+      byStatus,
+      mentionsTotal,
+      undatedMentions,
+      firstArticleDate: dateRange?.first ?? null,
+      lastArticleDate: dateRange?.last ?? null,
+      lastProcessedAt: lastProcessed?.lastProcessedAt ?? null,
+    };
+  }
+}
+
+function zeroedSentimentRecord(): Record<Sentiment, number> {
+  return Object.values(Sentiment).reduce((acc, s) => ({ ...acc, [s]: 0 }), {} as Record<Sentiment, number>);
+}
+
+function zeroedStatusRecord(): Record<CuratedLinkStatus, number> {
+  return Object.values(CuratedLinkStatus).reduce((acc, s) => ({ ...acc, [s]: 0 }), {} as Record<CuratedLinkStatus, number>);
+}
