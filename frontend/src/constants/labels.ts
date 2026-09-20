@@ -16,6 +16,7 @@ export const SOURCE_KIND_LABELS: Record<SourceKind, string> = {
   search_api: 'Поисковый API (К-1)',
   social_api: 'Соцсеть VK (К-4)',
   social_search_api: 'Соцсети через OpenAI web search (К-6)',
+  curated: 'Подборка материалов',
 };
 
 export const LANGUAGE_LABELS: Record<string, string> = {

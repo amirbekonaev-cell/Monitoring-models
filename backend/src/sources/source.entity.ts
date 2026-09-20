@@ -8,6 +8,10 @@ export enum SourceKind {
   SOCIAL_API = 'social_api',
   // К-6: соцсети/Telegram-каналы через OpenAI web search (не прямой API соцсети).
   SOCIAL_SEARCH_API = 'social_search_api',
+  // Единственный источник, который опрашивает /search теперь — закрытый пул ссылок
+  // (curated_links), обрабатываемых заранее отдельным скриптом (ПРОМПТ 2), не сборщиком.
+  // Ровно одна системная запись (url `curated://internal`) — см. CuratedSourceBootstrapService.
+  CURATED = 'curated',
 }
 
 export enum SourceStatus {

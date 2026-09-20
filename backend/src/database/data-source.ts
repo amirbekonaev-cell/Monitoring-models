@@ -5,6 +5,7 @@ import { Source } from '../sources/source.entity';
 import { Mention } from '../mentions/mention.entity';
 import { Keyword } from '../keywords/keyword.entity';
 import { Setting } from '../settings/setting.entity';
+import { CuratedLink } from '../curated/curated-link.entity';
 import { resolveDbConfig } from '../config/database.util';
 
 config();
@@ -19,7 +20,7 @@ export const AppDataSource = new DataSource({
   password: db.password,
   database: db.database,
   ssl: db.ssl,
-  entities: [Source, Mention, Keyword, Setting],
+  entities: [Source, Mention, Keyword, Setting, CuratedLink],
   migrations: [__dirname + '/migrations/*.{ts,js}'],
   synchronize: false,
 });
