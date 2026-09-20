@@ -48,7 +48,7 @@ export interface MentionsStats {
   topSources: { sourceId: string | null; name: string | null; count: number }[];
 }
 
-export type SourceKind = 'rss' | 'telegram' | 'parser' | 'search_api' | 'social_api' | 'social_search_api';
+export type SourceKind = 'rss' | 'telegram' | 'parser' | 'search_api' | 'social_api' | 'social_search_api' | 'curated';
 export type SourceStatus = 'active' | 'error' | 'disabled';
 
 export interface Source {

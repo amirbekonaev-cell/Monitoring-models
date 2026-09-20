@@ -26,6 +26,7 @@ import { Source } from '../sources/source.entity';
 import { Mention, Sentiment } from '../mentions/mention.entity';
 import { Keyword } from '../keywords/keyword.entity';
 import { Setting } from '../settings/setting.entity';
+import { CuratedLink } from '../curated/curated-link.entity';
 import { ParserService } from '../collectors/parser/parser.service';
 import { SentimentAnalysisService } from '../sentiment/sentiment-analysis.service';
 
@@ -47,7 +48,7 @@ import { SentimentAnalysisService } from '../sentiment/sentiment-analysis.servic
         password: config.get<string>('db.password'),
         database: config.get<string>('db.database'),
         ssl: config.get('db.ssl'),
-        entities: [Source, Mention, Keyword, Setting],
+        entities: [Source, Mention, Keyword, Setting, CuratedLink],
         synchronize: false,
       }),
     }),

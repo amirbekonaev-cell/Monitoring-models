@@ -90,6 +90,20 @@ export class Mention {
   @Column({ type: 'jsonb', default: () => "'[]'" })
   reprints: MentionReprint[];
 
+  /**
+   * Durable "never show this URL again" flag for the closed-pool Telegram bot (see
+   * CuratedSearchService). Deliberately its own column rather than derived from
+   * `curatedLinkId IS NOT NULL`: deleting the curated_links row (ON DELETE SET NULL) must never
+   * make the URL eligible to be shown again.
+   */
+  @Column({ name: 'url_hidden', type: 'boolean', default: false })
+  urlHidden: boolean;
+
+  /** Set only for mentions produced by the closed-pool ingestion script (ПРОМПТ 2) — see
+   *  CuratedSearchService, which is the only reader of this column. */
+  @Column({ name: 'curated_link_id', type: 'uuid', nullable: true })
+  curatedLinkId: string | null;
+
   @CreateDateColumn({ name: 'created_at', type: 'timestamptz' })
   createdAt: Date;
 }

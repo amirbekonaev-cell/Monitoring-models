@@ -16,10 +16,8 @@ import { fetchParserWithDeepScan, describeParserDeepScanNote } from '../../colle
 import { ParserDeepScanStrategy } from '../../collectors/parser/parser.service';
 
 // Onboarding's "Добавить по ссылке" is its own single Vercel Hobby request (60s hard cap — see
-// telegram-bot.service.ts), same as /search, but only ever runs the deep pass for exactly one
-// brand-new source — so unlike PARSER_ONDEMAND_SOURCE_BUDGET_MS in on-demand-search.service.ts
-// (which has to be split across however many sources are due in one shared /search call), this can
-// afford to use most of the whole request's budget on that one source.
+// telegram-bot.service.ts) that only ever runs the deep pass for exactly one brand-new source —
+// so it can afford to use most of the whole request's budget on that one source.
 const PARSER_ONBOARDING_TIME_BUDGET_MS = parseInt(process.env.PARSER_ONBOARDING_SOURCE_BUDGET_MS || '45000', 10);
 
 const SOURCE_TYPE_TO_MENTION_TYPE: Record<SourceKind, MentionSourceType> = {
@@ -31,6 +29,9 @@ const SOURCE_TYPE_TO_MENTION_TYPE: Record<SourceKind, MentionSourceType> = {
   // К-6 sources are only ever created by SocialSearchSchedulerService, never through "add by
   // link" onboarding — present here only so this map stays a total function over SourceKind.
   [SourceKind.SOCIAL_SEARCH_API]: MentionSourceType.SOCIAL_SEARCH,
+  // The single curated_links system source is only ever created idempotently at startup (see
+  // CuratedSourceBootstrapService), never through "add by link" — present here for the same reason.
+  [SourceKind.CURATED]: MentionSourceType.OTHER,
 };
 
 export interface AddByLinkResult {

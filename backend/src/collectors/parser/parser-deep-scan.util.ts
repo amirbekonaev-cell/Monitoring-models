@@ -52,13 +52,14 @@ export interface ParserDeepScanResult {
 /**
  * Runs the sitemap/HTML-pagination deep pass for a PARSER source and nothing else — see the
  * file-level comment for why there's no separate "fast path" to merge with, unlike
- * fetchRssWithDeepScan. Used by both SourceOnboardingService (one-time test collection, which also
- * uses `strategy` to build an admin-facing deepScanNote) and OnDemandSearchService (/search) so the
- * two never drift — same reasoning as fetchRssWithDeepScan.
+ * fetchRssWithDeepScan. Used by SourceOnboardingService (one-time test collection right after
+ * "Добавить по ссылке", which also uses `strategy` to build an admin-facing deepScanNote) — the
+ * only caller left now that /search reads a closed pool of pre-vetted links instead of polling
+ * collectors (see CuratedSearchService).
  *
  * `budget` is required (not optional, unlike ParserService.deepCollect's own DeepScanBudget) —
- * every caller of this function sits inside a single Vercel Hobby request capped at 60s (see
- * telegram-bot.service.ts), so there is no legitimate caller that should run this unbounded.
+ * every caller of this function sits inside a single Vercel Hobby request capped at 60s, so there
+ * is no legitimate caller that should run this unbounded.
  */
 export async function fetchParserWithDeepScan(params: {
   source: Source;

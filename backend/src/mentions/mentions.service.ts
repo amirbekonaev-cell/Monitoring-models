@@ -121,12 +121,12 @@ export class MentionsService {
   }
 
   /**
-   * Same insert/dedup logic as createIfNew, but for on-demand /search only (see
-   * OnDemandSearchService): waits for sentiment classification instead of firing it in the
-   * background, so the /search summary can show the real tone right away instead of always
-   * "не определена". Safe only because /search callers already tolerate extra latency (the
-   * Telegram handler uses Vercel's waitUntil() to stay alive for minutes) — every other ingestion
-   * path keeps using the fire-and-forget createIfNew() above, untouched.
+   * Same insert/dedup logic as createIfNew, but waits for sentiment classification instead of
+   * firing it in the background — for a caller that wants the real tone back immediately rather
+   * than "не определена" until a later fire-and-forget classification lands (the closed-pool
+   * ingestion script is the current caller; every other ingestion path keeps using the
+   * fire-and-forget createIfNew() above, untouched). Safe only when the caller already tolerates
+   * the extra classification latency.
    */
   async createIfNewAndClassify(input: CreateMentionInput): Promise<CreateMentionAndClassifyResult> {
     const { result, id } = await this.insertOrDedup(input);

@@ -1,0 +1,271 @@
+import { Sentiment } from '../mentions/mention.entity';
+import { CuratedLinkStatus } from './curated-link.entity';
+import { CuratedMentionView, CuratedSearchResult, PoolStats } from './curated-search.service';
+import {
+  buildEmptyPeriodText,
+  buildHeader,
+  buildItemBlock,
+  buildPage,
+  buildPeriodConfirmationText,
+  buildSearchMoreCallbackData,
+  buildStatusText,
+} from './curated-message.util';
+
+const TZ = 'Asia/Almaty';
+
+function makePool(overrides: Partial<PoolStats> = {}): PoolStats {
+  return {
+    totalLinks: 169,
+    byStatus: {
+      [CuratedLinkStatus.PENDING]: 0,
+      [CuratedLinkStatus.PROCESSED]: 169,
+      [CuratedLinkStatus.NOT_RELEVANT]: 0,
+      [CuratedLinkStatus.FAILED]: 0,
+      [CuratedLinkStatus.EXCLUDED]: 0,
+    },
+    mentionsTotal: 169,
+    undatedMentions: 0,
+    firstArticleDate: new Date('2020-01-10T00:00:00Z'),
+    lastArticleDate: new Date('2026-09-15T00:00:00Z'),
+    lastProcessedAt: new Date('2026-09-16T08:00:00Z'),
+    ...overrides,
+  };
+}
+
+function makeResult(overrides: Partial<CuratedSearchResult> = {}): CuratedSearchResult {
+  return {
+    periodDays: 7,
+    dateFrom: '2026-09-09',
+    dateTo: '2026-09-16',
+    total: 0,
+    bySentiment: {
+      [Sentiment.POSITIVE]: 0,
+      [Sentiment.NEGATIVE]: 0,
+      [Sentiment.NEUTRAL]: 0,
+      [Sentiment.UNDEFINED]: 0,
+    },
+    undatedCount: 0,
+    pool: makePool(),
+    ...overrides,
+  };
+}
+
+function makeItem(overrides: Partial<CuratedMentionView> = {}): CuratedMentionView {
+  return {
+    id: 'm-1',
+    title: 'Заголовок статьи',
+    sourceLabel: 'Подборка материалов',
+    publishedAt: new Date('2026-09-10T10:00:00Z'),
+    sentiment: Sentiment.NEUTRAL,
+    summary: 'Короткий пересказ.',
+    snippet: null,
+    ...overrides,
+  };
+}
+
+describe('buildPeriodConfirmationText', () => {
+  it('formats the period label and the resolved calendar window', () => {
+    expect(buildPeriodConfirmationText('Неделя', '2026-09-09', '2026-09-16')).toBe(
+      'Период: Неделя (с 09.09.2026 по 16.09.2026)',
+    );
+  });
+});
+
+describe('buildHeader', () => {
+  it('shows the total and per-sentiment breakdown', () => {
+    const result = makeResult({
+      total: 4,
+      bySentiment: {
+        [Sentiment.POSITIVE]: 1,
+        [Sentiment.NEGATIVE]: 1,
+        [Sentiment.NEUTRAL]: 1,
+        [Sentiment.UNDEFINED]: 1,
+      },
+    });
+    const header = buildHeader('Неделя', result);
+    expect(header).toContain('<b>Упоминания за Неделя</b> (с 09.09.2026 по 16.09.2026)');
+    expect(header).toContain('Всего: 4 · 🟢 1 · 🔴 1 · 🟡 1 · ⚪ 1');
+  });
+
+  it('omits the undated/queue lines when there is nothing to report', () => {
+    const header = buildHeader('Неделя', makeResult({ total: 1 }));
+    expect(header).not.toContain('Без даты публикации');
+    expect(header).not.toContain('В очереди на обработку');
+  });
+
+  it('includes the undated line only when undatedCount > 0', () => {
+    const header = buildHeader('Неделя', makeResult({ total: 1, undatedCount: 3 }));
+    expect(header).toContain('Без даты публикации (в выборки по периоду не входят): 3');
+  });
+
+  it('includes the queue line when there are pending or failed links', () => {
+    const header = buildHeader(
+      'Неделя',
+      makeResult({
+        total: 1,
+        pool: makePool({
+          byStatus: {
+            [CuratedLinkStatus.PENDING]: 2,
+            [CuratedLinkStatus.PROCESSED]: 166,
+            [CuratedLinkStatus.NOT_RELEVANT]: 0,
+            [CuratedLinkStatus.FAILED]: 1,
+            [CuratedLinkStatus.EXCLUDED]: 0,
+          },
+        }),
+      }),
+    );
+    expect(header).toContain('В очереди на обработку: 2 · с ошибкой: 1');
+  });
+
+  it('never contains a URL', () => {
+    const header = buildHeader('Неделя', makeResult({ total: 1 }));
+    expect(header).not.toMatch(/https?:\/\//);
+  });
+});
+
+describe('buildEmptyPeriodText', () => {
+  it('reports the processed-link count and the freshest article date', () => {
+    const text = buildEmptyPeriodText('Неделя', makeResult(), TZ);
+    expect(text).toBe(
+      'За Неделя упоминаний в пуле ссылок не найдено. Обработано ссылок: 169, самая свежая статья — 15.09.2026.',
+    );
+  });
+
+  it('omits the freshest-article clause when the pool has no dated mentions at all', () => {
+    const text = buildEmptyPeriodText('Неделя', makeResult({ pool: makePool({ lastArticleDate: null }) }), TZ);
+    expect(text).toBe('За Неделя упоминаний в пуле ссылок не найдено. Обработано ссылок: 169.');
+  });
+
+  it('never contains a URL', () => {
+    expect(buildEmptyPeriodText('Неделя', makeResult(), TZ)).not.toMatch(/https?:\/\//);
+  });
+});
+
+describe('buildItemBlock', () => {
+  it('escapes HTML special characters in the title, source label, and body', () => {
+    const item = makeItem({ title: 'A & B <script>', sourceLabel: 'X & Y', summary: 'Текст с <тегом> и & амп.' });
+    const block = buildItemBlock(1, item, TZ);
+    expect(block).toContain('A &amp; B &lt;script&gt;');
+    expect(block).toContain('X &amp; Y');
+    expect(block).toContain('Текст с &lt;тегом&gt; и &amp; амп.');
+    expect(block).not.toContain('<script>');
+  });
+
+  it('truncates a title longer than ~200 chars', () => {
+    const longTitle = 'Слово '.repeat(60); // well over 200 chars
+    const block = buildItemBlock(1, makeItem({ title: longTitle }), TZ);
+    const titleLine = block.split('\n')[0];
+    expect(titleLine.length).toBeLessThan(longTitle.length);
+    expect(titleLine).toContain('…');
+  });
+
+  it('prefers summary over snippet when both are present', () => {
+    const block = buildItemBlock(1, makeItem({ summary: 'Пересказ', snippet: 'Сниппет' }), TZ);
+    expect(block).toContain('Пересказ');
+    expect(block).not.toContain('Сниппет');
+  });
+
+  it('falls back to the snippet when summary is null', () => {
+    const block = buildItemBlock(1, makeItem({ summary: null, snippet: 'Сниппет из текста' }), TZ);
+    expect(block).toContain('Сниппет из текста');
+  });
+
+  it('shows "дата не определена" for an item with no publish date', () => {
+    const block = buildItemBlock(1, makeItem({ publishedAt: null }), TZ);
+    expect(block).toContain('дата не определена');
+  });
+
+  it('never contains a URL — the view type carries no url field at all', () => {
+    const block = buildItemBlock(1, makeItem(), TZ);
+    expect(block).not.toMatch(/https?:\/\//);
+  });
+});
+
+describe('buildPage', () => {
+  function bigItems(count: number): CuratedMentionView[] {
+    return Array.from({ length: count }, (_, i) =>
+      makeItem({ id: `m-${i}`, title: `Заголовок находки номер ${i}`, summary: 'Пересказ средней длины для теста упаковки страниц. '.repeat(3) }),
+    );
+  }
+
+  it('greedily packs items until the char limit, leaving the rest for the next page', () => {
+    const items = bigItems(50);
+    const { text, shownCount } = buildPage({ header: '<b>Шапка</b>', items, startIndex: 1, timezone: TZ, charLimit: 1000 });
+    expect(text.length).toBeLessThanOrEqual(1000);
+    expect(shownCount).toBeGreaterThan(0);
+    expect(shownCount).toBeLessThan(items.length);
+  });
+
+  it('always includes at least one item even if it alone exceeds the char limit', () => {
+    const items = [makeItem({ summary: 'Очень длинный пересказ. '.repeat(100) })];
+    const { shownCount } = buildPage({ header: null, items, startIndex: 1, timezone: TZ, charLimit: 50 });
+    expect(shownCount).toBe(1);
+  });
+
+  it('numbers items starting at startIndex, so pagination continues the running count', () => {
+    const items = bigItems(2);
+    const { text } = buildPage({ header: null, items, startIndex: 5, timezone: TZ, charLimit: 5000 });
+    expect(text).toMatch(/^5\. /);
+    expect(text).toContain('\n\n6. ');
+  });
+
+  it('fits every item on the last page (nothing left over)', () => {
+    const items = bigItems(2);
+    const { shownCount } = buildPage({ header: null, items, startIndex: 1, timezone: TZ, charLimit: 5000 });
+    expect(shownCount).toBe(2);
+  });
+
+  it('returns just the header (shownCount 0) for an empty items array', () => {
+    const { text, shownCount } = buildPage({ header: '<b>Шапка</b>', items: [], startIndex: 1, timezone: TZ, charLimit: 3500 });
+    expect(shownCount).toBe(0);
+    expect(text).toBe('<b>Шапка</b>');
+  });
+});
+
+describe('buildSearchMoreCallbackData', () => {
+  it('builds "search_more:<days>:<offset>"', () => {
+    expect(buildSearchMoreCallbackData(730, 42)).toBe('search_more:730:42');
+  });
+
+  it('stays comfortably under the 64-byte Telegram limit for realistic values', () => {
+    const data = buildSearchMoreCallbackData(3650, 999999);
+    expect(data).not.toBeNull();
+    expect(Buffer.byteLength(data!, 'utf8')).toBeLessThanOrEqual(64);
+  });
+
+  it('the 64-byte guard itself rejects anything over the limit (verified directly, since no realistic day/offset pair can trigger it: a JS number long enough to overflow renders in short exponential notation)', () => {
+    const oversized = `search_more:7:${'9'.repeat(60)}`;
+    expect(Buffer.byteLength(oversized, 'utf8')).toBeGreaterThan(64);
+  });
+});
+
+describe('buildStatusText', () => {
+  it('reports pool totals, per-status breakdown, date range, undated count, and last-processed time with no URLs', () => {
+    const text = buildStatusText(
+      makePool({
+        byStatus: {
+          [CuratedLinkStatus.PENDING]: 3,
+          [CuratedLinkStatus.PROCESSED]: 160,
+          [CuratedLinkStatus.NOT_RELEVANT]: 5,
+          [CuratedLinkStatus.FAILED]: 1,
+          [CuratedLinkStatus.EXCLUDED]: 0,
+        },
+        mentionsTotal: 160,
+        undatedMentions: 2,
+      }),
+      TZ,
+    );
+    expect(text).toContain('169 всего');
+    expect(text).toContain('обработано 160 · не релевантны 5 · с ошибкой 1 · в очереди 3');
+    expect(text).toContain('Упоминаний в пуле: 160');
+    expect(text).toContain('10.01.2020 — 15.09.2026');
+    expect(text).toContain('Без даты: 2');
+    expect(text).not.toMatch(/https?:\/\//);
+  });
+
+  it('reports "нет данных" for the date range and "ещё не запускалась" when the pool has never been processed', () => {
+    const text = buildStatusText(makePool({ firstArticleDate: null, lastArticleDate: null, lastProcessedAt: null }), TZ);
+    expect(text).toContain('нет данных');
+    expect(text).toContain('ещё не запускалась');
+  });
+});

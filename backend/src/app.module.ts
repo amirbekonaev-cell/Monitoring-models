@@ -7,6 +7,7 @@ import { Source } from './sources/source.entity';
 import { Mention } from './mentions/mention.entity';
 import { Keyword } from './keywords/keyword.entity';
 import { Setting } from './settings/setting.entity';
+import { CuratedLink } from './curated/curated-link.entity';
 import { SourcesModule } from './sources/sources.module';
 import { MentionsModule } from './mentions/mentions.module';
 import { KeywordsModule } from './keywords/keywords.module';
@@ -20,6 +21,7 @@ import { SocialSearchCollectorModule } from './collectors/social-search/social-s
 import { SourceOnboardingModule } from './sources/onboarding/source-onboarding.module';
 import { TelegramBotModule } from './notifications/telegram/telegram-bot.module';
 import { SentimentModule } from './sentiment/sentiment.module';
+import { CuratedModule } from './curated/curated.module';
 
 @Module({
   imports: [
@@ -36,7 +38,7 @@ import { SentimentModule } from './sentiment/sentiment.module';
         password: config.get<string>('db.password'),
         database: config.get<string>('db.database'),
         ssl: config.get('db.ssl'),
-        entities: [Source, Mention, Keyword, Setting],
+        entities: [Source, Mention, Keyword, Setting, CuratedLink],
         synchronize: false,
       }),
     }),
@@ -52,6 +54,7 @@ import { SentimentModule } from './sentiment/sentiment.module';
     SocialSearchCollectorModule,
     SourceOnboardingModule,
     SentimentModule,
+    CuratedModule,
     TelegramBotModule,
   ],
 })

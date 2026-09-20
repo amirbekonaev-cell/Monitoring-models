@@ -21,6 +21,7 @@ import { Source } from '../sources/source.entity';
 import { Mention } from '../mentions/mention.entity';
 import { Keyword } from '../keywords/keyword.entity';
 import { Setting } from '../settings/setting.entity';
+import { CuratedLink } from '../curated/curated-link.entity';
 import { SourceOnboardingModule } from '../sources/onboarding/source-onboarding.module';
 import { SourceOnboardingService } from '../sources/onboarding/source-onboarding.service';
 
@@ -41,7 +42,7 @@ import { SourceOnboardingService } from '../sources/onboarding/source-onboarding
         password: config.get<string>('db.password'),
         database: config.get<string>('db.database'),
         ssl: config.get('db.ssl'),
-        entities: [Source, Mention, Keyword, Setting],
+        entities: [Source, Mention, Keyword, Setting, CuratedLink],
         synchronize: false,
       }),
     }),

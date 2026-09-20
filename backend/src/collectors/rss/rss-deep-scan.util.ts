@@ -30,17 +30,13 @@ function getBackfillDays(): number {
  * every cycle after that only re-checks the last DEEP_SCAN_LOOKBACK_DAYS, and only once every
  * DEEP_SCAN_INTERVAL_HOURS (tracked via `sources.last_deep_scan_at`).
  *
- * Used by both SourceOnboardingService (one-time test collection) and OnDemandSearchService
- * (/search) so the two never drift — same reasoning as runCollectionCycle.
+ * Used by SourceOnboardingService (one-time test collection right after "Добавить по ссылке") —
+ * this is the only caller left. /search no longer polls any collector at all (see
+ * CuratedSearchService): it now reads a closed, pre-vetted pool of links instead.
  *
- * `budget` is optional and, unlike fetchParserWithDeepScan, has no default — omitting it means the
- * deep pass runs unbounded, same as before this field existed. **Every caller inside /search must
- * pass one.** A real incident confirmed why: with no budget here, a single RSS source that happened
- * to be due for its deep scan (dozens of sequential HTTP fetches) silently ate the *entire*
- * /search-wide SEARCH_TIME_BUDGET_MS by itself, before any other source — RSS, Parser, Telegram,
- * NewsAPI, VK, even the OpenAI web search channel — got a turn, so every one of them showed up as
- * "не удалось опросить" even though nothing was actually broken. See
- * on-demand-search.service.ts and README "Бюджет времени /search".
+ * `budget` is optional and has no default — omitting it means the deep pass runs unbounded, same
+ * as before this field existed. See README "Бюджет времени /search" for the incident (now
+ * historical, back when /search itself ran this) that motivated a bounded budget in the first place.
  */
 export async function fetchRssWithDeepScan(params: {
   source: Source;
