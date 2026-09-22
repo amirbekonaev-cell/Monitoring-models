@@ -28,6 +28,9 @@ export class HostQueue {
    * task (the rejection still propagates to that task's own caller).
    */
   run<T>(host: string, task: () => Promise<T>): Promise<T> {
+    // Captured BEFORE the tail is replaced below: by the time the .then() callback runs, this
+    // host is always present in the map, so the check has to happen here.
+    const isFirstForHost = !this.tails.has(host);
     const previous = this.tails.get(host) ?? Promise.resolve();
 
     const result = previous
@@ -35,7 +38,7 @@ export class HostQueue {
       .then(async () => {
         // No delay before the very first request to a host — the gap only matters between
         // consecutive ones.
-        if (this.tails.has(host) && this.delayMs > 0) {
+        if (!isFirstForHost && this.delayMs > 0) {
           await this.sleep(this.delayMs);
         }
         return task();
