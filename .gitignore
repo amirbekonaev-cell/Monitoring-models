@@ -9,3 +9,6 @@ env/
 __pycache__/
 .ipynb_checkpoints/
 .localstack/
+# Closed link pool (ПРОМПТ 2): the curated links file itself must never be committed —
+# only counters and group labels ever leave the machine. See README "Закрытый пул ссылок".
+backend/data/

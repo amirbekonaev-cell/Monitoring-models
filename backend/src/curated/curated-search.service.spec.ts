@@ -1,5 +1,6 @@
 import { ConfigService } from '@nestjs/config';
 import { Repository } from 'typeorm';
+import { CuratedIngestService } from './curated-ingest.service';
 import { CuratedSearchService } from './curated-search.service';
 import { Mention, Sentiment } from '../mentions/mention.entity';
 import { CuratedLink, CuratedLinkStatus } from './curated-link.entity';
@@ -153,6 +154,19 @@ function makeConfig(): ConfigService {
   } as unknown as ConfigService;
 }
 
+/**
+ * The lazy top-up collaborator (CURATED_LAZY_PROCESS). makeConfig() leaves the flag unset, so
+ * search() returns from lazyProcess() before touching this — these tests are about the DB read.
+ * The lazy pass has its own tests in curated-lazy-process.spec.ts.
+ */
+function makeIngest(): CuratedIngestService {
+  return {
+    findLazyCandidates: jest.fn().mockResolvedValue([]),
+    buildContext: jest.fn(),
+    processLink: jest.fn(),
+  } as unknown as CuratedIngestService;
+}
+
 function mention(overrides: Partial<FakeMentionRow>): FakeMentionRow {
   return {
     id: 'm-1',
@@ -178,7 +192,7 @@ describe('CuratedSearchService.search', () => {
       mention({ id: 'c', curatedLinkId: null, publishedAt: new Date('2026-09-10T10:00:00Z') }), // not from the pool
     ]);
     const curatedLinksRepo = makeFakeCuratedLinksRepo([]);
-    const service = new CuratedSearchService(mentionsRepo, curatedLinksRepo, makeConfig());
+    const service = new CuratedSearchService(mentionsRepo, curatedLinksRepo, makeConfig(), makeIngest());
 
     const result = await service.search(7, now);
 
@@ -189,7 +203,7 @@ describe('CuratedSearchService.search', () => {
 
   it('excludes a future-dated mention from the window', async () => {
     const mentionsRepo = makeFakeMentionsRepo([mention({ id: 'future', publishedAt: new Date('2026-09-17T10:00:00Z') })]);
-    const service = new CuratedSearchService(mentionsRepo, makeFakeCuratedLinksRepo([]), makeConfig());
+    const service = new CuratedSearchService(mentionsRepo, makeFakeCuratedLinksRepo([]), makeConfig(), makeIngest());
 
     const result = await service.search(7, now);
 
@@ -201,7 +215,7 @@ describe('CuratedSearchService.search', () => {
       mention({ id: 'undated', publishedAt: null }),
       mention({ id: 'dated', publishedAt: new Date('2026-09-10T10:00:00Z') }),
     ]);
-    const service = new CuratedSearchService(mentionsRepo, makeFakeCuratedLinksRepo([]), makeConfig());
+    const service = new CuratedSearchService(mentionsRepo, makeFakeCuratedLinksRepo([]), makeConfig(), makeIngest());
 
     const result = await service.search(1, now); // 1-day window wouldn't even cover 'dated'
 
@@ -215,7 +229,7 @@ describe('CuratedSearchService.search', () => {
       mention({ id: 'b', publishedAt: new Date('2026-09-11T10:00:00Z'), sentiment: Sentiment.POSITIVE }),
       mention({ id: 'c', publishedAt: new Date('2026-09-12T10:00:00Z'), sentiment: Sentiment.NEGATIVE }),
     ]);
-    const service = new CuratedSearchService(mentionsRepo, makeFakeCuratedLinksRepo([]), makeConfig());
+    const service = new CuratedSearchService(mentionsRepo, makeFakeCuratedLinksRepo([]), makeConfig(), makeIngest());
 
     const result = await service.search(7, now);
 
@@ -232,7 +246,7 @@ describe('CuratedSearchService.search', () => {
       // the 9th), even though a naive UTC ::date cast would have excluded it (UTC date is the 8th).
       mention({ id: 'boundary', publishedAt: new Date('2026-09-08T20:30:00Z') }),
     ]);
-    const service = new CuratedSearchService(mentionsRepo, makeFakeCuratedLinksRepo([]), makeConfig());
+    const service = new CuratedSearchService(mentionsRepo, makeFakeCuratedLinksRepo([]), makeConfig(), makeIngest());
 
     const result = await service.search(7, now);
 
@@ -244,7 +258,7 @@ describe('CuratedSearchService.search', () => {
       mention({ id: 'old-in-window', publishedAt: new Date('2024-09-20T10:00:00Z') }),
       mention({ id: 'too-old', publishedAt: new Date('2024-09-10T10:00:00Z') }),
     ]);
-    const service = new CuratedSearchService(mentionsRepo, makeFakeCuratedLinksRepo([]), makeConfig());
+    const service = new CuratedSearchService(mentionsRepo, makeFakeCuratedLinksRepo([]), makeConfig(), makeIngest());
 
     const result = await service.search(730, now);
 
@@ -254,7 +268,7 @@ describe('CuratedSearchService.search', () => {
 
   it('accepts an injected `now` for deterministic tests', async () => {
     const mentionsRepo = makeFakeMentionsRepo([]);
-    const service = new CuratedSearchService(mentionsRepo, makeFakeCuratedLinksRepo([]), makeConfig());
+    const service = new CuratedSearchService(mentionsRepo, makeFakeCuratedLinksRepo([]), makeConfig(), makeIngest());
 
     const result = await service.search(1, new Date('2020-01-01T12:00:00Z'));
 
@@ -271,7 +285,7 @@ describe('CuratedSearchService.findPage', () => {
       mention({ id: 'a', publishedAt: new Date('2026-09-10T10:00:00Z') }), // same instant as 'b' -> id breaks the tie
       mention({ id: 'newest', publishedAt: new Date('2026-09-12T10:00:00Z') }),
     ]);
-    const service = new CuratedSearchService(mentionsRepo, makeFakeCuratedLinksRepo([]), makeConfig());
+    const service = new CuratedSearchService(mentionsRepo, makeFakeCuratedLinksRepo([]), makeConfig(), makeIngest());
 
     const page = await service.findPage(7, 0, 10, now);
 
@@ -283,7 +297,7 @@ describe('CuratedSearchService.findPage', () => {
       mention({ id, publishedAt: new Date(`2026-09-1${i}T10:00:00Z`) }),
     );
     const mentionsRepo = makeFakeMentionsRepo(rows);
-    const service = new CuratedSearchService(mentionsRepo, makeFakeCuratedLinksRepo([]), makeConfig());
+    const service = new CuratedSearchService(mentionsRepo, makeFakeCuratedLinksRepo([]), makeConfig(), makeIngest());
 
     const page = await service.findPage(7, 1, 2, now);
 
@@ -303,7 +317,7 @@ describe('CuratedSearchService.findPage', () => {
         text: longText,
       }),
     ]);
-    const service = new CuratedSearchService(mentionsRepo, makeFakeCuratedLinksRepo([]), makeConfig());
+    const service = new CuratedSearchService(mentionsRepo, makeFakeCuratedLinksRepo([]), makeConfig(), makeIngest());
 
     const [view] = await service.findPage(7, 0, 10, now);
 
@@ -318,7 +332,7 @@ describe('CuratedSearchService.findPage', () => {
       mention({ id: 'pool', curatedLinkId: 'link-1', publishedAt: new Date('2026-09-10T10:00:00Z') }),
       mention({ id: 'other-channel', curatedLinkId: null, publishedAt: new Date('2026-09-10T10:00:00Z') }),
     ]);
-    const service = new CuratedSearchService(mentionsRepo, makeFakeCuratedLinksRepo([]), makeConfig());
+    const service = new CuratedSearchService(mentionsRepo, makeFakeCuratedLinksRepo([]), makeConfig(), makeIngest());
 
     const page = await service.findPage(7, 0, 10, now);
 
@@ -340,7 +354,7 @@ describe('CuratedSearchService.getPoolStats', () => {
       { status: CuratedLinkStatus.PENDING, processedAt: null },
       { status: CuratedLinkStatus.FAILED, processedAt: new Date('2026-08-01T08:00:00Z') },
     ]);
-    const service = new CuratedSearchService(mentionsRepo, curatedLinksRepo, makeConfig());
+    const service = new CuratedSearchService(mentionsRepo, curatedLinksRepo, makeConfig(), makeIngest());
 
     const stats = await service.getPoolStats();
 
@@ -357,7 +371,7 @@ describe('CuratedSearchService.getPoolStats', () => {
   });
 
   it('reports null date range and last-processed when the pool is empty', async () => {
-    const service = new CuratedSearchService(makeFakeMentionsRepo([]), makeFakeCuratedLinksRepo([]), makeConfig());
+    const service = new CuratedSearchService(makeFakeMentionsRepo([]), makeFakeCuratedLinksRepo([]), makeConfig(), makeIngest());
 
     const stats = await service.getPoolStats();
 

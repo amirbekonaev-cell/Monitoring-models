@@ -667,3 +667,96 @@ describe('MentionsService filters & stats', () => {
     expect(stats.changePercent).toBeNull();
   });
 });
+
+/**
+ * The closed pool's two-way isolation from deduplication. Both directions matter, and both are
+ * ways a hidden URL would end up being served:
+ *  - a pool insert must not be merged into an existing public mention (it would add the hidden
+ *    URL to that mention's `reprints`, which the API does serve);
+ *  - a public insert must not be merged into an existing POOL mention (the public item would
+ *    then be represented by the hidden row, whose URL must never be shown).
+ */
+describe('MentionsService: упоминания из закрытого пула не участвуют в дедупликации', () => {
+  function makeInsertingRepo(): Repository<Mention> & { findOne: jest.Mock; capturedValues: () => Record<string, unknown> } {
+    let captured: Record<string, unknown> = {};
+    const repo = {
+      findOne: jest.fn(async () => null),
+      update: jest.fn(),
+      createQueryBuilder: jest.fn(() => ({
+        insert: () => ({
+          into: () => ({
+            values: (values: Record<string, unknown>) => {
+              captured = values;
+              return { orIgnore: () => ({ execute: async () => ({ identifiers: [{ id: 'new-id' }] }) }) };
+            },
+          }),
+        }),
+      })),
+      capturedValues: () => captured,
+    };
+    return repo as unknown as Repository<Mention> & { findOne: jest.Mock; capturedValues: () => Record<string, unknown> };
+  }
+
+  it('вставка из пула идёт со skipDedup — проверки дублей не выполняются вовсе', async () => {
+    const repo = makeInsertingRepo();
+    const dataSource = { query: jest.fn(async () => []) } as unknown as DataSource;
+    const service = new MentionsService(repo, dataSource);
+
+    const result = await service.createIfNew(
+      makeInput({ skipDedup: true, urlHidden: true, curatedLinkId: 'link-1' }),
+    );
+
+    expect(result).toBe('inserted');
+    expect(repo.findOne).not.toHaveBeenCalled();
+    expect(dataSource.query).not.toHaveBeenCalled();
+  });
+
+  it('вставка из пула сохраняет url_hidden и curated_link_id', async () => {
+    const repo = makeInsertingRepo();
+    const service = new MentionsService(repo, { query: jest.fn(async () => []) } as unknown as DataSource);
+
+    await service.createIfNew(makeInput({ skipDedup: true, urlHidden: true, curatedLinkId: 'link-7' }));
+
+    expect(repo.capturedValues()).toMatchObject({ urlHidden: true, curatedLinkId: 'link-7' });
+  });
+
+  it('обычная вставка по умолчанию не скрытая', async () => {
+    const repo = makeInsertingRepo();
+    const service = new MentionsService(repo, { query: jest.fn(async () => []) } as unknown as DataSource);
+
+    await service.createIfNew(makeInput());
+
+    expect(repo.capturedValues()).toMatchObject({ urlHidden: false, curatedLinkId: null });
+  });
+
+  it('обычная вставка ищет дубль по хэшу только среди НЕскрытых упоминаний', async () => {
+    const repo = makeInsertingRepo();
+    const service = new MentionsService(repo, { query: jest.fn(async () => []) } as unknown as DataSource);
+
+    await service.createIfNew(makeInput({ hash: 'hash-x' }));
+
+    expect(repo.findOne).toHaveBeenCalledWith({ where: { hash: 'hash-x', urlHidden: false } });
+  });
+
+  it('обычная вставка ищет перепечатку по тексту только среди НЕскрытых упоминаний', async () => {
+    const repo = makeInsertingRepo();
+    const dataSource = { query: jest.fn(async () => []) } as unknown as DataSource;
+    const service = new MentionsService(repo, dataSource);
+
+    await service.createIfNew(makeInput({ text: 'Достаточно длинный текст для сравнения по схожести.' }));
+
+    const sql = (dataSource.query as jest.Mock).mock.calls[0][0] as string;
+    expect(sql).toContain('url_hidden = false');
+  });
+
+  it('вставка с пустым текстом тоже исключает скрытые строки из поиска по заголовку', async () => {
+    const repo = makeInsertingRepo();
+    const dataSource = { query: jest.fn(async () => []) } as unknown as DataSource;
+    const service = new MentionsService(repo, dataSource);
+
+    await service.createIfNew(makeInput({ text: '' }));
+
+    const sql = (dataSource.query as jest.Mock).mock.calls[0][0] as string;
+    expect(sql).toContain('url_hidden = false');
+  });
+});

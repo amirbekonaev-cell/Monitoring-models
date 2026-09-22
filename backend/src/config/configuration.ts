@@ -87,6 +87,30 @@ export default () => ({
     // capped ~4096 chars) — a page holds as many items as fit under this, then a "Показать ещё"
     // button loads the rest.
     messageCharLimit: parseInt(process.env.SEARCH_MESSAGE_CHAR_LIMIT || '3500', 10),
+    // --- Наполнение пула (ПРОМПТ 2, CuratedIngestService) ---
+    // 'auto' — сначала бесплатный HTTP-парсер, и только если страница не отдалась (анти-бот,
+    // JS-рендер, пустой текст) — платное чтение через OpenAI. 'openai' — всегда через OpenAI
+    // (дороже, нужен только для отладки или для домена, который парсер не берёт в принципе).
+    readMode: process.env.CURATED_READ_MODE === 'openai' ? 'openai' : 'auto',
+    // Ниже этого объёма текст страницы считается не статьёй, а заглушкой/тизером — включается
+    // fallback на OpenAI. Совпадает по смыслу с MIN_FULL_TEXT_LENGTH в SentimentAnalysisService.
+    minPageTextChars: parseInt(process.env.CURATED_MIN_PAGE_TEXT_CHARS || '400', 10),
+    // Сколько раз пробовать ссылку, прежде чем пометить её failed.
+    maxAttempts: parseInt(process.env.CURATED_MAX_ATTEMPTS || '3', 10),
+    // Потолок времени на ОДНУ ссылку целиком (скачивание + OpenAI + тональность), AbortController.
+    linkTimeoutMs: parseInt(process.env.CURATED_LINK_TIMEOUT_MS || '25000', 10),
+    // Сколько ссылок обрабатывается одновременно (разных хостов — к одному хосту всегда один
+    // запрос за раз, см. HostQueue).
+    concurrency: parseInt(process.env.CURATED_CONCURRENCY || '4', 10),
+    // Пауза между запросами к ОДНОМУ хосту — вежливость к сайту (у sknews.kz 49 ссылок подряд).
+    hostDelayMs: parseInt(process.env.CURATED_HOST_DELAY_MS || '300', 10),
+    // --- Ленивая дообработка внутри /search (см. CuratedSearchService.search) ---
+    lazyProcess: process.env.CURATED_LAZY_PROCESS === 'true',
+    lazyMaxLinks: parseInt(process.env.CURATED_LAZY_MAX_LINKS || '10', 10),
+    lazyBudgetMs: parseInt(process.env.CURATED_LAZY_BUDGET_MS || '20000', 10),
+    // Отдавать ли ссылки скрытых упоминаний в REST API/фронт. По умолчанию false. На Telegram-бота
+    // НЕ влияет: он ссылки не показывает никогда (ПРОМПТ 1). См. mention-privacy.util.ts.
+    exposeUrls: process.env.CURATED_LINKS_EXPOSE_URLS === 'true',
   },
   excludedDomains: {
     // Comma-separated domain blacklist (each entry also covers its subdomains) — a domain here

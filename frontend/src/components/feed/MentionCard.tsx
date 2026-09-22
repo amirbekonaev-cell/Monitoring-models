@@ -15,9 +15,15 @@ export function MentionCard({ mention, onChanged }: { mention: Mention; onChange
   return (
     <article className={styles.card} style={{ ['--card-accent' as string]: SENTIMENT_COLORS[mention.sentiment] }}>
       <div className={styles.header}>
-        <a href={mention.url} target="_blank" rel="noreferrer" className={styles.title}>
-          {mention.title}
-        </a>
+        {mention.url ? (
+          <a href={mention.url} target="_blank" rel="noreferrer" className={styles.title}>
+            {mention.title}
+          </a>
+        ) : (
+          // No link to open: the backend withholds the URL for pool mentions (see types/domain.ts).
+          // The title still has to be readable, so it renders as plain text rather than a dead <a>.
+          <span className={styles.title}>{mention.title}</span>
+        )}
         <SentimentSelect mentionId={mention.id} sentiment={mention.sentiment} onChanged={onChanged} />
       </div>
       <div className={styles.meta}>

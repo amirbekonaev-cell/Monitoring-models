@@ -1,10 +1,12 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { Mention, Sentiment } from '../mentions/mention.entity';
 import { CuratedLink, CuratedLinkStatus } from './curated-link.entity';
+import { CuratedIngestService } from './curated-ingest.service';
 import { subtractCalendarDays, zonedDateString } from './curated-date.util';
+import { extractDateFromUrl } from './curated-article-date.util';
 import { truncateText } from './text.util';
 
 export const CURATED_DEFAULT_SOURCE_LABEL = 'Подборка материалов';
@@ -61,12 +63,15 @@ export interface CuratedMentionView {
  */
 @Injectable()
 export class CuratedSearchService {
+  private readonly logger = new Logger(CuratedSearchService.name);
+
   constructor(
     @InjectRepository(Mention)
     private readonly mentionsRepo: Repository<Mention>,
     @InjectRepository(CuratedLink)
     private readonly curatedLinksRepo: Repository<CuratedLink>,
     private readonly config: ConfigService,
+    private readonly ingestService: CuratedIngestService,
   ) {}
 
   private get timezone(): string {
@@ -93,6 +98,8 @@ export class CuratedSearchService {
 
   async search(periodDays: number, now: Date = new Date()): Promise<CuratedSearchResult> {
     const { tz, dateFrom, dateTo } = this.dateWindow(periodDays, now);
+
+    await this.lazyProcess(dateFrom, now);
 
     const total = await this.inWindowQuery(tz, dateFrom, dateTo).getCount();
 
@@ -142,6 +149,59 @@ export class CuratedSearchService {
       summary: m.summary ? truncateText(m.summary, SUMMARY_DISPLAY_LENGTH) : null,
       snippet: m.text ? truncateText(m.text, SNIPPET_DISPLAY_LENGTH) : null,
     }));
+  }
+
+  /**
+   * Optional top-up pass (CURATED_LAZY_PROCESS=true) run before the DB read: takes up to
+   * CURATED_LAZY_MAX_LINKS still-unprocessed links and processes them inside a
+   * CURATED_LAZY_BUDGET_MS budget, so a pool that was only partly filled keeps catching up
+   * through ordinary bot usage instead of waiting for someone to run the script.
+   *
+   * Three things keep this safe inside a Telegram handler that must answer in ~30s:
+   *  - the budget is a deadline passed down to the ingest service, which starts no new link past
+   *    it (a link already in flight finishes — its own CURATED_LINK_TIMEOUT_MS bounds it);
+   *  - links whose date is already visible IN THE URL and older than the requested period are
+   *    skipped this time round: they cannot appear in these results however they classify, so
+   *    spending the budget (and an OpenAI call) on them now helps nobody;
+   *  - any failure here is swallowed. The point of the command is to READ the pool; a failing
+   *    top-up must never turn a working /search into an error message.
+   */
+  private async lazyProcess(dateFrom: string, now: Date): Promise<void> {
+    if (this.config.get<boolean>('curated.lazyProcess') !== true) {
+      return;
+    }
+
+    const maxLinks = this.config.get<number>('curated.lazyMaxLinks') ?? 10;
+    const budgetMs = this.config.get<number>('curated.lazyBudgetMs') ?? 20000;
+    const deadline = Date.now() + budgetMs;
+
+    try {
+      const candidates = await this.ingestService.findLazyCandidates(maxLinks * 3);
+      const windowStart = new Date(`${dateFrom}T00:00:00Z`);
+
+      const worthDoingNow = candidates
+        .filter((link) => {
+          const urlDate = extractDateFromUrl(link.url, now);
+          return !urlDate || urlDate >= windowStart;
+        })
+        .slice(0, maxLinks);
+
+      if (worthDoingNow.length === 0) {
+        return;
+      }
+
+      const context = await this.ingestService.buildContext();
+      for (const link of worthDoingNow) {
+        if (Date.now() >= deadline) {
+          this.logger.log(`Ленивая дообработка: бюджет ${budgetMs} мс исчерпан, новые ссылки не начинаю`);
+          break;
+        }
+        await this.ingestService.processLink(link, context);
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.logger.warn(`Ленивая дообработка пропущена (чтение из БД не затронуто): ${message}`);
+    }
   }
 
   async getPoolStats(): Promise<PoolStats> {

@@ -32,6 +32,13 @@ export interface CreateMentionInput {
    * should always show up as its own entry, every time it's found, not get merged away.
    */
   skipDedup?: boolean;
+  /**
+   * Closed-pool insert (ПРОМПТ 2): marks the mention's URL as never-show and ties it back to the
+   * `curated_links` row that produced it. `urlHidden` is stored as its own durable column rather
+   * than being derived from `curatedLinkId` — see Mention.urlHidden.
+   */
+  urlHidden?: boolean;
+  curatedLinkId?: string | null;
 }
 
 /** Filters shared by the feed list and the dashboard stats aggregation — kept in one place so
@@ -150,7 +157,13 @@ export class MentionsService {
     const isBackfill = input.isBackfill ?? false;
 
     if (!input.skipDedup) {
-      const existingByHash = await this.mentionsRepo.findOne({ where: { hash: input.hash } });
+      // `url_hidden = false` on both dedup checks: a pool mention must never be found as the
+      // "existing" row an ordinary insert collapses into. If it were, addReprintIfNewUrl() would
+      // append the ordinary (public) URL to a hidden mention — or, the other way round, a later
+      // public duplicate would adopt the hidden row and the hidden URL would be served as that
+      // public mention's own. Pool rows are inserted with skipDedup: true, so they never run
+      // these checks themselves; this filter closes the same hole from the other side.
+      const existingByHash = await this.mentionsRepo.findOne({ where: { hash: input.hash, urlHidden: false } });
       if (existingByHash) {
         await this.addReprintIfNewUrl(existingByHash, input);
         return { result: 'duplicate', id: existingByHash.id };
@@ -189,6 +202,8 @@ export class MentionsService {
         keywords: input.keywords,
         reprints: [],
         isBackfill,
+        urlHidden: input.urlHidden ?? false,
+        curatedLinkId: input.curatedLinkId ?? null,
         // No background collection writes mentions any more (see README "Деплой на Vercel") —
         // there is no per-mention Telegram alert left to guard against, but the column still
         // records whether a mention came from a backfill run.
@@ -205,6 +220,15 @@ export class MentionsService {
     return { result: 'inserted', id: insertedId };
   }
 
+  /**
+   * Classifies an existing mention now, awaited. Same work classifySentimentInBackground() does,
+   * exposed for a caller that is re-processing a row which never received a tone (see
+   * CuratedIngestService's --force path) and wants the result before it reports.
+   */
+  async classifyExisting(mentionId: string): Promise<void> {
+    await this.classifySentimentInBackground(mentionId);
+  }
+
   private async classifySentimentInBackground(mentionId: string): Promise<void> {
     if (!this.sentimentAnalysisService) {
       return;
@@ -214,7 +238,15 @@ export class MentionsService {
       if (!mention) {
         return;
       }
-      const classification = await this.sentimentAnalysisService.classify(mention.title, mention.text, mention.url);
+      // No url for a pool mention: SentimentAnalysisService uses it to re-download the article
+      // when the stored text looks like a teaser, which would (a) undo the context extraction
+      // that put the company mention in front of the classifier in the first place (see
+      // curated-context.util.ts) and (b) spend a second HTTP request on a page already read.
+      const classification = await this.sentimentAnalysisService.classify(
+        mention.title,
+        mention.text,
+        mention.urlHidden ? null : mention.url,
+      );
       if (!classification) {
         return;
       }
@@ -224,6 +256,35 @@ export class MentionsService {
       const message = error instanceof Error ? error.message : String(error);
       this.logger.error(`Не удалось определить тональность упоминания ${mentionId}: ${message}`);
     }
+  }
+
+  /**
+   * Refreshes the content of a mention produced by the closed pool, for a re-run of an already
+   * processed link (`curated:process --force`). Needed because those rows are inserted with
+   * `skipDedup`, and a partial UNIQUE index on `curated_link_id` means a second insert for the
+   * same link is silently ignored — so without this, re-reading a page (e.g. after fixing how
+   * its publish date is extracted) would leave the stored mention exactly as it was.
+   *
+   * Deliberately does NOT touch `sentiment`/`sentiment_manual`: re-reading a page is not a
+   * reason to discard a human's tone correction (ФТ-11), and the caller re-classifies
+   * separately when it decides that is warranted.
+   */
+  async updateCuratedContent(
+    id: string,
+    content: { title: string; text: string; publishedAt: Date | null; sourceLabel: string | null; keywords: string[] },
+  ): Promise<void> {
+    await this.mentionsRepo
+      .createQueryBuilder()
+      .update(Mention)
+      .set({
+        title: content.title,
+        text: content.text,
+        publishedAt: content.publishedAt,
+        sourceLabel: content.sourceLabel,
+        keywords: content.keywords,
+      })
+      .where('id = :id AND url_hidden = true', { id })
+      .execute();
   }
 
   findById(id: string): Promise<Mention | null> {
@@ -298,6 +359,7 @@ export class MentionsService {
       const rows = await this.dataSource.query(
         `SELECT id FROM mentions
          WHERE similarity(title, $1) > 0.9
+           AND url_hidden = false
            AND ($2::timestamptz IS NULL OR published_at IS NULL OR published_at BETWEEN $2 AND $3)
          ORDER BY similarity(title, $1) DESC
          LIMIT 1`,
@@ -310,6 +372,7 @@ export class MentionsService {
       `SELECT id, similarity(title, $1) as title_sim, similarity(text, $2) as text_sim
        FROM mentions
        WHERE similarity(title, $1) > $3
+         AND url_hidden = false
          AND similarity(text, $2) > $4
          AND ($5::timestamptz IS NULL OR published_at IS NULL OR published_at BETWEEN $5 AND $6)
        ORDER BY (similarity(title, $1) + similarity(text, $2)) DESC
