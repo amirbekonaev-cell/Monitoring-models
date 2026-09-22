@@ -11,14 +11,14 @@ describe('normalizeCuratedUrl', () => {
   });
 
   it('drops utm_* parameters but keeps the rest of the query', () => {
-    expect(normalizeCuratedUrl('https://example.com/?mod=news_read&id=164916&utm_source=tg&utm_medium=x')).toBe(
-      'https://example.com/?mod=news_read&id=164916',
+    expect(normalizeCuratedUrl('https://example.com/?mod=news_read&id=100001&utm_source=tg&utm_medium=x')).toBe(
+      'https://example.com/?mod=news_read&id=100001',
     );
   });
 
   it('keeps the query string that carries the page identity', () => {
-    const a = normalizeCuratedUrl('https://example.com/?mod=news_read&id=164916');
-    const b = normalizeCuratedUrl('https://example.com/?mod=news_read&id=150840');
+    const a = normalizeCuratedUrl('https://example.com/?mod=news_read&id=100001');
+    const b = normalizeCuratedUrl('https://example.com/?mod=news_read&id=100002');
     expect(a).not.toBe(b);
   });
 

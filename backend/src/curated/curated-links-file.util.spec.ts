@@ -55,15 +55,15 @@ describe('parseCuratedLinksFile', () => {
     const { links, stats } = parseCuratedLinksFile(
       [
         'ekaraganda',
-        'https://example.com/?mod=news_read&id=164916',
-        'https://example.com/?mod=news_read&id=150840',
+        'https://example.com/?mod=news_read&id=100001',
+        'https://example.com/?mod=news_read&id=100002',
       ].join('\n'),
     );
 
     expect(stats.uniqueUrls).toBe(2);
     expect(stats.duplicateUrls).toBe(0);
-    expect(links[0].url).toContain('id=164916');
-    expect(links[1].url).toContain('id=150840');
+    expect(links[0].url).toContain('id=100001');
+    expect(links[1].url).toContain('id=100002');
   });
 
   it('reports a malformed URL line by line number and keeps parsing the rest', () => {
