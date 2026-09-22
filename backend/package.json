@@ -18,6 +18,10 @@
     "classify-sentiment-backfill": "ts-node -r tsconfig-paths/register src/scripts/classify-sentiment-backfill.ts",
     "cleanup-mentions": "ts-node -r tsconfig-paths/register src/scripts/cleanup-unrelated-mentions.ts",
     "set-webhook": "ts-node -r tsconfig-paths/register src/scripts/set-webhook.ts",
+    "curated:import": "ts-node -r tsconfig-paths/register src/scripts/curated-import.ts",
+    "curated:process": "ts-node -r tsconfig-paths/register src/scripts/curated-process.ts",
+    "curated:status": "ts-node -r tsconfig-paths/register src/scripts/curated-status.ts",
+    "curated:leak-check": "ts-node -r tsconfig-paths/register src/scripts/curated-leak-check.ts",
     "test": "jest",
     "test:watch": "jest --watch"
   },

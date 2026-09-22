@@ -1,8 +1,10 @@
 import { Module } from '@nestjs/common';
+import { APP_INTERCEPTOR } from '@nestjs/core';
 import { ConfigModule, ConfigService } from '@nestjs/config';
 import { TypeOrmModule } from '@nestjs/typeorm';
 import configuration from './config/configuration';
 import { CommonModule } from './common/common.module';
+import { MentionPrivacyInterceptor } from './common/mention-privacy.interceptor';
 import { Source } from './sources/source.entity';
 import { Mention } from './mentions/mention.entity';
 import { Keyword } from './keywords/keyword.entity';
@@ -56,6 +58,12 @@ import { CuratedModule } from './curated/curated.module';
     SentimentModule,
     CuratedModule,
     TelegramBotModule,
+  ],
+  providers: [
+    // Global, not per-controller: hidden pool URLs must be stripped from EVERY response that
+    // serializes a mention, including endpoints added later — see mention-privacy.util.ts for
+    // why this cannot live in the frontend.
+    { provide: APP_INTERCEPTOR, useClass: MentionPrivacyInterceptor },
   ],
 })
 export class AppModule {}

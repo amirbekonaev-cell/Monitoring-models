@@ -73,6 +73,25 @@ export interface DeepScanBudget {
   crawlDelayMs?: number;
 }
 
+/** Full-article extraction result — see fetchPageDetailed(). */
+export interface ParsedPageDetails {
+  title: string;
+  /** The article body, as complete as the page's markup allows (see FULL_TEXT_MAX_CHARS). */
+  text: string;
+  publishedAt: Date | null;
+}
+
+/**
+ * Cap on fetchPageDetailed()'s body text. Far above extractBodyText()'s 2000-char cap because
+ * its consumer (the closed-pool ingestion, ПРОМПТ 2) needs the WHOLE article to find where the
+ * company is actually mentioned — often past the 2000th character in a long round-up — before
+ * cutting it back down to the relevant passages itself (see curated-context.util.ts).
+ */
+const FULL_TEXT_MAX_CHARS = 40000;
+
+/** Markup that carries no article prose and would otherwise pollute the extracted text. */
+const NON_CONTENT_SELECTORS = 'script, style, noscript, nav, header, footer, aside, form, iframe';
+
 @Injectable()
 export class ParserService {
   private readonly logger = new Logger(ParserService.name);
@@ -109,6 +128,57 @@ export class ParserService {
       this.logger.debug(`fetchArticleText: не удалось разобрать ${url}: ${String(error)}`);
       return null;
     }
+  }
+
+  /**
+   * Single-page read that returns the FULL article body rather than the short preview
+   * extractBodyText() produces (which prefers og:description — typically ~150 characters, a
+   * teaser). Added for the closed-pool ingestion (ПРОМПТ 2), which has to decide whether a page
+   * was really downloaded or merely bounced by an anti-bot/JS-render wall, and then locate the
+   * company mention anywhere in the text; neither is possible from a meta description.
+   *
+   * Additive: no existing caller's behaviour changes — fetchPage()/crawlSite()/deepCollect() keep
+   * using parseArticlePage()/extractBodyText() exactly as before.
+   *
+   * `signal` lets a caller abort mid-download (the per-link timeout in CuratedIngestService);
+   * without one this behaves like every other fetch here and only honours FETCH_TIMEOUT_MS.
+   */
+  async fetchPageDetailed(url: string, signal?: AbortSignal): Promise<ParsedPageDetails> {
+    const html = await this.download(url, signal);
+    const $ = cheerio.load(html);
+
+    const title =
+      $('meta[property="og:title"]').attr('content')?.trim() ||
+      $('title').first().text().trim() ||
+      $('h1').first().text().trim() ||
+      '';
+
+    return { title, text: this.extractFullBodyText($), publishedAt: this.extractPublishedAt($) };
+  }
+
+  /**
+   * Whole-article text: the most specific container that actually holds prose (<article>, then
+   * common CMS content classes, then <body>), stripped of non-content markup. Falls back to the
+   * short og:description only when the markup yielded nothing at all, so the caller still gets
+   * *something* to look at rather than an empty string.
+   */
+  private extractFullBodyText($: cheerio.CheerioAPI): string {
+    $(NON_CONTENT_SELECTORS).remove();
+
+    const containerSelectors = ['article', '[itemprop="articleBody"]', '.article-content', '.entry-content', '.post-content', '.news-text', '.content', 'main', 'body'];
+    for (const selector of containerSelectors) {
+      const container = $(selector).first();
+      if (container.length === 0) {
+        continue;
+      }
+      const text = container.text().replace(/\s+/g, ' ').trim();
+      if (text.length >= 200) {
+        return text.slice(0, FULL_TEXT_MAX_CHARS);
+      }
+    }
+
+    const fallback = $('meta[property="og:description"]').attr('content')?.trim() ?? '';
+    return fallback.slice(0, FULL_TEXT_MAX_CHARS);
   }
 
   private async parseArticlePage(url: string): Promise<CollectedItem> {
@@ -522,9 +592,19 @@ export class ParserService {
     return null;
   }
 
-  private async download(url: string): Promise<string> {
+  private async download(url: string, externalSignal?: AbortSignal): Promise<string> {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+    // An already-aborted external signal (the caller's per-link deadline passed before this
+    // request even started) aborts immediately; otherwise it forwards the abort to this request.
+    const abortFromExternal = () => controller.abort();
+    if (externalSignal) {
+      if (externalSignal.aborted) {
+        controller.abort();
+      } else {
+        externalSignal.addEventListener('abort', abortFromExternal, { once: true });
+      }
+    }
     try {
       const res = await fetch(url, {
         signal: controller.signal,
@@ -536,6 +616,7 @@ export class ParserService {
       return await res.text();
     } finally {
       clearTimeout(timeout);
+      externalSignal?.removeEventListener('abort', abortFromExternal);
     }
   }
 

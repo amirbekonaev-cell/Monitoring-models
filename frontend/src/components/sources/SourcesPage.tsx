@@ -128,7 +128,10 @@ export function SourcesPage() {
                 <tr key={source.id}>
                   <td>
                     <div className={styles.name}>{source.name ?? source.url}</div>
-                    <div className={styles.url}>{source.url}</div>
+                    {/* The curated pool's row is a system placeholder (`curated://internal`), not a
+                        site anyone can open, and the links it stands for are deliberately not
+                        listed anywhere — only its mentions count is meaningful here. */}
+                    {source.type !== 'curated' && <div className={styles.url}>{source.url}</div>}
                     {source.status === 'error' && source.lastError && <div className={styles.lastError}>{source.lastError}</div>}
                   </td>
                   <td>{SOURCE_KIND_LABELS[source.type]}</td>

@@ -6,7 +6,13 @@ export interface Mention {
   id: string;
   title: string;
   text: string;
-  url: string;
+  /**
+   * null for a mention whose source link is deliberately withheld (the closed link pool) — the
+   * backend strips it before the response is serialized, so it is genuinely absent rather than
+   * hidden in the UI. See backend mention-privacy.util.ts; MentionCard renders such a mention's
+   * title as plain text.
+   */
+  url: string | null;
   publishedAt: string | null;
   foundAt: string;
   sourceId: string | null;
