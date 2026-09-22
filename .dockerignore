@@ -1,0 +1,9 @@
+node_modules
+dist
+build
+.git
+*.log
+.env
+# Closed link pool — mounted at runtime (docker compose run -v ./backend/data:/app/data:ro),
+# never baked into an image.
+backend/data/

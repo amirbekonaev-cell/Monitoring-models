@@ -1,0 +1,6 @@
+node_modules
+dist
+*.log
+.env
+# Closed link pool (ПРОМПТ 2) — mounted read-only at runtime, never baked into the image.
+data/

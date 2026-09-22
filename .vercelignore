@@ -1,0 +1,7 @@
+node_modules
+dist
+build
+*.log
+.env
+# Closed link pool — never uploaded to a deployment.
+backend/data/
