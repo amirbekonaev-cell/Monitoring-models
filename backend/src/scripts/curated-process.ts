@@ -4,7 +4,7 @@
  * 60-second budget, so a full pool run can take as long as it needs.
  *
  * Usage:
- *   npm run curated:process -- [--limit N] [--concurrency N] [--force] [--retry-failed]
+ *   npm run curated:process -- [--limit N] [--concurrency N] [--hosts a.kz,b.kz] [--force] [--retry-failed]
  *
  * Resumable: a link that reached `processed` is skipped on the next run (an OpenAI page read is
  * billed — we do not pay for the same page twice), so an interrupted run is continued simply by
@@ -16,13 +16,17 @@
 import { CuratedIngestService, ProcessLinkOutcome } from '../curated/curated-ingest.service';
 import { CuratedOpenAiReaderService } from '../curated/curated-openai-reader.service';
 import { CuratedLinkStatus } from '../curated/curated-link.entity';
-import { createCuratedScriptContext, describeDatabase, hasFlag, numberFlag } from './curated-script-context';
+import { createCuratedScriptContext, describeDatabase, hasFlag, listFlag, numberFlag } from './curated-script-context';
 
 async function main(): Promise<void> {
   const limit = numberFlag('limit');
   const concurrency = numberFlag('concurrency');
   const force = hasFlag('force');
   const retryFailed = hasFlag('retry-failed');
+  // Narrows the batch to specific sites — how a systemic problem found on one host (a wall, a
+  // page type the parser can't read) is re-run after being fixed, without paying to re-read the
+  // rest of the pool.
+  const hosts = listFlag('hosts');
 
   const app = await createCuratedScriptContext();
   const ingest = app.get(CuratedIngestService);
@@ -37,8 +41,10 @@ async function main(): Promise<void> {
     );
   }
 
-  const planned = await ingest.selectLinks({ limit, force, retryFailed });
-  console.log(`К обработке: ${planned.length} ссыл(ок)${limit ? ` (лимит ${limit})` : ''}`);
+  const planned = await ingest.selectLinks({ limit, force, retryFailed, hosts });
+  console.log(
+    `К обработке: ${planned.length} ссыл(ок)${limit ? ` (лимит ${limit})` : ''}${hosts ? ` (хосты: ${hosts.join(', ')})` : ''}`,
+  );
   if (planned.length === 0) {
     await app.close();
     return;
@@ -50,6 +56,7 @@ async function main(): Promise<void> {
     concurrency,
     force,
     retryFailed,
+    hosts,
     onProgress: (done, total, outcome) => console.log(`[${done}/${total}] ${formatOutcome(outcome)}`),
   });
   const elapsedSec = Math.round((Date.now() - startedAt) / 1000);

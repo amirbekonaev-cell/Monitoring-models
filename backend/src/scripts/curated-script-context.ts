@@ -28,7 +28,17 @@ import { CuratedModule } from '../curated/curated.module';
 
 @Module({
   imports: [
-    ConfigModule.forRoot({ isGlobal: true, load: [configuration] }),
+    ConfigModule.forRoot({
+      isGlobal: true,
+      load: [configuration],
+      // Both env files, backend/.env first. The repo root's .env is where the shared settings
+      // live (OPENAI_API_KEY, EXCLUDED_DOMAINS, SEARCH_*) — docker-compose passes it to the
+      // backend service via env_file, but a script run straight from backend/ would otherwise
+      // only see backend/.env and come up without a key. Earlier files win, and neither
+      // overrides a variable already set in the environment, so an inline
+      // `DB_HOST=... npm run ...` still takes precedence over both.
+      envFilePath: ['.env', '../.env'],
+    }),
     TypeOrmModule.forRootAsync({
       imports: [ConfigModule],
       inject: [ConfigService],
@@ -68,11 +78,38 @@ export function hasFlag(name: string): boolean {
   return process.argv.includes(`--${name}`);
 }
 
-/** `--name value` or `--name=value`, parsed as a positive integer; undefined when absent/invalid. */
-export function numberFlag(name: string): number | undefined {
+/**
+ * The value of `--name value` or `--name=value`, or undefined when the flag is absent.
+ *
+ * The `index === -1` guard is load-bearing: without it `argv[indexOf(...) + 1]` silently reads
+ * `argv[0]` — the node executable's own path — for every flag that was NOT passed.
+ */
+function flagValue(name: string): string | undefined {
   const argv = process.argv;
   const inline = argv.find((a) => a.startsWith(`--${name}=`));
-  const raw = inline ? inline.split('=')[1] : argv[argv.indexOf(`--${name}`) + 1];
-  const parsed = parseInt(raw ?? '', 10);
+  if (inline) {
+    return inline.slice(`--${name}=`.length);
+  }
+  const index = argv.indexOf(`--${name}`);
+  if (index === -1) {
+    return undefined;
+  }
+  const next = argv[index + 1];
+  // A following token that is itself a flag means this one was used as a bare switch.
+  return next && !next.startsWith('--') ? next : undefined;
+}
+
+/** `--name value` or `--name=value`, parsed as a positive integer; undefined when absent/invalid. */
+export function numberFlag(name: string): number | undefined {
+  const parsed = parseInt(flagValue(name) ?? '', 10);
   return Number.isInteger(parsed) && parsed > 0 ? parsed : undefined;
+}
+
+/** `--name a,b,c` or `--name=a,b,c`, parsed as a comma-separated list; undefined when absent. */
+export function listFlag(name: string): string[] | undefined {
+  const values = (flagValue(name) ?? '')
+    .split(',')
+    .map((v) => v.trim())
+    .filter(Boolean);
+  return values.length > 0 ? values : undefined;
 }

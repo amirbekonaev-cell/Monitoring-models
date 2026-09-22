@@ -1,6 +1,6 @@
 import { ConfigService } from '@nestjs/config';
 import { Repository } from 'typeorm';
-import { CuratedIngestService, curatedMentionHash, humanizeError } from './curated-ingest.service';
+import { CuratedIngestService, curatedMentionHash, humanizeError, withTrailingSlashVariant } from './curated-ingest.service';
 import { CuratedLink, CuratedLinkStatus } from './curated-link.entity';
 import { CuratedOpenAiReaderService } from './curated-openai-reader.service';
 import { ParserService } from '../collectors/parser/parser.service';
@@ -59,7 +59,12 @@ interface Harness {
   linksRepo: { update: jest.Mock; manager: { query: jest.Mock } };
   parser: { fetchPageDetailed: jest.Mock };
   reader: { readPage: jest.Mock; isConfigured: jest.Mock };
-  mentions: { createIfNewAndClassify: jest.Mock };
+  mentions: {
+    createIfNewAndClassify: jest.Mock;
+    updateCuratedContent: jest.Mock;
+    classifyExisting: jest.Mock;
+    findById: jest.Mock;
+  };
   context: Parameters<CuratedIngestService['processLink']>[1];
 }
 
@@ -69,11 +74,19 @@ function makeHarness(
     keywordMatched?: boolean;
     parser?: jest.Mock;
     reader?: jest.Mock;
+    /** Start with a mention already attached to this link — the `--force` re-run path. */
+    existingMention?: boolean;
+    existingSentiment?: Sentiment;
   } = {},
 ): Harness {
+  // Mirrors reality: before the insert this link has produced no mention, after it there is one.
+  // (Returning a mention up front would send processLink down its --force update path instead.)
+  let mentionExists = options.existingMention ?? false;
   const linksRepo = {
     update: jest.fn().mockResolvedValue(undefined),
-    manager: { query: jest.fn().mockResolvedValue([{ id: 'mention-1' }]) },
+    manager: {
+      query: jest.fn().mockImplementation(async () => (mentionExists ? [{ id: 'mention-1' }] : [])),
+    },
   };
 
   const parser = {
@@ -96,7 +109,13 @@ function makeHarness(
   };
 
   const mentions = {
-    createIfNewAndClassify: jest.fn().mockResolvedValue({ result: 'inserted', sentiment: Sentiment.POSITIVE }),
+    createIfNewAndClassify: jest.fn().mockImplementation(async () => {
+      mentionExists = true;
+      return { result: 'inserted', sentiment: Sentiment.POSITIVE };
+    }),
+    updateCuratedContent: jest.fn().mockResolvedValue(undefined),
+    classifyExisting: jest.fn().mockResolvedValue(undefined),
+    findById: jest.fn().mockResolvedValue({ id: 'mention-1', sentiment: options.existingSentiment ?? Sentiment.NEUTRAL }),
   };
 
   const service = new CuratedIngestService(
@@ -343,6 +362,41 @@ describe('CuratedIngestService.processLink', () => {
     expect(written.lastError).not.toContain(PAGE_URL);
   });
 
+  it('повторная обработка обновляет уже созданное упоминание, а не вставляет второе', async () => {
+    // Без этого --force молча ничего не менял бы: partial UNIQUE по curated_link_id гасит
+    // вторую вставку, и исправленная дата не доехала бы до существующей строки.
+    const h = makeHarness({ existingMention: true });
+
+    const outcome = await h.service.processLink(makeLink({ mentionId: 'mention-1' }), h.context);
+
+    expect(h.mentions.createIfNewAndClassify).not.toHaveBeenCalled();
+    expect(h.mentions.updateCuratedContent).toHaveBeenCalledWith(
+      'mention-1',
+      expect.objectContaining({ publishedAt: new Date(Date.UTC(2026, 3, 20)) }),
+    );
+    expect(outcome.status).toBe(CuratedLinkStatus.PROCESSED);
+  });
+
+  it('повторная обработка не переклассифицирует уже определённую тональность (и не платит второй раз)', async () => {
+    const h = makeHarness({ existingMention: true, existingSentiment: Sentiment.NEGATIVE });
+
+    const outcome = await h.service.processLink(makeLink({ mentionId: 'mention-1' }), h.context);
+
+    expect(h.mentions.classifyExisting).not.toHaveBeenCalled();
+    expect(outcome.sentimentCalls).toBe(0);
+    expect(outcome.sentiment).toBe(Sentiment.NEGATIVE);
+  });
+
+  it('повторная обработка доклассифицирует упоминание, оставшееся без тональности', async () => {
+    // Так строки, созданные без OPENAI_API_KEY, получают тональность при следующем прогоне.
+    const h = makeHarness({ existingMention: true, existingSentiment: Sentiment.UNDEFINED });
+
+    const outcome = await h.service.processLink(makeLink({ mentionId: 'mention-1' }), h.context);
+
+    expect(h.mentions.classifyExisting).toHaveBeenCalledWith('mention-1');
+    expect(outcome.sentimentCalls).toBe(1);
+  });
+
   it('passes the extracted context — not the whole article — as the mention text', async () => {
     const h = makeHarness();
 
@@ -377,5 +431,35 @@ describe('curatedMentionHash', () => {
     expect(a).toMatch(/^[0-9a-f]{64}$/);
     expect(a).toBe(curatedMentionHash('a'.repeat(64)));
     expect(a).not.toBe(curatedMentionHash('b'.repeat(64)));
+  });
+});
+
+describe('withTrailingSlashVariant', () => {
+  it('offers the slashed spelling as a second attempt', () => {
+    // sk.kz answers 404 for the path and 200 for the path + "/" — the normalizer strips it, so
+    // the reader has to try both before paying for an OpenAI read.
+    expect(withTrailingSlashVariant('https://example.com/news/56084')).toEqual([
+      'https://example.com/news/56084',
+      'https://example.com/news/56084/',
+    ]);
+  });
+
+  it('offers nothing extra when the URL already ends in a slash', () => {
+    expect(withTrailingSlashVariant('https://example.com/news/56084/')).toEqual(['https://example.com/news/56084/']);
+  });
+
+  it('offers nothing extra for a bare root', () => {
+    expect(withTrailingSlashVariant('https://example.com/')).toEqual(['https://example.com/']);
+  });
+
+  it('keeps the query string on the variant', () => {
+    expect(withTrailingSlashVariant('https://example.com/a?id=1')).toEqual([
+      'https://example.com/a?id=1',
+      'https://example.com/a/?id=1',
+    ]);
+  });
+
+  it('returns the input unchanged when it is not a URL', () => {
+    expect(withTrailingSlashVariant('not a url')).toEqual(['not a url']);
   });
 });

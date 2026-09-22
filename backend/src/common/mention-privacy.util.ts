@@ -17,6 +17,18 @@
 /** The fields that carry a URL and therefore must not leave the server for a hidden mention. */
 const REDACTED_FIELDS = ['url', 'reprints'] as const;
 
+/**
+ * Dropping `url` is not sufficient on its own: a news page often prints its own address inside
+ * the article body (a "copy link" block, a share widget), so the extracted `text` — and any
+ * `summary` written from it — can carry the very link `url` withheld. Observed live on
+ * kz.kursiv.media. The ingestion strips links before storing (see curated-context.util.ts), and
+ * this scrubs them again on the way out so rows written before that fix, or by any other path,
+ * are covered too.
+ */
+const SCRUBBED_TEXT_FIELDS = ['text', 'summary', 'title'] as const;
+const URL_IN_TEXT = /https?:\/\/\S+/gi;
+const URL_PLACEHOLDER = '[ссылка]';
+
 /** Guards against pathological/cyclic payloads — no real API response nests this deep. */
 const MAX_DEPTH = 8;
 
@@ -71,10 +83,19 @@ export function redactHiddenMentions<T>(value: T, depth = 0): T {
     // "there is no link to show" (see MentionCard.tsx).
     result.url = null;
     result.reprints = [];
+
+    for (const field of SCRUBBED_TEXT_FIELDS) {
+      if (typeof result[field] === 'string') {
+        result[field] = (result[field] as string).replace(URL_IN_TEXT, URL_PLACEHOLDER);
+      }
+    }
   }
 
   for (const [key, child] of Object.entries(record)) {
-    if (hidden && (REDACTED_FIELDS as readonly string[]).includes(key)) {
+    if (
+      hidden &&
+      ((REDACTED_FIELDS as readonly string[]).includes(key) || (SCRUBBED_TEXT_FIELDS as readonly string[]).includes(key))
+    ) {
       continue;
     }
     const next = redactHiddenMentions(child, depth + 1);

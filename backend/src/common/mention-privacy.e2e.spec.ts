@@ -24,7 +24,8 @@ const PUBLIC_URL = 'https://example.com/public/ordinary-article';
 const hiddenMention = {
   id: 'm-hidden',
   title: 'Материал из закрытого пула',
-  text: 'Фрагмент вокруг упоминания компании.',
+  // Включает собственный адрес статьи — так и бывает на реальных сайтах (kz.kursiv.media).
+  text: `Фрагмент вокруг упоминания компании. Источник: ${HIDDEN_URL}`,
   url: HIDDEN_URL,
   reprints: [{ url: `${HIDDEN_URL}-reprint`, sourceId: null, foundAt: '2026-04-20T00:00:00.000Z' }],
   publishedAt: '2026-04-20T00:00:00.000Z',

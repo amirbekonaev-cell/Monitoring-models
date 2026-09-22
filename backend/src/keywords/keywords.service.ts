@@ -60,10 +60,20 @@ export class KeywordsService {
    * Snapshot of active keywords for one collection cycle. Loading this once per cycle
    * (rather than per-item) is what makes "changes apply only to the next cycle" true —
    * a cycle already in progress keeps using the list it started with.
+   *
+   * `includeMinus: false` builds the same matcher without the minus-keyword veto. Only the
+   * closed link pool uses it, and only because minus keywords exist for a different job there:
+   * they were tuned to suppress noise from the channels that search the whole open web, where
+   * nothing has been vetted. Every pool link, by contrast, was chosen by a person who already
+   * decided it is about the company — so a minus keyword there does not filter noise, it
+   * silently discards a link that was deliberately added (e.g. "Астан" vetoing a genuine
+   * "дата-центр под Астаной" story). Positive matching still applies, so a pool page that
+   * really doesn't name the company is still rejected.
    */
-  async loadActiveKeywordSet(): Promise<ActiveKeywordSet> {
+  async loadActiveKeywordSet(options: { includeMinus?: boolean } = {}): Promise<ActiveKeywordSet> {
     const active = await this.keywordsRepo.find({ where: { isActive: true } });
-    return new ActiveKeywordSet(active, this.dataSource);
+    const filtered = options.includeMinus === false ? active.filter((k) => k.type !== KeywordType.MINUS) : active;
+    return new ActiveKeywordSet(filtered, this.dataSource);
   }
 }
 

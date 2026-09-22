@@ -2,6 +2,7 @@ import { Injectable, Logger } from '@nestjs/common';
 import * as cheerio from 'cheerio';
 import { hashMentionText } from '../../common/hash.util';
 import { CollectedItem } from '../../common/collector-run.util';
+import { findUnambiguousDate, parseHumanReadableDate } from '../../common/human-date.util';
 
 const FETCH_TIMEOUT_MS = 15000;
 const USER_AGENT = 'Mozilla/5.0 (compatible; MentionsMonitor/1.0; +https://example.com/bot)';
@@ -147,13 +148,126 @@ export class ParserService {
     const html = await this.download(url, signal);
     const $ = cheerio.load(html);
 
+    // og:title, then <title>, then <h1> — but a <title> too short to be a headline is skipped in
+    // favour of the <h1>. Observed live on itsx.kz, whose every article page has the bare
+    // <title>ITS</title> while the real headline ("ITS completes key infrastructure migration to
+    // QazCloud data center") sits only in the <h1>. A two-word title is what the reader would
+    // see in /search, so it is worth preferring the longer candidate.
+    const MIN_MEANINGFUL_TITLE = 15;
+    const titleCandidates = [
+      $('meta[property="og:title"]').attr('content')?.trim(),
+      $('title').first().text().trim(),
+      $('h1').first().text().trim(),
+    ].filter((candidate): candidate is string => Boolean(candidate));
     const title =
-      $('meta[property="og:title"]').attr('content')?.trim() ||
-      $('title').first().text().trim() ||
-      $('h1').first().text().trim() ||
-      '';
+      titleCandidates.find((candidate) => candidate.length >= MIN_MEANINGFUL_TITLE) ?? titleCandidates[0] ?? '';
 
-    return { title, text: this.extractFullBodyText($), publishedAt: this.extractPublishedAt($) };
+    // Date BEFORE extractFullBodyText(), which strips markup out of `$` in place.
+    const publishedAt = this.extractArticlePublishedAt($);
+    return { title, text: this.extractFullBodyText($), publishedAt };
+  }
+
+  /**
+   * Publish date of THE ARTICLE, as opposed to extractPublishedAt()'s "first date-ish thing on
+   * the page". The difference is not academic: most news sites render a "latest news" sidebar on
+   * every article page, so `$('time[datetime]').first()` returns TODAY'S date on a five-year-old
+   * article (observed live on ekaraganda.kz, whose article pages list the day's headlines in a
+   * fixed sidebar ahead of the article's own <time>). For the closed pool that is the worst
+   * possible failure — every such article would fall inside every /search period forever.
+   *
+   * Order: explicit metadata, then JSON-LD (schema.org NewsArticle — widely emitted and
+   * unambiguous), then the <time> element NEAREST THE HEADLINE, found by walking up from <h1>
+   * and taking the first ancestor that contains one. Walking outwards from the headline is what
+   * distinguishes the article's own date from a sidebar's: the sidebar lives in a different
+   * subtree, reached only at the very top of the document, so the walk stops before <body>
+   * rather than settling for any date at all.
+   *
+   * Separate from extractPublishedAt() rather than replacing it: that one is used by the
+   * existing RSS/parser channels, which are out of scope here.
+   */
+  private extractArticlePublishedAt($: cheerio.CheerioAPI): Date | null {
+    const metaCandidates = [
+      $('meta[property="article:published_time"]').attr('content'),
+      $('meta[itemprop="datePublished"]').attr('content'),
+      $('meta[name="publish-date"]').attr('content'),
+      $('meta[name="pubdate"]').attr('content'),
+      $('meta[name="date"]').attr('content'),
+      $('meta[name="DC.date.issued"]').attr('content'),
+    ];
+    const fromMeta = firstValidDate(metaCandidates);
+    if (fromMeta) {
+      return fromMeta;
+    }
+
+    const fromJsonLd = firstValidDate(this.extractJsonLdDates($));
+    if (fromJsonLd) {
+      return fromJsonLd;
+    }
+
+    const headline = $('h1').first();
+    if (headline.length > 0) {
+      let scope = headline.parent();
+      for (let depth = 0; depth < 6 && scope.length > 0; depth += 1) {
+        const tagName = (scope.get(0) as { tagName?: string } | undefined)?.tagName?.toLowerCase();
+        if (tagName === 'body' || tagName === 'html') {
+          break;
+        }
+        const scoped = firstValidDate([
+          scope.find('time[datetime]').first().attr('datetime'),
+          scope.find('[itemprop="datePublished"]').first().attr('content'),
+        ]);
+        if (scoped) {
+          return scoped;
+        }
+        // Last resort at this scope: the date written out as prose ("20 января 2023"). Many
+        // Kazakh news sites publish no machine-readable date whatsoever — see human-date.util.ts.
+        // Widening one level at a time is what keeps this off a sidebar's dates: the article's
+        // own date sits close to its headline, a "latest news" list does not.
+        const fromText = parseHumanReadableDate(scope.text());
+        if (fromText) {
+          return fromText;
+        }
+        scope = scope.parent();
+      }
+    }
+
+    // Nothing near the headline. Last resort: the whole page, but only if it names exactly ONE
+    // date — see findUnambiguousDate. A page with a "latest news" sidebar has many and yields
+    // null here rather than a wrong date.
+    return findUnambiguousDate($('body').text());
+  }
+
+  /** `datePublished` from any schema.org JSON-LD block, including @graph-wrapped ones. */
+  private extractJsonLdDates($: cheerio.CheerioAPI): Array<string | undefined> {
+    const found: Array<string | undefined> = [];
+    $('script[type="application/ld+json"]').each((_, el) => {
+      const raw = $(el).contents().text().trim();
+      if (!raw) return;
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(raw);
+      } catch {
+        return; // A malformed JSON-LD block is common and never worth failing the whole parse for.
+      }
+      const visit = (node: unknown, depth: number): void => {
+        if (depth > 4 || node === null || typeof node !== 'object') return;
+        if (Array.isArray(node)) {
+          node.forEach((child) => visit(child, depth + 1));
+          return;
+        }
+        const record = node as Record<string, unknown>;
+        for (const key of ['datePublished', 'dateCreated']) {
+          if (typeof record[key] === 'string') {
+            found.push(record[key] as string);
+          }
+        }
+        if (Array.isArray(record['@graph'])) {
+          visit(record['@graph'], depth + 1);
+        }
+      };
+      visit(parsed, 0);
+    });
+    return found;
   }
 
   /**
@@ -657,4 +771,16 @@ export class ParserService {
 
     return null;
   }
+}
+
+/** First parseable date among the candidates; ignores empty/unparseable entries. */
+function firstValidDate(candidates: Array<string | undefined | null>): Date | null {
+  for (const candidate of candidates) {
+    if (!candidate || !candidate.trim()) continue;
+    const date = new Date(candidate.trim());
+    if (!Number.isNaN(date.getTime())) {
+      return date;
+    }
+  }
+  return null;
 }

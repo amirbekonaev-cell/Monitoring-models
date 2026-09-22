@@ -62,6 +62,29 @@ describe('redactHiddenMentions', () => {
     expect(JSON.stringify(redactHiddenMentions(raw))).not.toContain(HIDDEN_URL);
   });
 
+  it('scrubs a URL out of the text of a hidden mention, not just the url field', () => {
+    // Регрессия, найденная curated:leak-check на живом стенде: статья печатает собственный
+    // адрес в теле, и он уезжал в ответе GET /mentions при корректно скрытом url.
+    const mention = hiddenMention({ text: `Текст статьи. Источник: ${HIDDEN_URL} конец.` });
+
+    const result = redactHiddenMentions(mention) as Record<string, unknown>;
+
+    expect(JSON.stringify(result)).not.toContain(HIDDEN_URL);
+    expect(JSON.stringify(result)).not.toContain('/pool/secret-article-slug');
+    expect(result.text).toContain('Текст статьи.');
+  });
+
+  it('scrubs a URL out of summary and title of a hidden mention too', () => {
+    const mention = hiddenMention({ summary: `Кратко: ${HIDDEN_URL}`, title: `Заголовок ${HIDDEN_URL}` });
+    expect(JSON.stringify(redactHiddenMentions(mention))).not.toContain('/pool/secret-article-slug');
+  });
+
+  it('leaves the text of a PUBLIC mention untouched, links and all', () => {
+    const mention = publicMention({ text: 'Читайте на https://example.com/public/article' });
+    const result = redactHiddenMentions(mention) as Record<string, unknown>;
+    expect(result.text).toBe('Читайте на https://example.com/public/article');
+  });
+
   it('does not mutate the input', () => {
     const input = hiddenMention();
     redactHiddenMentions(input);

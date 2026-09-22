@@ -16,6 +16,18 @@
 export const CONTEXT_WINDOW_CHARS = 600;
 export const CONTEXT_MAX_CHARS = 4000;
 
+/**
+ * Any http(s) link in the extracted text is removed before the text is stored.
+ *
+ * This is not hygiene, it is the privacy requirement: news pages routinely print their own
+ * canonical URL in the body (a "copy link" block, a share widget, a footer credit). Observed
+ * live on kz.kursiv.media, whose article text contains the article's own address — which would
+ * land in `mentions.text` and be served by GET /mentions in full, even though `mentions.url` is
+ * correctly withheld. Removing links here means the URL never reaches the database at all.
+ */
+const URL_IN_TEXT = /https?:\/\/\S+/gi;
+const URL_PLACEHOLDER = '[ссылка]';
+
 export interface BuildContextOptions {
   /** Characters of context kept on each side of an occurrence. */
   windowChars?: number;
@@ -47,8 +59,8 @@ export function buildMentionContext(
   const windowChars = options.windowChars ?? CONTEXT_WINDOW_CHARS;
   const maxChars = options.maxChars ?? CONTEXT_MAX_CHARS;
 
-  const cleanTitle = (title ?? '').trim();
-  const cleanBody = (body ?? '').replace(/\s+/g, ' ').trim();
+  const cleanTitle = stripUrls((title ?? '').trim());
+  const cleanBody = stripUrls((body ?? '').replace(/\s+/g, ' ')).trim();
 
   if (!cleanBody) {
     return cleanTitle.slice(0, maxChars);
@@ -106,4 +118,9 @@ function mergeRanges(ranges: Range[]): Range[] {
     }
   }
   return merged;
+}
+
+/** Replaces every http(s) link with a placeholder — see URL_IN_TEXT. */
+export function stripUrls(text: string): string {
+  return text.replace(URL_IN_TEXT, URL_PLACEHOLDER);
 }

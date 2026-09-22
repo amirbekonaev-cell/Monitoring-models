@@ -73,3 +73,28 @@ describe('buildMentionContext', () => {
     expect(result).toContain('абвгд');
   });
 });
+
+describe('buildMentionContext: ссылки не попадают в сохраняемый текст', () => {
+  it('вырезает URL из тела статьи', () => {
+    // Регрессия: kz.kursiv.media печатает собственный адрес статьи в её же тексте, и он уезжал
+    // в mentions.text — то есть наружу через GET /mentions, хотя mentions.url скрыт.
+    const body = 'Новость про QazCloud. Источник: https://example.com/2022-04-12/article-slug конец.';
+    const result = buildMentionContext('Заголовок', body, FORMS, { windowChars: 600 });
+
+    expect(result).not.toContain('https://');
+    expect(result).not.toContain('/2022-04-12/article-slug');
+    expect(result).toContain('[ссылка]');
+    expect(result).toContain('Новость про QazCloud');
+  });
+
+  it('вырезает URL и из заголовка', () => {
+    const result = buildMentionContext('Заголовок https://example.com/secret-path', 'Текст QazCloud.', FORMS);
+    expect(result).not.toContain('/secret-path');
+  });
+
+  it('вырезает несколько ссылок сразу', () => {
+    const body = 'QazCloud http://example.com/a и https://example.com/b и http://example.com/c';
+    const result = buildMentionContext('T', body, FORMS, { windowChars: 600 });
+    expect(result).not.toMatch(/https?:\/\//);
+  });
+});

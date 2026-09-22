@@ -212,7 +212,10 @@ export class CuratedIngestService {
   }
 
   async buildContext(): Promise<IngestContext> {
-    const keywordSet = await this.keywordsService.loadActiveKeywordSet();
+    // includeMinus: false — see KeywordsService.loadActiveKeywordSet. The pool is hand-vetted,
+    // so a minus keyword here rejects a link a person deliberately added rather than filtering
+    // noise. Positive matching is unchanged and still decides relevance.
+    const keywordSet = await this.keywordsService.loadActiveKeywordSet({ includeMinus: false });
     const source = await this.sourcesService.ensureSingleton({
       url: CURATED_SOURCE_URL,
       name: CURATED_SOURCE_NAME,
@@ -288,27 +291,54 @@ export class CuratedIngestService {
       });
       base.dateSource = dateSource;
 
-      const insert = await this.mentionsService.createIfNewAndClassify({
-        title: read.title || (link.groupLabel ?? 'Материал из пула'),
-        text,
-        url: link.url,
-        publishedAt: date,
-        sourceId: context.sourceId,
-        sourceType: MentionSourceType.NEWS,
-        // group_label from the file, NOT the domain — the label is what /search prints, and a
-        // domain there would reconstruct half the hidden link for the reader.
-        sourceLabel: link.groupLabel ?? CURATED_SOURCE_NAME,
-        hash: curatedMentionHash(link.urlHash),
-        keywords: relevance.matchedKeywords,
-        skipDedup: true,
-        urlHidden: true,
-        curatedLinkId: link.id,
-      });
+      const title = read.title || (link.groupLabel ?? 'Материал из пула');
+      // group_label from the file, NOT the domain — the label is what /search prints, and a
+      // domain there would reconstruct half the hidden link for the reader.
+      const sourceLabel = link.groupLabel ?? CURATED_SOURCE_NAME;
 
-      base.sentimentCalls = 1;
-      base.sentiment = insert.sentiment;
+      // A re-run (`--force`) must UPDATE the mention this link already produced, not insert a
+      // second one: pool inserts use skipDedup, and the partial UNIQUE index on curated_link_id
+      // would silently drop the second row — leaving the stale content in place. This is the
+      // path that lets a fixed date extractor actually reach the existing mentions.
+      const existingMentionId = link.mentionId ?? (await this.findMentionIdFor(link.id));
 
-      const mention = await this.findMentionIdFor(link.id);
+      if (existingMentionId) {
+        await this.mentionsService.updateCuratedContent(existingMentionId, {
+          title,
+          text,
+          publishedAt: date,
+          sourceLabel,
+          keywords: relevance.matchedKeywords,
+        });
+        const existing = await this.mentionsService.findById(existingMentionId);
+        base.sentiment = existing?.sentiment ?? Sentiment.UNDEFINED;
+        // Only pay for classification again if the mention never got a tone in the first place
+        // (e.g. it was first processed with no OPENAI_API_KEY configured).
+        if (base.sentiment === Sentiment.UNDEFINED) {
+          await this.mentionsService.classifyExisting(existingMentionId);
+          base.sentimentCalls = 1;
+          base.sentiment = (await this.mentionsService.findById(existingMentionId))?.sentiment ?? Sentiment.UNDEFINED;
+        }
+      } else {
+        const insert = await this.mentionsService.createIfNewAndClassify({
+          title,
+          text,
+          url: link.url,
+          publishedAt: date,
+          sourceId: context.sourceId,
+          sourceType: MentionSourceType.NEWS,
+          sourceLabel,
+          hash: curatedMentionHash(link.urlHash),
+          keywords: relevance.matchedKeywords,
+          skipDedup: true,
+          urlHidden: true,
+          curatedLinkId: link.id,
+        });
+        base.sentimentCalls = 1;
+        base.sentiment = insert.sentiment;
+      }
+
+      const mention = existingMentionId ?? (await this.findMentionIdFor(link.id));
       base.mentionId = mention;
       base.status = CuratedLinkStatus.PROCESSED;
 
@@ -323,7 +353,7 @@ export class CuratedIngestService {
       });
 
       this.logger.log(
-        `${ref}: обработана (${read.readVia}), тональность=${insert.sentiment}, дата=${dateSource ?? 'нет'}`,
+        `${ref}: обработана (${read.readVia}), тональность=${base.sentiment}, дата=${dateSource ?? 'нет'}`,
       );
       return base;
     } catch (error) {
@@ -363,27 +393,34 @@ export class CuratedIngestService {
 
     if (this.readMode === 'auto') {
       let parserError: string | null = null;
-      try {
-        const page = await this.parser.fetchPageDetailed(link.url, signal);
-        const minChars = this.num('minPageTextChars', 400);
-        if (page.title && page.text.trim().length >= minChars) {
-          return {
-            readVia: 'parser',
-            title: page.title,
-            text: page.text,
-            pageDate: page.publishedAt,
-            modelDateIso: null,
-            modelSaysMentioned: false,
-            modelFragments: [],
-            webSearchCalls: 0,
-          };
+      // Both spellings of the path. Normalization strips a trailing slash (see
+      // curated-url.util.ts), and a few sites treat the two as different resources — sk.kz
+      // answers 404 for `/news/56084` and 200 for `/news/56084/`. Retrying with the slash costs
+      // one free HTTP request and saves a billed OpenAI read, so it happens before the fallback,
+      // not instead of it.
+      for (const candidateUrl of withTrailingSlashVariant(link.url)) {
+        try {
+          const page = await this.parser.fetchPageDetailed(candidateUrl, signal);
+          const minChars = this.num('minPageTextChars', 400);
+          if (page.title && page.text.trim().length >= minChars) {
+            return {
+              readVia: 'parser',
+              title: page.title,
+              text: page.text,
+              pageDate: page.publishedAt,
+              modelDateIso: null,
+              modelSaysMentioned: false,
+              modelFragments: [],
+              webSearchCalls: 0,
+            };
+          }
+          parserError = `парсер получил ${page.text.trim().length} символов текста (порог ${minChars})`;
+        } catch (error) {
+          if (signal.aborted) {
+            throw error;
+          }
+          parserError = humanizeError(error, link.host ?? 'unknown');
         }
-        parserError = `парсер получил ${page.text.trim().length} символов текста (порог ${minChars})`;
-      } catch (error) {
-        if (signal.aborted) {
-          throw error;
-        }
-        parserError = humanizeError(error, link.host ?? 'unknown');
       }
       this.logger.debug(`${ref}: парсер не справился (${parserError}) — пробую OpenAI`);
     }
@@ -487,6 +524,24 @@ export class CuratedIngestService {
  */
 export function curatedMentionHash(urlHash: string): string {
   return createHash('sha256').update(`curated:${urlHash}`).digest('hex');
+}
+
+/**
+ * The URL, then the same URL with a trailing slash added (or nothing more, when it already has
+ * one or has no path to speak of). Used to work around sites that serve a path and that path
+ * plus "/" as different resources — see readPage().
+ */
+export function withTrailingSlashVariant(url: string): string[] {
+  try {
+    const parsed = new URL(url);
+    if (parsed.pathname.length <= 1 || parsed.pathname.endsWith('/')) {
+      return [url];
+    }
+    parsed.pathname = `${parsed.pathname}/`;
+    return [url, parsed.toString()];
+  } catch {
+    return [url];
+  }
 }
 
 /** Error text fit for `last_error`: readable, and never carrying the link's URL. */

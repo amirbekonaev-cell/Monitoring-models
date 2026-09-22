@@ -220,6 +220,15 @@ export class MentionsService {
     return { result: 'inserted', id: insertedId };
   }
 
+  /**
+   * Classifies an existing mention now, awaited. Same work classifySentimentInBackground() does,
+   * exposed for a caller that is re-processing a row which never received a tone (see
+   * CuratedIngestService's --force path) and wants the result before it reports.
+   */
+  async classifyExisting(mentionId: string): Promise<void> {
+    await this.classifySentimentInBackground(mentionId);
+  }
+
   private async classifySentimentInBackground(mentionId: string): Promise<void> {
     if (!this.sentimentAnalysisService) {
       return;
@@ -247,6 +256,35 @@ export class MentionsService {
       const message = error instanceof Error ? error.message : String(error);
       this.logger.error(`Не удалось определить тональность упоминания ${mentionId}: ${message}`);
     }
+  }
+
+  /**
+   * Refreshes the content of a mention produced by the closed pool, for a re-run of an already
+   * processed link (`curated:process --force`). Needed because those rows are inserted with
+   * `skipDedup`, and a partial UNIQUE index on `curated_link_id` means a second insert for the
+   * same link is silently ignored — so without this, re-reading a page (e.g. after fixing how
+   * its publish date is extracted) would leave the stored mention exactly as it was.
+   *
+   * Deliberately does NOT touch `sentiment`/`sentiment_manual`: re-reading a page is not a
+   * reason to discard a human's tone correction (ФТ-11), and the caller re-classifies
+   * separately when it decides that is warranted.
+   */
+  async updateCuratedContent(
+    id: string,
+    content: { title: string; text: string; publishedAt: Date | null; sourceLabel: string | null; keywords: string[] },
+  ): Promise<void> {
+    await this.mentionsRepo
+      .createQueryBuilder()
+      .update(Mention)
+      .set({
+        title: content.title,
+        text: content.text,
+        publishedAt: content.publishedAt,
+        sourceLabel: content.sourceLabel,
+        keywords: content.keywords,
+      })
+      .where('id = :id AND url_hidden = true', { id })
+      .execute();
   }
 
   findById(id: string): Promise<Mention | null> {
