@@ -1,5 +1,6 @@
 import { resolveDbConfig } from './database.util';
 import { parseSearchPeriodDays } from '../curated/search-period.util';
+import { resolveTelegramBotMode } from '../notifications/telegram/telegram-bot-mode.util';
 
 export default () => ({
   port: parseInt(process.env.PORT || '3000', 10),
@@ -60,6 +61,10 @@ export default () => ({
     // with no token). Created once via @BotFather — see docs/telegram-setup.md.
     token: process.env.TELEGRAM_BOT_TOKEN || '',
     chatId: process.env.TELEGRAM_CHAT_ID || '',
+    // 'polling' (default off Vercel) | 'webhook' (default on Vercel, which sets VERCEL itself).
+    // The local docker compose stand MUST use polling: Telegram cannot POST to localhost, so a
+    // webhook-only bot silently answers nothing there. See telegram-bot-mode.util.ts.
+    mode: resolveTelegramBotMode(process.env.TELEGRAM_BOT_MODE, Boolean(process.env.VERCEL)),
     // Checked against the `X-Telegram-Bot-Api-Secret-Token` header on every POST /telegram/webhook
     // call (TelegramWebhookController) before the update is even parsed — Telegram sends this
     // header back verbatim on every webhook call once it's set via `npm run set-webhook`
