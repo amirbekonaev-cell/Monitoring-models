@@ -14,6 +14,15 @@ const handleUpdateMock = jest.fn(async () => undefined);
 const setMyCommandsMock = jest.fn(async () => undefined);
 const sendMessageMock = jest.fn(async (..._args: unknown[]) => undefined);
 const catchMock = jest.fn();
+const stopMock = jest.fn();
+// launch() resolves only when the bot stops — the mock mirrors that (a never-settling promise),
+// so a test would hang if the service ever awaited it instead of the onLaunch callback.
+const launchMock = jest.fn(
+  (_config: unknown, onLaunch?: () => void) =>
+    new Promise<void>(() => {
+      onLaunch?.();
+    }),
+);
 
 jest.mock('telegraf', () => {
   const actual = jest.requireActual('telegraf');
@@ -24,15 +33,18 @@ jest.mock('telegraf', () => {
       action: (pattern: RegExp, handler: ActionHandler) => actionHandlers.set(pattern.toString(), handler),
       handleUpdate: handleUpdateMock,
       catch: catchMock,
+      launch: launchMock,
+      stop: stopMock,
       telegram: { setMyCommands: setMyCommandsMock, sendMessage: sendMessageMock },
     })),
   };
 });
 
-function makeConfig(chatId = '-1001'): ConfigService {
+function makeConfig(chatId = '-1001', mode: 'polling' | 'webhook' = 'webhook'): ConfigService {
   const values: Record<string, unknown> = {
     'telegramBot.token': 'tok',
     'telegramBot.chatId': chatId,
+    'telegramBot.mode': mode,
     'curated.periodDays': [...DEFAULT_SEARCH_PERIOD_DAYS],
     'curated.timezone': 'Asia/Almaty',
     'curated.messageCharLimit': 3500,
@@ -125,19 +137,23 @@ describe('TelegramBotService (closed-pool bot)', () => {
     setMyCommandsMock.mockClear();
     sendMessageMock.mockClear();
     catchMock.mockClear();
+    launchMock.mockClear();
+    stopMock.mockClear();
   });
 
   async function boot(
     chatId = '-1001',
     curatedSearchService: CuratedSearchService = makeCuratedSearchService(),
+    mode: 'polling' | 'webhook' = 'webhook',
   ): Promise<{ service: TelegramBotService; curatedSearchService: CuratedSearchService }> {
-    const service = new TelegramBotService(makeConfig(chatId), curatedSearchService);
+    const service = new TelegramBotService(makeConfig(chatId, mode), curatedSearchService);
     await service.onModuleInit();
     return { service, curatedSearchService };
   }
 
-  it('registers /status and /search on init, without starting a long-poll connection', async () => {
+  it('registers /status and /search on init, without starting a long-poll connection in webhook mode', async () => {
     await boot();
+    expect(launchMock).not.toHaveBeenCalled();
     expect(commandHandlers.has('status')).toBe(true);
     expect(commandHandlers.has('search')).toBe(true);
     expect(commandHandlers.has('pause')).toBe(false);
@@ -161,6 +177,41 @@ describe('TelegramBotService (closed-pool bot)', () => {
     await service.onModuleInit();
 
     await expect(service.handleUpdate({} as any)).rejects.toThrow('TELEGRAM_BOT_TOKEN');
+  });
+
+  describe('режим получения апдейтов', () => {
+    // The local docker compose stand cannot be reached by Telegram at all, so a webhook-only bot
+    // answers nothing there — polling mode is what makes /status and /search work on localhost.
+    it('opens the long-poll loop in polling mode and still registers the same commands', async () => {
+      await boot('-1001', makeCuratedSearchService(), 'polling');
+
+      expect(launchMock).toHaveBeenCalledTimes(1);
+      expect(launchMock.mock.calls[0][0]).toEqual({ dropPendingUpdates: true });
+      expect(commandHandlers.has('status')).toBe(true);
+      expect(commandHandlers.has('search')).toBe(true);
+    });
+
+    it('does not hang bootstrap even though launch() never resolves', async () => {
+      // onModuleInit must return once polling has started; if it awaited launch() itself, Nest
+      // would never finish booting and the HTTP server would never listen.
+      await expect(boot('-1001', makeCuratedSearchService(), 'polling')).resolves.toBeDefined();
+    });
+
+    it('keeps the rest of the stand up when long polling fails to start', async () => {
+      launchMock.mockImplementationOnce(() => Promise.reject(new Error('401: Unauthorized')));
+
+      await expect(boot('-1001', makeCuratedSearchService(), 'polling')).resolves.toBeDefined();
+    });
+
+    it('stops the long-poll loop on shutdown, and only when it was actually started', async () => {
+      const { service } = await boot('-1001', makeCuratedSearchService(), 'polling');
+      await service.onModuleDestroy();
+      expect(stopMock).toHaveBeenCalledTimes(1);
+
+      const webhookBoot = await boot('-1001', makeCuratedSearchService(), 'webhook');
+      await webhookBoot.service.onModuleDestroy();
+      expect(stopMock).toHaveBeenCalledTimes(1);
+    });
   });
 
   describe('/status', () => {

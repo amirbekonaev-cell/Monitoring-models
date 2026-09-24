@@ -1,4 +1,4 @@
-import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
+import { Injectable, Logger, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { Context, Markup, Telegraf } from 'telegraf';
 import { InlineKeyboardMarkup, Update } from 'telegraf/types';
@@ -21,24 +21,31 @@ import {
  *  to build one page; the pool itself is only ever a few hundred links. */
 const PAGE_FETCH_BATCH_SIZE = 500;
 
+/** How the bot receives updates — see the class comment and resolveTelegramBotMode(). */
+export type TelegramBotMode = 'polling' | 'webhook';
+
 /**
  * Owns the single Telegraf bot instance for the whole app — both inbound commands (/status,
- * /search, dispatched via handleUpdate() from TelegramWebhookController) and outbound alerts
- * (via getBot(), used by TelegramNotifierService) share it.
+ * /search) and outbound alerts (via getBot(), used by TelegramNotifierService) share it.
  *
- * Webhook, not long-poll: a Vercel Function instance is frozen/torn down between requests
- * (scale-to-zero after ~5 min idle, ~30s on preview deployments) — nothing can keep a persistent
- * bot.launch()/getUpdates connection open across that. Telegram calls TelegramWebhookController's
- * POST /telegram/webhook once per update instead; this service just builds the Telegraf instance
- * and registers handlers, it never opens a connection of its own.
+ * Two transports, because the app runs in two very different places:
+ *  - `webhook` — Telegram POSTs each update to TelegramWebhookController, which calls
+ *    handleUpdate(). Required on Vercel: a Function instance is frozen/torn down between
+ *    requests (scale-to-zero), so nothing can keep a getUpdates connection open across that.
+ *  - `polling` — the bot itself pulls updates (bot.launch()). Required on the local docker
+ *    compose stand: Telegram cannot reach http://localhost:3000, so a webhook can never be
+ *    delivered there and the bot would silently answer nothing at all.
+ * Default: polling everywhere except Vercel (which sets VERCEL=1 itself); TELEGRAM_BOT_MODE
+ * overrides it explicitly. See resolveMode() and README "Телеграм-бот: webhook или polling".
  *
- * /search and /status are now pure DB reads over the closed pool of pre-vetted links (see
+ * /search and /status are pure DB reads over the closed pool of pre-vetted links (see
  * CuratedSearchService) — no collector, no network call, no OpenAI, ever runs from this bot.
  */
 @Injectable()
-export class TelegramBotService implements OnModuleInit {
+export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(TelegramBotService.name);
   private bot: Telegraf | null = null;
+  private polling = false;
 
   constructor(
     private readonly config: ConfigService,
@@ -57,19 +64,33 @@ export class TelegramBotService implements OnModuleInit {
     return this.config.get<number>('curated.messageCharLimit') || 3500;
   }
 
+  private get mode(): TelegramBotMode {
+    return this.config.get<TelegramBotMode>('telegramBot.mode') === 'webhook' ? 'webhook' : 'polling';
+  }
+
   /**
-   * No bot.launch() here — see class-level comment. This just builds the Telegraf instance and
-   * registers the command/action handlers so handleUpdate() (called by TelegramWebhookController)
-   * has something to dispatch to; it runs on every cold start, which is fine since it does no
-   * network calls of its own. Registering the webhook URL with Telegram is a separate, one-time
-   * step (`npm run set-webhook`) — doing it here on every cold start would hit Telegram's API on
-   * every request and race across concurrent instances for no benefit.
+   * Builds the Telegraf instance and registers the command/action handlers, then — in polling
+   * mode only — opens the getUpdates loop so the bot actually receives anything on a stand
+   * Telegram cannot call back into (localhost). In webhook mode nothing is launched: updates
+   * arrive through TelegramWebhookController, and registering the webhook URL with Telegram
+   * stays a separate one-time step (`npm run set-webhook`) — doing it on every cold start would
+   * hit Telegram's API on every request and race across concurrent instances for no benefit.
    */
   async onModuleInit(): Promise<void> {
     const token = this.config.get<string>('telegramBot.token');
     if (!token) {
       this.logger.warn('TELEGRAM_BOT_TOKEN не задан — команды /status, /search недоступны, отправка уведомлений тоже работать не будет.');
       return;
+    }
+
+    // Without a chat id every command is rejected by isAuthorizedChat() and the bot looks dead
+    // from inside the group — say so once at startup instead of only logging one warning per
+    // ignored message.
+    if (!this.config.get<string>('telegramBot.chatId')) {
+      this.logger.warn(
+        'TELEGRAM_CHAT_ID не задан — бот запустится, но отклонит любую команду как «не из рабочей группы». ' +
+          'Получите chat_id через `npm run get-chat-id` и впишите его в .env (см. docs/telegram-setup.md).',
+      );
     }
 
     this.bot = new Telegraf(token);
@@ -92,7 +113,55 @@ export class TelegramBotService implements OnModuleInit {
       this.logger.warn(`Не удалось задать список команд бота (не критично): ${describeError(error)}`);
     }
 
-    this.logger.log('Telegram-бот готов принимать вебхуки: /status, /search');
+    if (this.mode === 'webhook') {
+      this.logger.log('Telegram-бот готов принимать вебхуки (POST /telegram/webhook): /status, /search');
+      return;
+    }
+
+    await this.startPolling(this.bot);
+  }
+
+  /**
+   * launch() resolves only when the bot stops, so it must never be awaited here — awaiting it
+   * would hang Nest's bootstrap forever and the HTTP server would never start listening. We wait
+   * on the onLaunch callback instead (fired right after getMe() succeeds) so an invalid token
+   * surfaces as a clear error at startup rather than as silence.
+   */
+  private async startPolling(bot: Telegraf): Promise<void> {
+    await new Promise<void>((resolve, reject) => {
+      // dropPendingUpdates: whatever piled up while the stand was down is stale by definition —
+      // /search results for a period that has since moved on are worse than no answer.
+      bot
+        .launch({ dropPendingUpdates: true }, () => {
+          this.polling = true;
+          this.logger.log('Telegram-бот запущен в режиме long polling: /status, /search');
+          resolve();
+        })
+        .then(() => {
+          this.polling = false;
+        })
+        .catch((error) => {
+          this.polling = false;
+          this.logger.error(`Telegram-бот не смог запустить long polling: ${describeError(error)}`);
+          reject(error instanceof Error ? error : new Error(String(error)));
+        });
+    }).catch(() => {
+      // Already logged above. A bot that can't start must not take the whole backend (collectors,
+      // REST API, frontend) down with it — the rest of the stand stays up.
+    });
+  }
+
+  /** Closes the getUpdates loop on shutdown (app.enableShutdownHooks() in main.ts). */
+  async onModuleDestroy(): Promise<void> {
+    if (!this.bot || !this.polling) {
+      return;
+    }
+    this.polling = false;
+    try {
+      this.bot.stop('shutdown');
+    } catch (error) {
+      this.logger.warn(`Не удалось корректно остановить long polling: ${describeError(error)}`);
+    }
   }
 
   /** Used by TelegramWebhookController to dispatch one incoming Telegram update. */
