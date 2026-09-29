@@ -12,6 +12,21 @@ interface RawFilterParams {
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
+// Matches the Telegram bot's period picker (curated/search-period.util.ts DEFAULT_SEARCH_PERIOD_DAYS)
+// so the frontend and /search never disagree about what "3 месяца"/"год"/"2 года" mean. The closed
+// pool's mentions are historical (dates spanning years, backfilled all at once — see README
+// "Закрытый пул ссылок"), so the frontend's old '7d'/'30d'-only presets hid nearly all of it by
+// default; found live: /mentions?limit=5 (no period) returned 177 items, but every period-scoped
+// view showed close to none.
+const PERIOD_DAYS: Record<string, number> = {
+  '7d': 7,
+  '30d': 30,
+  '90d': 90,
+  '180d': 180,
+  '365d': 365,
+  '730d': 730,
+};
+
 @Controller('mentions')
 export class MentionsController {
   constructor(private readonly mentionsService: MentionsService) {}
@@ -101,18 +116,25 @@ export class MentionsController {
     }
 
     const dateTo = new Date();
-    switch (period) {
-      case 'today': {
-        const dateFrom = new Date(dateTo);
-        dateFrom.setHours(0, 0, 0, 0);
-        return { dateFrom, dateTo };
-      }
-      case '30d':
-        return { dateFrom: new Date(dateTo.getTime() - 30 * DAY_MS), dateTo };
-      case '7d':
-      default:
-        return { dateFrom: new Date(dateTo.getTime() - 7 * DAY_MS), dateTo };
+    if (period === 'today') {
+      const dateFrom = new Date(dateTo);
+      dateFrom.setHours(0, 0, 0, 0);
+      return { dateFrom, dateTo };
     }
+    if (!period || period === '7d') {
+      // No period given at all (e.g. a request that only sent sentiment/sourceId) keeps the old
+      // implicit default — everything else below is explicit and rejects anything unrecognised
+      // instead of silently defaulting to it, see PERIOD_DAYS below.
+      return { dateFrom: new Date(dateTo.getTime() - 7 * DAY_MS), dateTo };
+    }
+    const days = PERIOD_DAYS[period];
+    if (days === undefined) {
+      throw new BadRequestException(
+        `Недопустимое значение периода: "${period}" (ожидается одно из: ${Object.keys(PERIOD_DAYS).join(', ')}, today, ` +
+          'либо dateFrom/dateTo)',
+      );
+    }
+    return { dateFrom: new Date(dateTo.getTime() - days * DAY_MS), dateTo };
   }
 
   /** ФТ-11: ручная правка тональности. Всегда побеждает автоматику — см. MentionsService.updateSentiment. */

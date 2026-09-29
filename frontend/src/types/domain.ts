@@ -31,7 +31,10 @@ export interface MentionsResponse {
   offset: number;
 }
 
-export type PeriodPreset = 'today' | '7d' | '30d' | 'custom';
+// Matches the backend's PERIOD_DAYS (mentions.controller.ts) and the Telegram bot's /search
+// period picker (curated/search-period.util.ts) — the three must stay in step, or the same
+// "год"/"2 года" means a different date range depending on where you clicked it.
+export type PeriodPreset = 'today' | '7d' | '30d' | '90d' | '180d' | '365d' | '730d' | 'custom';
 
 /** Filter state shared by the feed and the dashboard's compact period picker. */
 export interface MentionsFilters {

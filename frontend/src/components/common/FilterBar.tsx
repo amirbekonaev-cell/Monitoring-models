@@ -8,10 +8,18 @@ export type FilterField = 'period' | 'sentiment' | 'source' | 'sourceType' | 'la
 
 const ALL_FIELDS: FilterField[] = ['period', 'sentiment', 'source', 'sourceType', 'language', 'search'];
 
+// Labels match the Telegram bot's /search period buttons (searchPeriodLabel in
+// curated/search-period.util.ts) — the closed pool's mentions are historical (dates spanning
+// years, backfilled all at once), so 'today'/'7d'/'30d' alone used to hide nearly all of it from
+// the feed/dashboard by default. See mentions.controller.ts PERIOD_DAYS for the day counts.
 const PERIOD_LABELS: Record<PeriodPreset, string> = {
   today: 'Сегодня',
   '7d': '7 дней',
   '30d': '30 дней',
+  '90d': '3 месяца',
+  '180d': 'Полгода',
+  '365d': 'Год',
+  '730d': '2 года',
   custom: 'Свои даты',
 };
 
