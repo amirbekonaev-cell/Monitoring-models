@@ -40,7 +40,17 @@ async function main(): Promise<void> {
   const bot = new Telegraf(token);
 
   console.log(`Регистрирую вебхук: ${webhookUrl}`);
-  await bot.telegram.setWebhook(webhookUrl, { secret_token: secretToken });
+  // allowed_updates must be explicit: Telegram's setWebhook treats an OMITTED allowed_updates as
+  // "keep whatever list was registered before" (not "allow everything"), so any earlier
+  // registration for this URL that had a narrower list — e.g. message-only, from before the bot
+  // grew inline-keyboard buttons — silently keeps callback_query updates from ever being
+  // delivered here. Found live: /search and /status worked (they're plain messages), but every
+  // inline button (search_period:/search_more:, see registerCommands()) did nothing, because
+  // Telegram was still filtering callback_query out from a stale prior setWebhook call.
+  await bot.telegram.setWebhook(webhookUrl, {
+    secret_token: secretToken,
+    allowed_updates: ['message', 'callback_query'],
+  });
 
   const info = await bot.telegram.getWebhookInfo();
   console.log('Готово. Текущее состояние вебхука:', info);
