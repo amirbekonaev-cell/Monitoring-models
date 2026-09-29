@@ -4,7 +4,7 @@ import { createHash, randomUUID } from 'crypto';
 import { DataSource, Repository, SelectQueryBuilder } from 'typeorm';
 import { Mention, MentionSourceType, Sentiment } from './mention.entity';
 import { Source } from '../sources/source.entity';
-import { SentimentAnalysisService } from '../sentiment/sentiment-analysis.service';
+import { SentimentAnalysisService, SentimentClassification } from '../sentiment/sentiment-analysis.service';
 
 export interface CreateMentionInput {
   title: string;
@@ -87,6 +87,14 @@ export interface MentionsStats {
  */
 const REPRINT_TITLE_SIMILARITY_THRESHOLD = 0.6;
 const REPRINT_TEXT_SIMILARITY_THRESHOLD = 0.5;
+
+/**
+ * Attempts (including the first) for a classification that keeps failing *transiently* — see
+ * classifyWithRetries. Three is deliberately small: the caller is either a Telegram handler with
+ * ~30s to answer or a bulk script that will revisit the mention anyway.
+ */
+const SENTIMENT_CLASSIFY_ATTEMPTS = 3;
+const SENTIMENT_RETRY_BASE_DELAY_MS = 800;
 
 export type CreateMentionResult = 'inserted' | 'reprint' | 'duplicate';
 
@@ -238,14 +246,21 @@ export class MentionsService {
       if (!mention) {
         return;
       }
+      // classify() throws only on genuinely transient failures (network/timeout, HTTP 429, 5xx —
+      // see SentimentAnalysisService) and returns null on permanent ones. A single 429 used to be
+      // enough to leave a mention "не определена" forever, since nothing ever retried it: that is
+      // how most of the pool ended up unclassified. Retrying only the transient case keeps a
+      // rate-limit blip from costing a tone, without hammering the API on a bad key or a request
+      // it will reject identically every time.
       // No url for a pool mention: SentimentAnalysisService uses it to re-download the article
       // when the stored text looks like a teaser, which would (a) undo the context extraction
       // that put the company mention in front of the classifier in the first place (see
       // curated-context.util.ts) and (b) spend a second HTTP request on a page already read.
-      const classification = await this.sentimentAnalysisService.classify(
+      const classification = await this.classifyWithRetries(
         mention.title,
         mention.text,
         mention.urlHidden ? null : mention.url,
+        mentionId,
       );
       if (!classification) {
         return;
@@ -256,6 +271,37 @@ export class MentionsService {
       const message = error instanceof Error ? error.message : String(error);
       this.logger.error(`Не удалось определить тональность упоминания ${mentionId}: ${message}`);
     }
+  }
+
+  /**
+   * Retries a *transient* classification failure a couple of times with a short backoff. Never
+   * invents a tone: if every attempt fails the mention keeps Sentiment.UNDEFINED and says so in
+   * the log — a made-up "нейтрал" would be worse than an honest "не определена", because it is
+   * indistinguishable from a real classification once it's in the database.
+   */
+  private async classifyWithRetries(
+    title: string,
+    text: string,
+    url: string | null,
+    mentionId: string,
+  ): Promise<SentimentClassification | null> {
+    let lastError: unknown = null;
+    for (let attempt = 1; attempt <= SENTIMENT_CLASSIFY_ATTEMPTS; attempt += 1) {
+      try {
+        return await this.sentimentAnalysisService!.classify(title, text, url);
+      } catch (error) {
+        lastError = error;
+        if (attempt < SENTIMENT_CLASSIFY_ATTEMPTS) {
+          const delayMs = SENTIMENT_RETRY_BASE_DELAY_MS * attempt;
+          this.logger.warn(
+            `Тональность упоминания ${mentionId}: попытка ${attempt}/${SENTIMENT_CLASSIFY_ATTEMPTS} не удалась ` +
+              `(${error instanceof Error ? error.message : String(error)}) — повтор через ${delayMs} мс`,
+          );
+          await sleep(delayMs);
+        }
+      }
+    }
+    throw lastError instanceof Error ? lastError : new Error(String(lastError));
   }
 
   /**
@@ -518,4 +564,14 @@ export class MentionsService {
 
     return { total, previousTotal, changePercent, byDay, bySentiment, topSources };
   }
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, ms);
+    // Classification runs fire-and-forget from createIfNew(), so a pending retry timer must not be
+    // what keeps a short-lived process alive — a CLI script (curated:process) would otherwise hang
+    // around after its work is done waiting for a backoff nobody is watching.
+    timer.unref?.();
+  });
 }

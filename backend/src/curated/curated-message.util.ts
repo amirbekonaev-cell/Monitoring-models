@@ -12,8 +12,31 @@ const TITLE_DISPLAY_LENGTH = 200;
 /** Telegram's own hard cap on callback_data. */
 const CALLBACK_DATA_MAX_BYTES = 64;
 
-export function buildPeriodConfirmationText(label: string, dateFrom: string, dateTo: string): string {
-  return `Период: ${label} (с ${formatIsoDateDisplay(dateFrom)} по ${formatIsoDateDisplay(dateTo)})`;
+/**
+ * Shown the moment a period button is pressed, BEFORE CuratedSearchService.search() runs — that
+ * call does real work first (the CURATED_LAZY_PROCESS pass downloads still-unprocessed pool
+ * pages, extracts their dates and classifies tone through OpenAI, up to CURATED_LAZY_BUDGET_MS),
+ * and without this the chat just sits silent for those seconds and looks broken.
+ *
+ * Deliberately describes only what actually happens: reading source pages and determining tone
+ * of links from the pool. It must not claim to be crawling the web for new links — it isn't, and
+ * a status line that overstates what the bot does would be a lie to whoever reads it.
+ */
+export function buildSearchInProgressText(label: string): string {
+  return `Ищу упоминания за ${label}…\nЧитаю страницы источников из пула и определяю тональность — это может занять до полуминуты.`;
+}
+
+export function buildPeriodConfirmationText(
+  label: string,
+  dateFrom: string,
+  dateTo: string,
+  processedNow = 0,
+): string {
+  const base = `Период: ${label} (с ${formatIsoDateDisplay(dateFrom)} по ${formatIsoDateDisplay(dateTo)})`;
+  if (processedNow <= 0) {
+    return base;
+  }
+  return `${base}\nОбработано источников в этом запросе: ${processedNow} (скачаны страницы, определена тональность).`;
 }
 
 export function buildHeader(label: string, result: CuratedSearchResult): string {

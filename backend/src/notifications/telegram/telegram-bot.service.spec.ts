@@ -98,6 +98,7 @@ function makeSearchResult(overrides: Partial<CuratedSearchResult> = {}): Curated
       [Sentiment.UNDEFINED]: 0,
     },
     undatedCount: 0,
+    processedNow: 0,
     pool: makePoolStats(),
     ...overrides,
   };
@@ -328,6 +329,57 @@ describe('TelegramBotService (closed-pool bot)', () => {
       // is structural (see the constructor signature in telegram-bot.service.ts): TelegramBotService
       // no longer has a way to reach RSS/Parser/Telegram/NewsAPI/VK/OpenAI web search from /search.
       expect(curatedSearchService.search).toHaveBeenCalledWith(7, expect.any(Date));
+    });
+
+    // The CURATED_LAZY_PROCESS pass inside search() downloads pool pages and classifies tone via
+    // OpenAI before reading, so the button press is followed by real seconds of work. The status
+    // line has to go out BEFORE that call, or the chat sits blank and looks broken.
+    it('posts the "ищу упоминания" status before search() starts, not after it returns', async () => {
+      const order: string[] = [];
+      const curatedSearchService = makeCuratedSearchService();
+      (curatedSearchService.search as jest.Mock).mockImplementation(async (periodDays: number) => {
+        order.push('search');
+        return makeSearchResult({ periodDays });
+      });
+      await boot('-1001', curatedSearchService);
+      const ctx = makeCtx('-1001');
+      ctx.editMessageText = jest.fn(async (...args: unknown[]) => {
+        order.push(String(args[0]).startsWith('Ищу упоминания') ? 'status' : 'result');
+        return undefined;
+      }) as unknown as typeof ctx.editMessageText;
+
+      await actionHandlers.get('/^search_period:(\\d+)$/')!(ctx);
+
+      expect(order).toEqual(['status', 'search', 'result']);
+    });
+
+    it('reports how many links this call actually processed, and stays silent about it when none were', async () => {
+      const withWork = makeCuratedSearchService({ searchResult: { processedNow: 4 } });
+      await boot('-1001', withWork);
+      const ctx = makeCtx('-1001');
+      await actionHandlers.get('/^search_period:(\\d+)$/')!(ctx);
+      expect(ctx.editMessageText).toHaveBeenCalledWith(expect.stringContaining('Обработано источников в этом запросе: 4'));
+
+      const withoutWork = makeCuratedSearchService({ searchResult: { processedNow: 0 } });
+      await boot('-1001', withoutWork);
+      const ctx2 = makeCtx('-1001');
+      await actionHandlers.get('/^search_period:(\\d+)$/')!(ctx2);
+      expect(ctx2.editMessageText).not.toHaveBeenCalledWith(expect.stringContaining('Обработано источников'));
+    });
+
+    it('still runs the search when the status edit fails (an old message can no longer be edited)', async () => {
+      const curatedSearchService = makeCuratedSearchService();
+      await boot('-1001', curatedSearchService);
+      const ctx = makeCtx('-1001');
+      ctx.editMessageText = jest
+        .fn()
+        .mockRejectedValueOnce(new Error('message is not modified'))
+        .mockResolvedValue(undefined) as unknown as typeof ctx.editMessageText;
+
+      await actionHandlers.get('/^search_period:(\\d+)$/')!(ctx);
+
+      expect(curatedSearchService.search).toHaveBeenCalled();
+      expect(sendMessageMock).toHaveBeenCalled();
     });
 
     it('answers, edits the prompt message with the resolved date window, then sends the header + first page', async () => {

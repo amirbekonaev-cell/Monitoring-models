@@ -12,6 +12,7 @@ import {
   buildPage,
   buildPeriodConfirmationText,
   buildSearchMoreCallbackData,
+  buildSearchInProgressText,
   buildSearchPeriodCallbackData,
   buildStatusText,
 } from '../../curated/curated-message.util';
@@ -38,8 +39,12 @@ export type TelegramBotMode = 'polling' | 'webhook';
  * Default: polling everywhere except Vercel (which sets VERCEL=1 itself); TELEGRAM_BOT_MODE
  * overrides it explicitly. See resolveMode() and README "Телеграм-бот: webhook или polling".
  *
- * /search and /status are pure DB reads over the closed pool of pre-vetted links (see
- * CuratedSearchService) — no collector, no network call, no OpenAI, ever runs from this bot.
+ * /status is a pure DB read over the closed pool of pre-vetted links (see CuratedSearchService).
+ * /search reads the same pool, but when CURATED_LAZY_PROCESS is on it first does real work:
+ * downloading still-unprocessed pool pages, extracting their dates and classifying tone through
+ * OpenAI, bounded by CURATED_LAZY_BUDGET_MS. That is why the period handler posts a status line
+ * before calling search() — see buildSearchInProgressText. It still never crawls the web for new
+ * links: the pool is closed, and nothing here may claim otherwise to the user.
  */
 @Injectable()
 export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
@@ -237,10 +242,21 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
         return;
       }
 
+      // Status first, work second: search() below is not an instant DB read when the
+      // CURATED_LAZY_PROCESS pass is on — it downloads still-unprocessed pool pages and classifies
+      // their tone through OpenAI before reading (up to CURATED_LAZY_BUDGET_MS). Without this the
+      // chat shows nothing at all for those seconds and looks like the button did nothing.
+      try {
+        await ctx.editMessageText(buildSearchInProgressText(label));
+      } catch (error) {
+        // Purely cosmetic — never let a failed status edit stop the actual search below.
+        this.logger.warn(`Не удалось показать статус поиска: ${describeError(error)}`);
+      }
+
       try {
         const now = new Date();
         const result = await this.curatedSearchService.search(days, now);
-        await ctx.editMessageText(buildPeriodConfirmationText(label, result.dateFrom, result.dateTo));
+        await ctx.editMessageText(buildPeriodConfirmationText(label, result.dateFrom, result.dateTo, result.processedNow));
         await this.sendFirstResultsPage(ctx.telegram, chatId, days, label, result, now);
       } catch (error) {
         await this.replyWithSearchError(ctx.telegram, chatId, error);

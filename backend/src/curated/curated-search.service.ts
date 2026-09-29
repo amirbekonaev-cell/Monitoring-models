@@ -36,6 +36,13 @@ export interface CuratedSearchResult {
   /** Curated mentions with no publishedAt at all — never inside any period window, counted here instead. */
   undatedCount: number;
   pool: PoolStats;
+  /**
+   * How many pool links this very call actually fetched, dated and classified before reading
+   * (the CURATED_LAZY_PROCESS top-up pass, see lazyProcess). 0 when the pass is off or found
+   * nothing left to do. Reported to the user by the bot so the work it just did is visible
+   * rather than looking like an unexplained pause.
+   */
+  processedNow: number;
 }
 
 export interface CuratedMentionView {
@@ -99,7 +106,7 @@ export class CuratedSearchService {
   async search(periodDays: number, now: Date = new Date()): Promise<CuratedSearchResult> {
     const { tz, dateFrom, dateTo } = this.dateWindow(periodDays, now);
 
-    await this.lazyProcess(dateFrom, now);
+    const processedNow = await this.lazyProcess(dateFrom, now);
 
     const total = await this.inWindowQuery(tz, dateFrom, dateTo).getCount();
 
@@ -121,7 +128,7 @@ export class CuratedSearchService {
 
     const pool = await this.getPoolStats();
 
-    return { periodDays, dateFrom, dateTo, total, bySentiment, undatedCount, pool };
+    return { periodDays, dateFrom, dateTo, total, bySentiment, undatedCount, pool, processedNow };
   }
 
   /**
@@ -166,9 +173,9 @@ export class CuratedSearchService {
    *  - any failure here is swallowed. The point of the command is to READ the pool; a failing
    *    top-up must never turn a working /search into an error message.
    */
-  private async lazyProcess(dateFrom: string, now: Date): Promise<void> {
+  private async lazyProcess(dateFrom: string, now: Date): Promise<number> {
     if (this.config.get<boolean>('curated.lazyProcess') !== true) {
-      return;
+      return 0;
     }
 
     const maxLinks = this.config.get<number>('curated.lazyMaxLinks') ?? 10;
@@ -187,20 +194,26 @@ export class CuratedSearchService {
         .slice(0, maxLinks);
 
       if (worthDoingNow.length === 0) {
-        return;
+        return 0;
       }
 
       const context = await this.ingestService.buildContext();
+      let processed = 0;
       for (const link of worthDoingNow) {
         if (Date.now() >= deadline) {
           this.logger.log(`Ленивая дообработка: бюджет ${budgetMs} мс исчерпан, новые ссылки не начинаю`);
           break;
         }
         await this.ingestService.processLink(link, context);
+        processed += 1;
       }
+      return processed;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       this.logger.warn(`Ленивая дообработка пропущена (чтение из БД не затронуто): ${message}`);
+      // Whatever was already processed before the failure stays processed, but the count is no
+      // longer trustworthy here — report nothing rather than a number that may undercount.
+      return 0;
     }
   }
 

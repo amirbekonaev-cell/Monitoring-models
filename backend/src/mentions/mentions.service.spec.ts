@@ -235,6 +235,49 @@ describe('MentionsService dedup', () => {
     expect(sentimentAnalysisService.classify).toHaveBeenCalledWith(inserted.title, inserted.text, inserted.url);
   });
 
+  // Found live: most of the curated pool sat at Sentiment.UNDEFINED forever, because a single
+  // transient failure (OpenAI 429/5xx/network — the only cases classify() throws on) was never
+  // retried. classifyWithRetries now gives those another go.
+  it('retries a transient classification failure and stores the tone the retry returns', async () => {
+    const inserted = { id: 'new-id', title: 't', text: 'x', url: 'https://example.com/a' } as Mention;
+    // updateSentiment() writes through createQueryBuilder().update().set(), not repo.update() —
+    // capture what reaches .set() so the stored tone is what's actually asserted.
+    const setCalls: Record<string, unknown>[] = [];
+    const repo = makeRepoCapturingSentimentWrites(inserted, setCalls);
+    const dataSource = { query: jest.fn(async () => []) } as unknown as DataSource;
+
+    const classify = jest
+      .fn()
+      .mockRejectedValueOnce(new Error('OpenAI Responses API HTTP 429: rate limit'))
+      .mockResolvedValue({ sentiment: Sentiment.NEGATIVE, reason: 'r', summary: 's' });
+    const sentimentAnalysisService = { classify } as unknown as SentimentAnalysisService;
+    const service = new MentionsService(repo, dataSource, sentimentAnalysisService);
+
+    await service.createIfNewAndClassify(makeInput());
+
+    expect(classify).toHaveBeenCalledTimes(2);
+    expect(setCalls).toEqual([expect.objectContaining({ sentiment: Sentiment.NEGATIVE })]);
+  });
+
+  // The other half of the same guarantee: retries must not turn into invention. If every attempt
+  // fails the mention keeps "не определена" — a fabricated tone would be indistinguishable from a
+  // real one once stored.
+  it('gives up after the retry budget without inventing a tone', async () => {
+    const inserted = { id: 'new-id', title: 't', text: 'x', url: 'https://example.com/a' } as Mention;
+    const setCalls: Record<string, unknown>[] = [];
+    const repo = makeRepoCapturingSentimentWrites(inserted, setCalls);
+    const dataSource = { query: jest.fn(async () => []) } as unknown as DataSource;
+
+    const classify = jest.fn().mockRejectedValue(new Error('OpenAI Responses API HTTP 503'));
+    const sentimentAnalysisService = { classify } as unknown as SentimentAnalysisService;
+    const service = new MentionsService(repo, dataSource, sentimentAnalysisService);
+
+    await expect(service.createIfNewAndClassify(makeInput())).resolves.toBeDefined();
+
+    expect(classify).toHaveBeenCalledTimes(3);
+    expect(setCalls).toEqual([]);
+  });
+
   it('does not let a sentiment classification failure propagate out of, or block, the insert', async () => {
     const inserted = { id: 'new-id', title: 't', text: 'x', url: 'https://example.com/a' } as Mention;
     const repo = {
@@ -760,3 +803,25 @@ describe('MentionsService: упоминания из закрытого пула
     expect(sql).toContain('url_hidden = false');
   });
 });
+
+/** Repo double whose createQueryBuilder() serves both the insert path and the update path used by
+ *  updateSentiment(), recording every .set() payload into `setCalls`. */
+function makeRepoCapturingSentimentWrites(inserted: Mention, setCalls: Record<string, unknown>[]): Repository<Mention> {
+  return {
+    findOne: jest.fn().mockResolvedValueOnce(null).mockResolvedValue(inserted),
+    createQueryBuilder: jest.fn(() => ({
+      insert: () => ({
+        into: () => ({
+          values: () => ({ orIgnore: () => ({ execute: async () => ({ identifiers: [{ id: 'new-id' }] }) }) }),
+        }),
+      }),
+      update: () => ({
+        set: (values: Record<string, unknown>) => {
+          setCalls.push(values);
+          return { where: () => ({ execute: async () => ({ affected: 1 }) }) };
+        },
+      }),
+    })),
+    update: jest.fn(),
+  } as unknown as Repository<Mention>;
+}

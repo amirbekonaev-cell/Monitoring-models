@@ -45,6 +45,7 @@ function makeResult(overrides: Partial<CuratedSearchResult> = {}): CuratedSearch
       [Sentiment.UNDEFINED]: 0,
     },
     undatedCount: 0,
+    processedNow: 0,
     pool: makePool(),
     ...overrides,
   };
