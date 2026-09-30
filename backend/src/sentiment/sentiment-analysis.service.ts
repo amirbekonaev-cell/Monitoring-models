@@ -1,4 +1,4 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { Sentiment } from '../mentions/mention.entity';
 import { ParserService } from '../collectors/parser/parser.service';
@@ -77,7 +77,7 @@ interface ResponsesApiPayload {
  * Sentiment.UNDEFINED без ретраев.
  */
 @Injectable()
-export class SentimentAnalysisService {
+export class SentimentAnalysisService implements OnModuleInit {
   private readonly logger = new Logger(SentimentAnalysisService.name);
 
   // Счётчик вызовов классификации тональности за время жизни процесса — логируется на каждый
@@ -90,6 +90,24 @@ export class SentimentAnalysisService {
     private readonly config: ConfigService,
     private readonly parserService: ParserService,
   ) {}
+
+  /**
+   * Says once, at startup, whether tone can be determined at all. Without this the only signal a
+   * missing key gives is a warning inside classify() — which nobody reads until they notice the
+   * whole dataset sitting at "не определена" weeks later. A misspelled variable name in .env
+   * (OPEN_API_KEY instead of OPENAI_API_KEY — a real one, found on this project) looks exactly
+   * like no key at all, and this is where that becomes obvious.
+   */
+  onModuleInit(): void {
+    if (this.config.get<string>('sentimentAnalysis.apiKey')) {
+      return;
+    }
+    this.logger.warn(
+      'OPENAI_API_KEY не задан — тональность НЕ будет определяться ни для одного упоминания ' +
+        '(останется «не определена»). Проверьте имя переменной в .env: код читает ровно ' +
+        'OPENAI_API_KEY.',
+    );
+  }
 
   async classify(title: string, text: string, url?: string | null): Promise<SentimentClassification | null> {
     const apiKey = this.config.get<string>('sentimentAnalysis.apiKey');

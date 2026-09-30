@@ -175,3 +175,32 @@ describe('SentimentAnalysisService', () => {
     expect(parserService.fetchArticleText).toHaveBeenCalledWith('https://example.com/a');
   });
 });
+
+describe('SentimentAnalysisService — предупреждение о ключе на старте', () => {
+  function makeService(apiKey: string) {
+    const config = { get: jest.fn((k: string) => (k === 'sentimentAnalysis.apiKey' ? apiKey : undefined)) };
+    return new SentimentAnalysisService(config as any, {} as any);
+  }
+
+  // A misspelled variable name in .env (OPEN_API_KEY instead of OPENAI_API_KEY — a real one on
+  // this project) is indistinguishable from no key at all, and without a startup signal it only
+  // shows up as the whole dataset sitting at "не определена".
+  it('warns once at startup when no key is configured', () => {
+    const service = makeService('');
+    const warn = jest.spyOn((service as any).logger, 'warn').mockImplementation(() => undefined);
+
+    service.onModuleInit();
+
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn.mock.calls[0][0]).toContain('OPENAI_API_KEY');
+  });
+
+  it('stays quiet when a key is configured', () => {
+    const service = makeService('sk-test');
+    const warn = jest.spyOn((service as any).logger, 'warn').mockImplementation(() => undefined);
+
+    service.onModuleInit();
+
+    expect(warn).not.toHaveBeenCalled();
+  });
+});
