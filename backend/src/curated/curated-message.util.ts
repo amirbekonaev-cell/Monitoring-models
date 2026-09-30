@@ -125,6 +125,37 @@ export function buildSearchPeriodCallbackData(days: number): string {
   return `search_period:${days}`;
 }
 
+export const RESET_CONFIRM_CALLBACK_DATA = 'pool_reset:confirm';
+export const RESET_CANCEL_CALLBACK_DATA = 'pool_reset:cancel';
+export const RESET_CANCELLED_TEXT = 'Сброс отменён — ничего не изменилось.';
+export const RESET_NOTHING_TEXT = 'В пуле нет ссылок — сбрасывать нечего.';
+
+/**
+ * Confirmation prompt for /reset. Spells out both irreversible parts explicitly rather than a
+ * generic "точно?": the tone already classified for these mentions goes with them (manual UI
+ * corrections included — `sentiment_manual` does not survive the row being deleted), and
+ * re-processing pays OpenAI again. Whoever presses the button should know that before pressing.
+ */
+export function buildResetConfirmText(preview: { links: number; mentions: number }): string {
+  return [
+    '<b>Сбросить пул ссылок?</b>',
+    `Ссылок вернётся в очередь на обработку: ${preview.links}`,
+    `Упоминаний будет удалено: ${preview.mentions}`,
+    '',
+    'Это необратимо: вместе с упоминаниями пропадёт уже определённая тональность, включая ручные ' +
+      'правки в веб-интерфейсе. Повторная обработка снова потратит вызовы OpenAI.',
+    'Сами ссылки не теряются — бот обработает их заново по команде /search.',
+  ].join('\n');
+}
+
+export function buildResetDoneText(outcome: { links: number; mentionsDeleted: number }): string {
+  return [
+    `Пул сброшен. Удалено упоминаний: ${outcome.mentionsDeleted}, ссылок в очереди: ${outcome.links}.`,
+    'Лента и дашборд сейчас пустые — записи появятся снова по мере того, как /search будет ' +
+      'обрабатывать ссылки.',
+  ].join('\n');
+}
+
 /** /status text — pool statistics only, no URLs, no per-channel breakdown (there are no live
  *  channels left to poll — see CuratedSearchService). */
 export function buildStatusText(pool: PoolStats, timezone: string): string {

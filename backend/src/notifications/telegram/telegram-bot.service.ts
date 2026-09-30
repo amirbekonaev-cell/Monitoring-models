@@ -3,10 +3,17 @@ import { ConfigService } from '@nestjs/config';
 import { Context, Markup, Telegraf } from 'telegraf';
 import { InlineKeyboardMarkup, Update } from 'telegraf/types';
 import { CuratedSearchService, CuratedSearchResult } from '../../curated/curated-search.service';
+import { CuratedResetService } from '../../curated/curated-reset.service';
 import { searchPeriodLabel } from '../../curated/search-period.util';
 import {
   EMPTY_POOL_TEXT,
+  RESET_CANCELLED_TEXT,
+  RESET_CANCEL_CALLBACK_DATA,
+  RESET_CONFIRM_CALLBACK_DATA,
+  RESET_NOTHING_TEXT,
   SEARCH_PERIOD_PROMPT_TEXT,
+  buildResetConfirmText,
+  buildResetDoneText,
   buildEmptyPeriodText,
   buildHeader,
   buildPage,
@@ -55,6 +62,7 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
   constructor(
     private readonly config: ConfigService,
     private readonly curatedSearchService: CuratedSearchService,
+    private readonly curatedResetService: CuratedResetService,
   ) {}
 
   private get periodDays(): number[] {
@@ -113,6 +121,7 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
       await this.bot.telegram.setMyCommands([
         { command: 'status', description: 'Статистика пула ссылок' },
         { command: 'search', description: 'Упоминания из пула ссылок за период' },
+        { command: 'reset', description: 'Сбросить пул: удалить упоминания, вернуть ссылки в очередь' },
       ]);
     } catch (error) {
       this.logger.warn(`Не удалось задать список команд бота (не критично): ${describeError(error)}`);
@@ -221,6 +230,56 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
         row.map((days) => Markup.button.callback(searchPeriodLabel(days), buildSearchPeriodCallbackData(days))),
       );
       await ctx.reply(SEARCH_PERIOD_PROMPT_TEXT, Markup.inlineKeyboard(rows));
+    });
+
+    // Destructive, so it is two steps: /reset only ever shows what would be lost, and nothing is
+    // touched until the confirm button below is pressed. Same chat restriction as everything else
+    // (isAuthorizedChat) — this must not be reachable by a stranger who DMs the bot.
+    bot.command('reset', async (ctx) => {
+      if (!this.isAuthorizedChat(ctx.chat?.id)) {
+        await this.rejectUnauthorized(ctx);
+        return;
+      }
+
+      const preview = await this.curatedResetService.preview();
+      if (preview.links === 0) {
+        await ctx.reply(RESET_NOTHING_TEXT);
+        return;
+      }
+
+      await ctx.reply(buildResetConfirmText(preview), {
+        parse_mode: 'HTML',
+        ...Markup.inlineKeyboard([
+          [Markup.button.callback('Да, сбросить', RESET_CONFIRM_CALLBACK_DATA)],
+          [Markup.button.callback('Отмена', RESET_CANCEL_CALLBACK_DATA)],
+        ]),
+      });
+    });
+
+    bot.action(RESET_CANCEL_CALLBACK_DATA, async (ctx) => {
+      if (!this.isAuthorizedChat(ctx.chat?.id)) {
+        await ctx.answerCbQuery('Эта команда доступна только в рабочей группе мониторинга.');
+        return;
+      }
+      await ctx.answerCbQuery();
+      await ctx.editMessageText(RESET_CANCELLED_TEXT);
+    });
+
+    bot.action(RESET_CONFIRM_CALLBACK_DATA, async (ctx) => {
+      if (!this.isAuthorizedChat(ctx.chat?.id)) {
+        await ctx.answerCbQuery('Эта команда доступна только в рабочей группе мониторинга.');
+        return;
+      }
+      await ctx.answerCbQuery();
+
+      try {
+        const outcome = await this.curatedResetService.reset();
+        await ctx.editMessageText(buildResetDoneText(outcome));
+      } catch (error) {
+        const reason = describeError(error);
+        this.logger.error(`Сброс пула из Telegram не удался: ${reason}`);
+        await ctx.editMessageText(`Не удалось сбросить пул: ${reason}`);
+      }
     });
 
     bot.action(/^search_period:(\d+)$/, async (ctx) => {

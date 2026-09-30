@@ -1,29 +1,16 @@
 /**
- * Returns the closed pool to its un-processed state: every link back to `pending`, and the
- * mentions those links produced deleted. Nothing about the link list itself is lost — the URLs,
- * hosts and group labels stay exactly as imported, so the next `curated:process` (or the bot's
- * own CURATED_LAZY_PROCESS pass) reads them again from scratch.
- *
- * Why this exists: pool mentions are what the feed/dashboard and /search actually show, so a
- * fully processed pool means every link is already visible before anyone asks for anything. For
- * a stand where the links should surface as the bot works through them, the pool has to start
- * un-processed.
+ * Returns the closed pool to its un-processed state — see CuratedResetService, which owns the
+ * actual logic and is shared with the bot's /reset button so the two can't drift apart.
  *
  * DESTRUCTIVE: the deleted mentions include any sentiment already classified for them (a manual
  * tone correction made in the UI included — `sentiment_manual` does not survive the row being
- * deleted). Re-processing will re-download and re-classify, which costs OpenAI calls again.
- * Because of that it refuses to run without --yes, and never touches a mention that did not come
- * from the pool (`curated_link_id IS NULL` — everything collected by RSS/parser/onboarding is
- * left alone).
+ * deleted), and re-processing costs OpenAI calls again. Refuses to run without --yes.
  *
  * Usage:
  *   npm run curated:reset -- --yes
  *   npm run curated:reset -- --yes --hosts sknews.kz,bluescreen.kz   (only those hosts)
  */
-import { getRepositoryToken } from '@nestjs/typeorm';
-import { Repository } from 'typeorm';
-import { CuratedLink, CuratedLinkStatus } from '../curated/curated-link.entity';
-import { Mention } from '../mentions/mention.entity';
+import { CuratedResetService } from '../curated/curated-reset.service';
 import { createCuratedScriptContext, describeDatabase, hasFlag, listFlag } from './curated-script-context';
 
 async function main(): Promise<void> {
@@ -31,32 +18,20 @@ async function main(): Promise<void> {
   const hosts = listFlag('hosts');
 
   const app = await createCuratedScriptContext();
-  const linksRepo = app.get<Repository<CuratedLink>>(getRepositoryToken(CuratedLink));
-  const mentionsRepo = app.get<Repository<Mention>>(getRepositoryToken(Mention));
+  const resetService = app.get(CuratedResetService);
 
   console.log(`База: ${describeDatabase()}`);
 
-  const linkQuery = linksRepo.createQueryBuilder('c');
-  if (hosts?.length) {
-    linkQuery.where('c.host IN (:...hosts)', { hosts });
-  }
-  const links = await linkQuery.getMany();
-
-  if (links.length === 0) {
+  const preview = await resetService.preview(hosts);
+  if (preview.links === 0) {
     console.log('Под условие не попала ни одна ссылка — ничего не делаю.');
     await app.close();
     return;
   }
 
-  const linkIds = links.map((link) => link.id);
-  const mentionsToDelete = await mentionsRepo
-    .createQueryBuilder('m')
-    .where('m.curatedLinkId IN (:...linkIds)', { linkIds })
-    .getCount();
-
   const scope = hosts?.length ? `хостов ${hosts.join(', ')}` : 'всего пула';
-  console.log(`Будет сброшено ссылок (${scope}): ${links.length}`);
-  console.log(`Будет удалено упоминаний, созданных этими ссылками: ${mentionsToDelete}`);
+  console.log(`Будет сброшено ссылок (${scope}): ${preview.links}`);
+  console.log(`Будет удалено упоминаний, созданных этими ссылками: ${preview.mentions}`);
 
   if (!confirmed) {
     console.log(
@@ -67,30 +42,8 @@ async function main(): Promise<void> {
     return;
   }
 
-  // Mentions first: a link row flipped to `pending` while its mention still exists would be
-  // re-processed into the update branch of CuratedIngestService (refresh existing mention)
-  // instead of a clean insert, which is not what "reset" should mean.
-  const deleted = await mentionsRepo
-    .createQueryBuilder()
-    .delete()
-    .from(Mention)
-    .where('curated_link_id IN (:...linkIds)', { linkIds })
-    .execute();
-
-  await linksRepo
-    .createQueryBuilder()
-    .update(CuratedLink)
-    .set({
-      status: CuratedLinkStatus.PENDING,
-      attempts: 0,
-      lastError: null,
-      processedAt: null,
-      mentionId: null,
-    })
-    .where('id IN (:...linkIds)', { linkIds })
-    .execute();
-
-  console.log(`Готово. Удалено упоминаний: ${deleted.affected ?? 0}. Ссылок возвращено в pending: ${links.length}.`);
+  const outcome = await resetService.reset(hosts);
+  console.log(`Готово. Удалено упоминаний: ${outcome.mentionsDeleted}. Ссылок возвращено в pending: ${outcome.links}.`);
   console.log('Дальше: `npm run curated:process` — или просто /search в боте, если CURATED_LAZY_PROCESS=true.');
 
   await app.close();

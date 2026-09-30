@@ -6,6 +6,7 @@ import { CuratedSearchService } from './curated-search.service';
 import { CuratedIngestService } from './curated-ingest.service';
 import { CuratedOpenAiReaderService } from './curated-openai-reader.service';
 import { CuratedSourceBootstrapService } from './curated-source-bootstrap.service';
+import { CuratedResetService } from './curated-reset.service';
 import { SourcesModule } from '../sources/sources.module';
 import { MentionsModule } from '../mentions/mentions.module';
 import { KeywordsModule } from '../keywords/keywords.module';
@@ -25,7 +26,13 @@ import { ParserCollectorModule } from '../collectors/parser/parser.module';
     KeywordsModule,
     ParserCollectorModule,
   ],
-  providers: [CuratedSearchService, CuratedIngestService, CuratedOpenAiReaderService, CuratedSourceBootstrapService],
-  exports: [CuratedSearchService, CuratedIngestService, CuratedOpenAiReaderService],
+  providers: [
+    CuratedSearchService,
+    CuratedIngestService,
+    CuratedOpenAiReaderService,
+    CuratedSourceBootstrapService,
+    CuratedResetService,
+  ],
+  exports: [CuratedSearchService, CuratedIngestService, CuratedOpenAiReaderService, CuratedResetService],
 })
 export class CuratedModule {}

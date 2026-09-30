@@ -1,6 +1,7 @@
 import { ConfigService } from '@nestjs/config';
 import { TelegramBotService } from './telegram-bot.service';
 import { CuratedSearchService, CuratedSearchResult, CuratedMentionView, PoolStats } from '../../curated/curated-search.service';
+import { CuratedResetService } from '../../curated/curated-reset.service';
 import { CuratedLinkStatus } from '../../curated/curated-link.entity';
 import { Sentiment } from '../../mentions/mention.entity';
 import { DEFAULT_SEARCH_PERIOD_DAYS } from '../../curated/search-period.util';
@@ -117,6 +118,13 @@ function makeMentionView(overrides: Partial<CuratedMentionView> = {}): CuratedMe
   };
 }
 
+function makeCuratedResetService(preview = { links: 169, mentions: 167 }): CuratedResetService {
+  return {
+    preview: jest.fn(async () => preview),
+    reset: jest.fn(async () => ({ ...preview, mentionsDeleted: preview.mentions })),
+  } as unknown as CuratedResetService;
+}
+
 function makeCuratedSearchService(config: {
   pool?: Partial<PoolStats>;
   searchResult?: Partial<CuratedSearchResult>;
@@ -146,10 +154,15 @@ describe('TelegramBotService (closed-pool bot)', () => {
     chatId = '-1001',
     curatedSearchService: CuratedSearchService = makeCuratedSearchService(),
     mode: 'polling' | 'webhook' = 'webhook',
-  ): Promise<{ service: TelegramBotService; curatedSearchService: CuratedSearchService }> {
-    const service = new TelegramBotService(makeConfig(chatId, mode), curatedSearchService);
+    curatedResetService: CuratedResetService = makeCuratedResetService(),
+  ): Promise<{
+    service: TelegramBotService;
+    curatedSearchService: CuratedSearchService;
+    curatedResetService: CuratedResetService;
+  }> {
+    const service = new TelegramBotService(makeConfig(chatId, mode), curatedSearchService, curatedResetService);
     await service.onModuleInit();
-    return { service, curatedSearchService };
+    return { service, curatedSearchService, curatedResetService };
   }
 
   it('registers /status and /search on init, without starting a long-poll connection in webhook mode', async () => {
@@ -174,7 +187,7 @@ describe('TelegramBotService (closed-pool bot)', () => {
 
   it('throws from handleUpdate when TELEGRAM_BOT_TOKEN was never configured', async () => {
     const config = { get: jest.fn(() => '') } as unknown as ConfigService;
-    const service = new TelegramBotService(config, makeCuratedSearchService());
+    const service = new TelegramBotService(config, makeCuratedSearchService(), makeCuratedResetService());
     await service.onModuleInit();
 
     await expect(service.handleUpdate({} as any)).rejects.toThrow('TELEGRAM_BOT_TOKEN');
@@ -212,6 +225,87 @@ describe('TelegramBotService (closed-pool bot)', () => {
       const webhookBoot = await boot('-1001', makeCuratedSearchService(), 'webhook');
       await webhookBoot.service.onModuleDestroy();
       expect(stopMock).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe('/reset (сброс пула)', () => {
+    // The whole point of the two-step flow: /reset is a question, never an action. Anything that
+    // deletes 167 mentions must not fire from a single command that could be typed by accident.
+    it('only previews on /reset — nothing is reset until the confirm button is pressed', async () => {
+      const curatedResetService = makeCuratedResetService();
+      await boot('-1001', makeCuratedSearchService(), 'webhook', curatedResetService);
+      const ctx = makeCtx('-1001');
+
+      await commandHandlers.get('reset')!(ctx);
+
+      expect(curatedResetService.preview).toHaveBeenCalled();
+      expect(curatedResetService.reset).not.toHaveBeenCalled();
+      const [text] = (ctx.reply as jest.Mock).mock.calls[0];
+      expect(text).toContain('Сбросить пул ссылок?');
+      expect(text).toContain('169');
+      expect(text).toContain('167');
+      // The irreversible parts have to be stated on the button itself, not just in the README.
+      expect(text).toContain('необратимо');
+      expect(text).toContain('ручные правки');
+    });
+
+    it('resets only after the confirm button, and reports what was deleted', async () => {
+      const curatedResetService = makeCuratedResetService();
+      await boot('-1001', makeCuratedSearchService(), 'webhook', curatedResetService);
+      const ctx = makeCtx('-1001');
+
+      await actionHandlers.get('pool_reset:confirm')!(ctx);
+
+      expect(curatedResetService.reset).toHaveBeenCalled();
+      expect(ctx.editMessageText).toHaveBeenCalledWith(expect.stringContaining('Удалено упоминаний: 167'));
+    });
+
+    it('cancel button changes nothing', async () => {
+      const curatedResetService = makeCuratedResetService();
+      await boot('-1001', makeCuratedSearchService(), 'webhook', curatedResetService);
+      const ctx = makeCtx('-1001');
+
+      await actionHandlers.get('pool_reset:cancel')!(ctx);
+
+      expect(curatedResetService.reset).not.toHaveBeenCalled();
+      expect(ctx.editMessageText).toHaveBeenCalledWith(expect.stringContaining('отменён'));
+    });
+
+    it('refuses /reset and the confirm button from a chat that is not the configured group', async () => {
+      const curatedResetService = makeCuratedResetService();
+      await boot('-1001', makeCuratedSearchService(), 'webhook', curatedResetService);
+
+      const strangerCommand = makeCtx(999999);
+      await commandHandlers.get('reset')!(strangerCommand);
+      expect(curatedResetService.preview).not.toHaveBeenCalled();
+
+      // Guarded separately from the command: a confirm callback can arrive on its own, from a
+      // forwarded/copied message, without /reset ever being typed in that chat.
+      const strangerConfirm = makeCtx(999999);
+      await actionHandlers.get('pool_reset:confirm')!(strangerConfirm);
+      expect(curatedResetService.reset).not.toHaveBeenCalled();
+    });
+
+    it('says there is nothing to reset instead of offering a button for an empty pool', async () => {
+      const curatedResetService = makeCuratedResetService({ links: 0, mentions: 0 });
+      await boot('-1001', makeCuratedSearchService(), 'webhook', curatedResetService);
+      const ctx = makeCtx('-1001');
+
+      await commandHandlers.get('reset')!(ctx);
+
+      expect(ctx.reply).toHaveBeenCalledWith(expect.stringContaining('сбрасывать нечего'));
+      expect(curatedResetService.reset).not.toHaveBeenCalled();
+    });
+
+    it('reports a failed reset instead of leaving the confirmation hanging', async () => {
+      const curatedResetService = makeCuratedResetService();
+      (curatedResetService.reset as jest.Mock).mockRejectedValueOnce(new Error('connection terminated'));
+      await boot('-1001', makeCuratedSearchService(), 'webhook', curatedResetService);
+      const ctx = makeCtx('-1001');
+
+      await actionHandlers.get('pool_reset:confirm')!(ctx);
+
+      expect(ctx.editMessageText).toHaveBeenCalledWith(expect.stringContaining('Не удалось сбросить пул'));
     });
   });
 
