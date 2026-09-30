@@ -20,6 +20,24 @@ import { ActiveKeywordSet } from '../keywords/keywords.service';
 
 const SAMPLE_SIZE = 5;
 
+/**
+ * What to print for a sample row's link. A closed-pool mention (`url_hidden`) must never have its
+ * full URL printed — not to a log, not to this script's stdout: the pool is the one thing in this
+ * database whose links never leave it, and `curated:status --show-problems` is the single
+ * sanctioned exception (see README "Приватность"). The host alone is enough to recognise the
+ * sample here, and is what the rest of the codebase logs for pool rows.
+ */
+function describeMentionLink(mention: { url: string; urlHidden: boolean }): string {
+  if (!mention.urlHidden) {
+    return mention.url;
+  }
+  try {
+    return `<ссылка скрыта: ${new URL(mention.url).hostname}>`;
+  } catch {
+    return '<ссылка скрыта>';
+  }
+}
+
 // Substrings for reason (b) — deliberately not a Kazakh/Russian morphology lookup, just a
 // truncated stem for each word (same "медицин%"-style principle for both, not full-word
 // "медицина"/"астана"): Kazakh case suffixes append after the stem without altering it
@@ -106,7 +124,7 @@ async function main(): Promise<void> {
     if (isBrandRelevant) {
       const matchedTerms = FALSE_POSITIVE_TERMS.filter((term) => containsFalsePositiveTerm(mention, term));
       if (matchedTerms.length > 0 && protectedSamples.length < SAMPLE_SIZE) {
-        protectedSamples.push({ title: mention.title, url: mention.url });
+        protectedSamples.push({ title: mention.title, url: describeMentionLink(mention) });
       }
       continue;
     }
@@ -117,7 +135,7 @@ async function main(): Promise<void> {
     if (!matched) {
       unrelatedIds.add(mention.id);
       if (unrelatedSamples.length < SAMPLE_SIZE) {
-        unrelatedSamples.push({ title: mention.title, url: mention.url });
+        unrelatedSamples.push({ title: mention.title, url: describeMentionLink(mention) });
       }
     }
 
@@ -128,7 +146,7 @@ async function main(): Promise<void> {
       for (const term of matchedTerms) {
         const samples = falsePositiveSamplesByTerm.get(term)!;
         if (samples.length < SAMPLE_SIZE) {
-          samples.push({ title: mention.title, url: mention.url });
+          samples.push({ title: mention.title, url: describeMentionLink(mention) });
         }
       }
     }
