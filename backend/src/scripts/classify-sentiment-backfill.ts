@@ -81,7 +81,8 @@ async function main(): Promise<void> {
     id: string;
     title: string;
     text: string;
-    url: string;
+    /** null for a closed-pool mention — a pool URL must never reach a file. See README "Приватность". */
+    url: string | null;
     sourceType: string;
     autoSentiment: Sentiment;
     autoReason: string | null;
@@ -92,12 +93,21 @@ async function main(): Promise<void> {
 
   for (const mention of pending) {
     try {
-      const classification = await sentimentService.classify(mention.title, mention.text, mention.url);
+      // urlHidden mentions come from the closed pool, and their stored `text` is not the raw
+      // article: it is the extracted window around the company mention (curated-context.util.ts).
+      // Passing the url would let SentimentAnalysisService re-download the whole page whenever
+      // that window looks short — throwing away the very extraction that put the mention in front
+      // of the classifier, and paying for a second fetch of a page already read. MentionsService
+      // .classifySentimentInBackground() passes null here for the same reason.
+      const classifyUrl = mention.urlHidden ? null : mention.url;
+      const classification = await sentimentService.classify(mention.title, mention.text, classifyUrl);
       const sentiment = classification?.sentiment ?? Sentiment.UNDEFINED;
       await mentionsRepo
         .createQueryBuilder()
         .update(Mention)
-        .set({ sentiment, sentimentManual: false, summary: classification?.summary ?? null })
+        // Only touch `summary` when this run actually produced one: `?? null` would wipe a good
+        // summary from an earlier run every time a later classification comes back empty.
+        .set({ sentiment, sentimentManual: false, ...(classification?.summary ? { summary: classification.summary } : {}) })
         .where('id = :id AND sentiment_manual = false', { id: mention.id })
         .execute();
 
@@ -105,7 +115,7 @@ async function main(): Promise<void> {
         id: mention.id,
         title: mention.title,
         text: mention.text,
-        url: mention.url,
+        url: classifyUrl,
         sourceType: mention.sourceType,
         autoSentiment: sentiment,
         autoReason: classification?.reason ?? null,
@@ -120,7 +130,7 @@ async function main(): Promise<void> {
         id: mention.id,
         title: mention.title,
         text: mention.text,
-        url: mention.url,
+        url: mention.urlHidden ? null : mention.url,
         sourceType: mention.sourceType,
         autoSentiment: Sentiment.UNDEFINED,
         autoReason: `error: ${message}`,
