@@ -10,7 +10,10 @@ import { extractDateFromUrl } from './curated-article-date.util';
 import { truncateText } from './text.util';
 
 export const CURATED_DEFAULT_SOURCE_LABEL = 'Подборка материалов';
-const SUMMARY_DISPLAY_LENGTH = 250;
+/** Default display cap for `summary` — the previous hard-coded value, kept as the default so an
+ *  unset CURATED_SUMMARY_DISPLAY_CHARS changes nothing. Raise it alongside CURATED_SUMMARY_WORDS
+ *  (a ~50-word summary needs roughly 420 characters, otherwise it arrives truncated mid-sentence). */
+const DEFAULT_SUMMARY_DISPLAY_LENGTH = 250;
 const SNIPPET_DISPLAY_LENGTH = 200;
 /** Generous enough to cover any realistic /search message page (see curated-message.util.ts's
  *  greedy packing) without an extra round-trip — the whole pool is a few hundred links at most. */
@@ -51,7 +54,8 @@ export interface CuratedMentionView {
   sourceLabel: string;
   publishedAt: Date | null;
   sentiment: Sentiment;
-  /** Pre-truncated (~250 chars) LLM summary, or null when the mention has none yet. */
+  /** LLM summary, pre-truncated to CURATED_SUMMARY_DISPLAY_CHARS (~250 by default), or null when
+   *  the mention has none yet. */
   summary: string | null;
   /** Pre-truncated (~200 chars) fallback built from the raw text — the message formatter uses
    *  this only when `summary` is null. */
@@ -83,6 +87,12 @@ export class CuratedSearchService {
 
   private get timezone(): string {
     return this.config.get<string>('curated.timezone') || 'Asia/Almaty';
+  }
+
+  /** How many characters of `summary` findPage() hands to the formatter (CURATED_SUMMARY_DISPLAY_CHARS). */
+  private get summaryDisplayLength(): number {
+    const value = this.config.get<number>('curated.summaryDisplayChars');
+    return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : DEFAULT_SUMMARY_DISPLAY_LENGTH;
   }
 
   private dateWindow(periodDays: number, now: Date): { tz: string; dateFrom: string; dateTo: string } {
@@ -147,13 +157,14 @@ export class CuratedSearchService {
       .limit(Math.min(limit, PAGE_FETCH_LIMIT))
       .getMany();
 
+    const summaryDisplayLength = this.summaryDisplayLength;
     return rows.map((m) => ({
       id: m.id,
       title: m.title,
       sourceLabel: m.sourceLabel ?? CURATED_DEFAULT_SOURCE_LABEL,
       publishedAt: m.publishedAt,
       sentiment: m.sentiment,
-      summary: m.summary ? truncateText(m.summary, SUMMARY_DISPLAY_LENGTH) : null,
+      summary: m.summary ? truncateText(m.summary, summaryDisplayLength) : null,
       snippet: m.text ? truncateText(m.text, SNIPPET_DISPLAY_LENGTH) : null,
     }));
   }

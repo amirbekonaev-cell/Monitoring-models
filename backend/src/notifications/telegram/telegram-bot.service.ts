@@ -16,6 +16,8 @@ import {
   buildResetDoneText,
   buildEmptyPeriodText,
   buildHeader,
+  buildItemMessages,
+  buildMoreButtonFallbackText,
   buildPage,
   buildPeriodConfirmationText,
   buildSearchMoreCallbackData,
@@ -28,6 +30,15 @@ import {
  *  message's char limit (see buildPage's greedy packing), so a single findPage() call is enough
  *  to build one page; the pool itself is only ever a few hundred links. */
 const PAGE_FETCH_BATCH_SIZE = 500;
+
+/**
+ * Pause between two consecutive messages in one-article-per-message mode. Telegram rate-limits a
+ * bot to roughly 20 messages/minute into a single group, and exceeding it earns a 429 for the
+ * whole batch rather than a slower delivery. 700 ms keeps a default batch (8) at ~5s of waiting —
+ * comfortably inside the 60s ceiling the Vercel invocation has, which is the other half of why
+ * the batch is capped (see buildItemMessages).
+ */
+const ONE_PER_MESSAGE_DELAY_MS = 700;
 
 /** How the bot receives updates — see the class comment and resolveTelegramBotMode(). */
 export type TelegramBotMode = 'polling' | 'webhook';
@@ -75,6 +86,17 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
 
   private get charLimit(): number {
     return this.config.get<number>('curated.messageCharLimit') || 3500;
+  }
+
+  /** SEARCH_ONE_ARTICLE_PER_MESSAGE — false (default) keeps the packed-page output byte for byte. */
+  private get oneArticlePerMessage(): boolean {
+    return this.config.get<boolean>('curated.oneArticlePerMessage') === true;
+  }
+
+  /** SEARCH_ITEMS_PER_BATCH — how many separate article messages one button press sends. */
+  private get itemsPerBatch(): number {
+    const value = this.config.get<number>('curated.itemsPerBatch');
+    return typeof value === 'number' && Number.isFinite(value) && value > 0 ? Math.floor(value) : 8;
   }
 
   private get mode(): TelegramBotMode {
@@ -354,6 +376,15 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
         const now = new Date();
         const label = searchPeriodLabel(days);
         const result = await this.curatedSearchService.search(days, now);
+
+        if (this.oneArticlePerMessage) {
+          const sent = await this.sendItemsOnePerMessage(ctx.telegram, chatId, days, result, offset, now);
+          if (sent === 0) {
+            await ctx.telegram.sendMessage(chatId, 'Больше записей нет.');
+          }
+          return;
+        }
+
         const items = await this.curatedSearchService.findPage(days, offset, PAGE_FETCH_BATCH_SIZE, now);
         const { text, shownCount } = buildPage({
           header: null,
@@ -400,6 +431,16 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
     }
 
     const header = buildHeader(label, result);
+
+    // One article per message: the header goes out on its own first (exactly the same text as in
+    // packed mode), then each finding as its own message. Nothing about buildPage's code path is
+    // touched when the flag is off.
+    if (this.oneArticlePerMessage) {
+      await telegram.sendMessage(chatId, header, { parse_mode: 'HTML', link_preview_options: { is_disabled: true } });
+      await this.sendItemsOnePerMessage(telegram, chatId, days, result, 0, now);
+      return;
+    }
+
     const items = await this.curatedSearchService.findPage(days, 0, PAGE_FETCH_BATCH_SIZE, now);
     const { text, shownCount } = buildPage({ header, items, startIndex: 1, timezone: this.timezone, charLimit: this.charLimit });
     const remaining = result.total - shownCount;
@@ -410,6 +451,81 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
       link_preview_options: { is_disabled: true },
       ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
     });
+  }
+
+  /**
+   * One batch of findings, one Telegram message each (SEARCH_ONE_ARTICLE_PER_MESSAGE=true).
+   * Returns how many findings the batch covered — 0 means the offset is already past the end,
+   * which the caller turns into "Больше записей нет.".
+   *
+   * Everything here is awaited inside the webhook invocation, like every other handler in this
+   * class (see README "Почему обработчики бота дожидаются всего синхронно"): the batch size and
+   * the pause between messages are chosen so the whole call fits the 60s ceiling with room to
+   * spare, rather than being handed off to something that outlives the response.
+   *
+   * A failed send is logged (id and label only, never a URL) and the batch continues: losing one
+   * article to a Telegram hiccup must not cost the reader the other seven, nor the button that
+   * fetches the rest — which is why the keyboard falls back to its own carrier message when the
+   * article message it was meant to ride on is the one that failed.
+   */
+  private async sendItemsOnePerMessage(
+    telegram: Telegraf['telegram'],
+    chatId: number,
+    days: number,
+    result: CuratedSearchResult,
+    offset: number,
+    now: Date,
+  ): Promise<number> {
+    const batchSize = this.itemsPerBatch;
+    const items = await this.curatedSearchService.findPage(days, offset, batchSize, now);
+    const { messages, nextOffset, remaining } = buildItemMessages({
+      items,
+      startOffset: offset,
+      total: result.total,
+      timezone: this.timezone,
+      batchSize,
+    });
+
+    if (messages.length === 0) {
+      return 0;
+    }
+
+    const replyMarkup = remaining > 0 ? this.buildMoreKeyboard(days, nextOffset, remaining) : undefined;
+    let keyboardDelivered = replyMarkup === undefined;
+
+    for (let i = 0; i < messages.length; i++) {
+      if (i > 0) {
+        await sleep(ONE_PER_MESSAGE_DELAY_MS);
+      }
+      const isLast = i === messages.length - 1;
+      const markup = isLast && replyMarkup ? replyMarkup : undefined;
+      try {
+        await telegram.sendMessage(chatId, messages[i], {
+          parse_mode: 'HTML',
+          link_preview_options: { is_disabled: true },
+          ...(markup ? { reply_markup: markup } : {}),
+        });
+        if (markup) {
+          keyboardDelivered = true;
+        }
+      } catch (error) {
+        this.logger.warn(
+          `Не удалось отправить сообщение с находкой №${offset + i + 1} за период ${days} дн.: ${describeError(error)}`,
+        );
+      }
+    }
+
+    if (!keyboardDelivered && replyMarkup) {
+      try {
+        await telegram.sendMessage(chatId, buildMoreButtonFallbackText(nextOffset, result.total), {
+          reply_markup: replyMarkup,
+        });
+      } catch (error) {
+        this.logger.warn(`Не удалось отправить кнопку "Показать ещё": ${describeError(error)}`);
+      }
+    }
+
+    return messages.length;
   }
 
   private buildMoreKeyboard(days: number, offset: number, remaining: number): InlineKeyboardMarkup | undefined {
@@ -444,6 +560,10 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
 
 function describeError(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function chunkArray<T>(items: T[], size: number): T[][] {

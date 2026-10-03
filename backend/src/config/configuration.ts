@@ -1,4 +1,5 @@
 import { resolveDbConfig } from './database.util';
+import { parseCuratedMinArticleDate } from '../curated/curated-min-article-date.util';
 import { parseSearchPeriodDays } from '../curated/search-period.util';
 import { resolveTelegramBotMode } from '../notifications/telegram/telegram-bot-mode.util';
 
@@ -116,6 +117,25 @@ export default () => ({
     // Отдавать ли ссылки скрытых упоминаний в REST API/фронт. По умолчанию false. На Telegram-бота
     // НЕ влияет: он ссылки не показывает никогда (ПРОМПТ 1). См. mention-privacy.util.ts.
     exposeUrls: process.env.CURATED_LINKS_EXPOSE_URLS === 'true',
+    // --- Аддитивные настройки пула (по умолчанию выключены = прежнее поведение) ---
+    // Отсечка по дате статьи: статья раньше этой даты не превращается в упоминание (ссылка
+    // получает статус not_relevant). Пусто/не задано/некорректно — отсечки нет, см.
+    // curated-min-article-date.util.ts (невалидное значение только пишет warn, не падает).
+    minArticleDate: parseCuratedMinArticleDate(process.env.CURATED_MIN_ARTICLE_DATE),
+    // Длина пересказа (в словах), которую запрашивает промпт тональности ТОЛЬКО для ссылок пула.
+    // Пусто/0 — промпт остаётся ровно прежним (1-2 предложения, ~250 символов) для всех каналов,
+    // включая пул. См. SentimentAnalysisService.classify(options).
+    summaryWords: parseInt(process.env.CURATED_SUMMARY_WORDS || '0', 10),
+    // До скольких символов CuratedSearchService обрезает summary при показе. Для summaryWords=50
+    // осмысленное значение ~420; по умолчанию 250 — столько же, сколько было зашито в коде.
+    summaryDisplayChars: parseInt(process.env.CURATED_SUMMARY_DISPLAY_CHARS || '250', 10),
+    // true — каждая находка /search уходит отдельным сообщением (порциями, см. ниже), а не
+    // упакованной в одну "страницу" по messageCharLimit. По умолчанию false = прежний вывод.
+    oneArticlePerMessage: process.env.SEARCH_ONE_ARTICLE_PER_MESSAGE === 'true',
+    // Сколько отдельных сообщений отправлять за одно нажатие кнопки. Ограничение сверху — лимит
+    // Telegram (~20 сообщений/мин в группу) и 60-секундный потолок Vercel: порция × пауза между
+    // сообщениями должна укладываться в бюджет вызова с большим запасом.
+    itemsPerBatch: parseInt(process.env.SEARCH_ITEMS_PER_BATCH || '8', 10),
   },
   excludedDomains: {
     // Comma-separated domain blacklist (each entry also covers its subdomains) — a domain here

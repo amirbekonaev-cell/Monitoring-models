@@ -41,7 +41,11 @@ jest.mock('telegraf', () => {
   };
 });
 
-function makeConfig(chatId = '-1001', mode: 'polling' | 'webhook' = 'webhook'): ConfigService {
+function makeConfig(
+  chatId = '-1001',
+  mode: 'polling' | 'webhook' = 'webhook',
+  extra: Record<string, unknown> = {},
+): ConfigService {
   const values: Record<string, unknown> = {
     'telegramBot.token': 'tok',
     'telegramBot.chatId': chatId,
@@ -49,6 +53,7 @@ function makeConfig(chatId = '-1001', mode: 'polling' | 'webhook' = 'webhook'): 
     'curated.periodDays': [...DEFAULT_SEARCH_PERIOD_DAYS],
     'curated.timezone': 'Asia/Almaty',
     'curated.messageCharLimit': 3500,
+    ...extra,
   };
   return { get: jest.fn((key: string) => values[key]) } as unknown as ConfigService;
 }
@@ -155,12 +160,17 @@ describe('TelegramBotService (closed-pool bot)', () => {
     curatedSearchService: CuratedSearchService = makeCuratedSearchService(),
     mode: 'polling' | 'webhook' = 'webhook',
     curatedResetService: CuratedResetService = makeCuratedResetService(),
+    extraConfig: Record<string, unknown> = {},
   ): Promise<{
     service: TelegramBotService;
     curatedSearchService: CuratedSearchService;
     curatedResetService: CuratedResetService;
   }> {
-    const service = new TelegramBotService(makeConfig(chatId, mode), curatedSearchService, curatedResetService);
+    const service = new TelegramBotService(
+      makeConfig(chatId, mode, extraConfig),
+      curatedSearchService,
+      curatedResetService,
+    );
     await service.onModuleInit();
     return { service, curatedSearchService, curatedResetService };
   }
@@ -687,6 +697,206 @@ describe('TelegramBotService (closed-pool bot)', () => {
 
       const [, message] = sendMessageMock.mock.calls[0];
       expect(message).toBe('Больше записей нет.');
+    });
+  });
+
+  /**
+   * SEARCH_ONE_ARTICLE_PER_MESSAGE=true — one message per finding instead of a packed page.
+   *
+   * Fake timers throughout: the handler pauses ~700 ms between messages (Telegram's ~20
+   * messages/minute cap into a group), which is real waiting the tests should not sit through.
+   * The pauses themselves are part of the design and tested below as "a full batch fits the
+   * Vercel 60s ceiling", not quietly skipped.
+   */
+  describe('SEARCH_ONE_ARTICLE_PER_MESSAGE', () => {
+    const ONE_PER_MESSAGE = { 'curated.oneArticlePerMessage': true, 'curated.itemsPerBatch': 8 };
+
+    /** findPage() that honours offset/limit, so batching and offsets are exercised for real. */
+    function makePagedSearchService(total: number): CuratedSearchService {
+      const pool = makePoolStats();
+      const all = Array.from({ length: total }, (_, i) => makeMentionView({ id: `m-${i}`, title: `Находка ${i}` }));
+      return {
+        getPoolStats: jest.fn(async () => pool),
+        search: jest.fn(async (periodDays: number) => makeSearchResult({ periodDays, pool, total })),
+        findPage: jest.fn(async (_days: number, offset: number, limit: number) => all.slice(offset, offset + limit)),
+      } as unknown as CuratedSearchService;
+    }
+
+    /** Runs a handler under fake timers, advancing past every inter-message pause. */
+    async function runHandler(handler: ActionHandler, ctx: any): Promise<void> {
+      jest.useFakeTimers();
+      try {
+        const promise = handler(ctx);
+        await jest.advanceTimersByTimeAsync(120000);
+        await promise;
+      } finally {
+        jest.useRealTimers();
+      }
+    }
+
+    const periodHandler = () => actionHandlers.get('/^search_period:(\\d+)$/')!;
+    const moreHandler = () => actionHandlers.get('/^search_more:(\\d+):(\\d+)$/')!;
+
+    function sentTexts(): string[] {
+      return sendMessageMock.mock.calls.map((call) => call[1] as string);
+    }
+
+    it('sends the header first, then each finding as its own message', async () => {
+      await boot('-1001', makePagedSearchService(3), 'webhook', makeCuratedResetService(), ONE_PER_MESSAGE);
+
+      await runHandler(periodHandler(), makeCtx('-1001'));
+
+      const texts = sentTexts();
+      expect(texts).toHaveLength(4); // header + 3 findings
+      expect(texts[0]).toContain('Упоминания за Неделя');
+      expect(texts[0]).toContain('Всего: 3');
+      expect(texts[0]).not.toContain('Находка');
+      expect(texts[1]).toContain('1. ');
+      expect(texts[1]).toContain('Находка 0');
+      expect(texts[2]).toContain('2. ');
+      expect(texts[3]).toContain('3. ');
+    });
+
+    it('stops at SEARCH_ITEMS_PER_BATCH and offers the rest behind the same search_more button', async () => {
+      await boot('-1001', makePagedSearchService(19), 'webhook', makeCuratedResetService(), ONE_PER_MESSAGE);
+
+      await runHandler(periodHandler(), makeCtx('-1001'));
+
+      expect(sentTexts()).toHaveLength(9); // header + 8 findings
+      // The button rides on the last finding of the batch; callback_data keeps its existing shape.
+      const last = sendMessageMock.mock.calls[8] as [unknown, string, any];
+      const button = last[2].reply_markup.inline_keyboard[0][0];
+      expect(button.text).toBe('Показать ещё (осталось 11)');
+      expect(button.callback_data).toBe('search_more:7:8');
+      // ...and on none of the earlier ones.
+      expect((sendMessageMock.mock.calls[7] as any)[2].reply_markup).toBeUndefined();
+    });
+
+    it('walks the whole period over several presses with no duplicate and no gap', async () => {
+      const total = 19;
+      const curatedSearchService = makePagedSearchService(total);
+      await boot('-1001', curatedSearchService, 'webhook', makeCuratedResetService(), ONE_PER_MESSAGE);
+
+      await runHandler(periodHandler(), makeCtx('-1001'));
+      for (const offset of [8, 16]) {
+        await runHandler(moreHandler(), makeCtx('-1001', { match: [`search_more:7:${offset}`, '7', String(offset)] }));
+      }
+
+      // Every finding, exactly once, in order — header excluded.
+      const numbered = sentTexts()
+        .filter((t) => /^\d+\. /.test(t))
+        .map((t) => parseInt(t.split('.')[0], 10));
+      expect(numbered).toEqual(Array.from({ length: total }, (_, i) => i + 1));
+      expect(curatedSearchService.findPage).toHaveBeenCalledWith(7, 0, 8, expect.any(Date));
+      expect(curatedSearchService.findPage).toHaveBeenCalledWith(7, 8, 8, expect.any(Date));
+      expect(curatedSearchService.findPage).toHaveBeenCalledWith(7, 16, 8, expect.any(Date));
+    });
+
+    it('drops the "Показать ещё" button on the last batch', async () => {
+      await boot('-1001', makePagedSearchService(10), 'webhook', makeCuratedResetService(), ONE_PER_MESSAGE);
+
+      await runHandler(moreHandler(), makeCtx('-1001', { match: ['search_more:7:8', '7', '8'] }));
+
+      const calls = sendMessageMock.mock.calls;
+      expect(calls).toHaveLength(2); // findings 9 and 10
+      expect((calls[1] as any)[2].reply_markup).toBeUndefined();
+    });
+
+    it('says "Больше записей нет." when the offset is already past the end', async () => {
+      await boot('-1001', makePagedSearchService(2), 'webhook', makeCuratedResetService(), ONE_PER_MESSAGE);
+
+      await runHandler(moreHandler(), makeCtx('-1001', { match: ['search_more:7:2', '7', '2'] }));
+
+      expect(sentTexts()).toEqual(['Больше записей нет.']);
+    });
+
+    it('sends no finding messages for an empty period, just the usual explanation', async () => {
+      await boot('-1001', makePagedSearchService(0), 'webhook', makeCuratedResetService(), ONE_PER_MESSAGE);
+
+      await runHandler(periodHandler(), makeCtx('-1001'));
+
+      const texts = sentTexts();
+      expect(texts).toHaveLength(1);
+      expect(texts[0]).toContain('упоминаний в пуле ссылок не найдено');
+    });
+
+    it('keeps sending the rest of the batch when one message fails', async () => {
+      await boot('-1001', makePagedSearchService(3), 'webhook', makeCuratedResetService(), ONE_PER_MESSAGE);
+      // Header and finding 1 go out, finding 2 fails, finding 3 must still be attempted.
+      sendMessageMock.mockImplementationOnce(async () => undefined);
+      sendMessageMock.mockImplementationOnce(async () => undefined);
+      sendMessageMock.mockImplementationOnce(async () => {
+        throw new Error('429: Too Many Requests');
+      });
+
+      await expect(runHandler(periodHandler(), makeCtx('-1001'))).resolves.toBeUndefined();
+
+      expect(sendMessageMock).toHaveBeenCalledTimes(4);
+      expect(sentTexts()[3]).toContain('3. ');
+    });
+
+    it('still delivers the "Показать ещё" button when the message it would ride on fails', async () => {
+      await boot('-1001', makePagedSearchService(19), 'webhook', makeCuratedResetService(), ONE_PER_MESSAGE);
+      // Header plus findings 1-7 succeed; finding 8 — the one carrying the keyboard — fails.
+      for (let i = 0; i < 8; i++) {
+        sendMessageMock.mockImplementationOnce(async () => undefined);
+      }
+      sendMessageMock.mockImplementationOnce(async () => {
+        throw new Error('400: message text is too long');
+      });
+
+      await runHandler(periodHandler(), makeCtx('-1001'));
+
+      const lastCall = sendMessageMock.mock.calls[sendMessageMock.mock.calls.length - 1] as [unknown, string, any];
+      expect(lastCall[1]).toContain('Показано находок: 8 из 19');
+      expect(lastCall[2].reply_markup.inline_keyboard[0][0].callback_data).toBe('search_more:7:8');
+    });
+
+    it('never puts a URL in any of the messages it sends', async () => {
+      await boot('-1001', makePagedSearchService(19), 'webhook', makeCuratedResetService(), ONE_PER_MESSAGE);
+
+      await runHandler(periodHandler(), makeCtx('-1001'));
+
+      expect(sentTexts().join('\n')).not.toContain('http');
+    });
+
+    it('fits a full batch well inside the 60-second Vercel ceiling', async () => {
+      await boot('-1001', makePagedSearchService(19), 'webhook', makeCuratedResetService(), ONE_PER_MESSAGE);
+      jest.useFakeTimers();
+      try {
+        // Advanced in small steps and stopped the moment the handler resolves, so `elapsed` is
+        // the fake time the handler actually ASKED for (8 messages => 7 pauses of 700 ms ≈ 4.9s)
+        // rather than however far the test chose to push the clock.
+        let settled = false;
+        const promise = periodHandler()(makeCtx('-1001')).then(() => {
+          settled = true;
+        });
+        let elapsed = 0;
+        while (!settled && elapsed < 120000) {
+          await jest.advanceTimersByTimeAsync(100);
+          elapsed += 100;
+        }
+        await promise;
+
+        expect(settled).toBe(true);
+        expect(elapsed).toBeLessThan(30000);
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+
+    it('changes nothing when the flag is off — still one packed page, same button', async () => {
+      const items = Array.from({ length: 3 }, (_, i) => makeMentionView({ id: `m-${i}`, title: `Находка ${i}` }));
+      await boot('-1001', makeCuratedSearchService({ searchResult: { total: 50 }, page: items }));
+
+      await periodHandler()(makeCtx('-1001'));
+
+      expect(sendMessageMock).toHaveBeenCalledTimes(1);
+      const [, message, extra] = sendMessageMock.mock.calls[0] as [unknown, string, any];
+      expect(message).toContain('Упоминания за Неделя');
+      expect(message).toContain('1. ');
+      expect(message).toContain('3. ');
+      expect(extra.reply_markup.inline_keyboard[0][0].callback_data).toBe('search_more:7:3');
     });
   });
 });

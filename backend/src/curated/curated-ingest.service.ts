@@ -8,6 +8,7 @@ import { ActiveKeywordSet, KeywordsService } from '../keywords/keywords.service'
 import { Keyword, KeywordType } from '../keywords/keyword.entity';
 import { MentionSourceType, Sentiment } from '../mentions/mention.entity';
 import { MentionsService } from '../mentions/mentions.service';
+import { SentimentClassifyOptions } from '../sentiment/sentiment-analysis.service';
 import { SourcesService } from '../sources/sources.service';
 import { SourceKind } from '../sources/source.entity';
 import { CURATED_SOURCE_NAME, CURATED_SOURCE_URL } from './curated-source-bootstrap.service';
@@ -15,6 +16,7 @@ import { CuratedLink, CuratedLinkDateSource, CuratedLinkStatus } from './curated
 import { CuratedOpenAiReaderService } from './curated-openai-reader.service';
 import { buildMentionContext } from './curated-context.util';
 import { extractDateFromUrl, parseIsoDate, resolveArticleDate } from './curated-article-date.util';
+import { minArticleDateRejectionReason } from './curated-min-article-date.util';
 import { curatedLinkRef } from './curated-url.util';
 import { HostQueue, runWithConcurrency } from './host-queue.util';
 
@@ -113,6 +115,32 @@ export class CuratedIngestService {
 
   private get readMode(): 'auto' | 'openai' {
     return this.config.get<string>('curated.readMode') === 'openai' ? 'openai' : 'auto';
+  }
+
+  /**
+   * The CURATED_MIN_ARTICLE_DATE cutoff, or null when it is unset/invalid (no cutoff — the
+   * default). Parsing and the warn on a malformed value happen once at config load time, see
+   * curated-min-article-date.util.ts.
+   */
+  private get minArticleDate(): Date | null {
+    const value = this.config.get<Date | null>('curated.minArticleDate');
+    return value instanceof Date ? value : null;
+  }
+
+  /**
+   * Summary length, in words, to ask the tone prompt for — pool links only, and only when
+   * CURATED_SUMMARY_WORDS is set to a positive number. 0/unset means the shared prompt is used
+   * exactly as every other channel gets it (see SentimentAnalysisService.classify's `options`).
+   */
+  private get summaryWords(): number | undefined {
+    const value = this.config.get<number>('curated.summaryWords');
+    return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : undefined;
+  }
+
+  /** The tone options a pool mention is classified with — `undefined` when nothing is customized. */
+  private get sentimentOptions(): SentimentClassifyOptions | undefined {
+    const summaryWords = this.summaryWords;
+    return summaryWords === undefined ? undefined : { summaryWords };
   }
 
   /**
@@ -291,6 +319,24 @@ export class CuratedIngestService {
       });
       base.dateSource = dateSource;
 
+      // Optional age cutoff (CURATED_MIN_ARTICLE_DATE, off by default). Deliberately placed
+      // AFTER the date is resolved and BEFORE anything is written to `mentions`: a link whose
+      // article predates the threshold produces no mention at all, so it cannot show up in any
+      // /search period or in the feed.
+      //
+      // Two decisions worth stating:
+      //  - An article with NO date is not affected. The threshold filters by a date we know; an
+      //    undated article is still counted as "без даты" exactly as before (see
+      //    curated-article-date.util.ts on why today's date is never substituted).
+      //  - The comparison is strictly `<`, so an article published ON the threshold day is kept.
+      //  - A mention this link produced on an EARLIER run (before the threshold was set) is not
+      //    deleted here — removing already-stored mentions is `curated:reset`'s job, not a side
+      //    effect of re-running the ingest. The link still ends up `not_relevant`.
+      const minArticleDate = this.minArticleDate;
+      if (date && minArticleDate && date.getTime() < minArticleDate.getTime()) {
+        return await this.recordNotRelevant(link, base, minArticleDateRejectionReason(date, minArticleDate), ref);
+      }
+
       const title = read.title || (link.groupLabel ?? 'Материал из пула');
       // group_label from the file, NOT the domain — the label is what /search prints, and a
       // domain there would reconstruct half the hidden link for the reader.
@@ -301,6 +347,10 @@ export class CuratedIngestService {
       // would silently drop the second row — leaving the stale content in place. This is the
       // path that lets a fixed date extractor actually reach the existing mentions.
       const existingMentionId = link.mentionId ?? (await this.findMentionIdFor(link.id));
+      // Omitted entirely rather than passed as `undefined` when nothing is customized, so the
+      // unconfigured path is the exact same call the other channels make (see
+      // SentimentAnalysisService.classify's `options`).
+      const sentimentOptions = this.sentimentOptions;
 
       if (existingMentionId) {
         await this.mentionsService.updateCuratedContent(existingMentionId, {
@@ -315,7 +365,9 @@ export class CuratedIngestService {
         // Only pay for classification again if the mention never got a tone in the first place
         // (e.g. it was first processed with no OPENAI_API_KEY configured).
         if (base.sentiment === Sentiment.UNDEFINED) {
-          await this.mentionsService.classifyExisting(existingMentionId);
+          await (sentimentOptions
+            ? this.mentionsService.classifyExisting(existingMentionId, sentimentOptions)
+            : this.mentionsService.classifyExisting(existingMentionId));
           base.sentimentCalls = 1;
           base.sentiment = (await this.mentionsService.findById(existingMentionId))?.sentiment ?? Sentiment.UNDEFINED;
         }
@@ -333,6 +385,7 @@ export class CuratedIngestService {
           skipDedup: true,
           urlHidden: true,
           curatedLinkId: link.id,
+          ...(sentimentOptions ? { sentimentOptions } : {}),
         });
         base.sentimentCalls = 1;
         base.sentiment = insert.sentiment;
