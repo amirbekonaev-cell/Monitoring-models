@@ -4,7 +4,11 @@ import { createHash, randomUUID } from 'crypto';
 import { DataSource, Repository, SelectQueryBuilder } from 'typeorm';
 import { Mention, MentionSourceType, Sentiment } from './mention.entity';
 import { Source } from '../sources/source.entity';
-import { SentimentAnalysisService, SentimentClassification } from '../sentiment/sentiment-analysis.service';
+import {
+  SentimentAnalysisService,
+  SentimentClassification,
+  SentimentClassifyOptions,
+} from '../sentiment/sentiment-analysis.service';
 
 export interface CreateMentionInput {
   title: string;
@@ -39,6 +43,14 @@ export interface CreateMentionInput {
    */
   urlHidden?: boolean;
   curatedLinkId?: string | null;
+  /**
+   * Per-call overrides for the tone prompt, passed straight through to
+   * SentimentAnalysisService.classify. Only the closed-pool ingest sets it (see
+   * CuratedIngestService); omitted everywhere else, which keeps the shared prompt — and therefore
+   * every other channel's summaries — exactly as it was. There is still only ONE classifier and
+   * one prompt; this is a parameter of it, not a second copy.
+   */
+  sentimentOptions?: SentimentClassifyOptions;
 }
 
 /** Filters shared by the feed list and the dashboard stats aggregation — kept in one place so
@@ -151,7 +163,7 @@ export class MentionsService {
     }
 
     if (result === 'inserted') {
-      await this.classifySentimentInBackground(id);
+      await this.classifySentimentInBackground(id, input.sentimentOptions);
     }
 
     // For an already-known mention (duplicate/reprint), just read back whatever sentiment it
@@ -233,11 +245,11 @@ export class MentionsService {
    * exposed for a caller that is re-processing a row which never received a tone (see
    * CuratedIngestService's --force path) and wants the result before it reports.
    */
-  async classifyExisting(mentionId: string): Promise<void> {
-    await this.classifySentimentInBackground(mentionId);
+  async classifyExisting(mentionId: string, options?: SentimentClassifyOptions): Promise<void> {
+    await this.classifySentimentInBackground(mentionId, options);
   }
 
-  private async classifySentimentInBackground(mentionId: string): Promise<void> {
+  private async classifySentimentInBackground(mentionId: string, options?: SentimentClassifyOptions): Promise<void> {
     if (!this.sentimentAnalysisService) {
       return;
     }
@@ -261,6 +273,7 @@ export class MentionsService {
         mention.text,
         mention.urlHidden ? null : mention.url,
         mentionId,
+        options,
       );
       if (!classification) {
         return;
@@ -284,11 +297,16 @@ export class MentionsService {
     text: string,
     url: string | null,
     mentionId: string,
+    options?: SentimentClassifyOptions,
   ): Promise<SentimentClassification | null> {
     let lastError: unknown = null;
     for (let attempt = 1; attempt <= SENTIMENT_CLASSIFY_ATTEMPTS; attempt += 1) {
       try {
-        return await this.sentimentAnalysisService!.classify(title, text, url);
+        // `options` is omitted rather than passed as `undefined` when the caller customized
+        // nothing, so the five non-pool channels issue the exact same call they always did.
+        return await (options
+          ? this.sentimentAnalysisService!.classify(title, text, url, options)
+          : this.sentimentAnalysisService!.classify(title, text, url));
       } catch (error) {
         lastError = error;
         if (attempt < SENTIMENT_CLASSIFY_ATTEMPTS) {

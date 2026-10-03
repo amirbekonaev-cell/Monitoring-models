@@ -1,5 +1,5 @@
 import { ConfigService } from '@nestjs/config';
-import { SentimentAnalysisService } from './sentiment-analysis.service';
+import { SentimentAnalysisService, buildSentimentPrompt } from './sentiment-analysis.service';
 import { Sentiment } from '../mentions/mention.entity';
 import { ParserService } from '../collectors/parser/parser.service';
 
@@ -202,5 +202,89 @@ describe('SentimentAnalysisService — предупреждение о ключ�
     service.onModuleInit();
 
     expect(warn).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * CURATED_SUMMARY_WORDS — a per-call summary length, used only by the closed pool. The prompt is
+ * shared by all six ingestion channels, so the contract tested here is twofold: with no options
+ * the instructions string is the SAME STRING as before (compared literally, not "looks similar"),
+ * and with options only the length guidance changes.
+ */
+describe('buildSentimentPrompt', () => {
+  const baseline = buildSentimentPrompt();
+
+  it.each([undefined, {}, { summaryWords: 0 }, { summaryWords: -10 }, { summaryWords: NaN }])(
+    'returns the shared prompt unchanged for %p',
+    (options) => {
+      expect(buildSentimentPrompt(options as any)).toBe(baseline);
+    },
+  );
+
+  it('still asks for the default 1-2 sentences / ~250 characters when nothing is passed', () => {
+    expect(baseline).toContain('в 1-2 предложения (не более ~250 символов)');
+    expect(baseline).not.toContain('около');
+  });
+
+  it('asks for approximately N words when a word count is passed', () => {
+    const prompt = buildSentimentPrompt({ summaryWords: 50 });
+
+    expect(prompt).toContain('около 50 слов');
+    expect(prompt).not.toContain('в 1-2 предложения (не более ~250 символов)');
+    // Everything else about the prompt — the sentiment enum, the reason field, the "read the whole
+    // article" instruction — must be identical; only the length sentence may differ.
+    expect(prompt.replace('объёмом около 50 слов', 'в 1-2 предложения (не более ~250 символов)')).toBe(baseline);
+  });
+
+  it('rounds a fractional count rather than printing it', () => {
+    expect(buildSentimentPrompt({ summaryWords: 49.6 })).toContain('около 50 слов');
+  });
+});
+
+describe('SentimentAnalysisService.classify — параметр длины пересказа', () => {
+  const originalFetch = global.fetch;
+
+  afterEach(() => {
+    global.fetch = originalFetch;
+  });
+
+  function captureInstructions(): { body: () => any } {
+    let captured: any;
+    global.fetch = jest.fn(async (_url: string, init: RequestInit) => {
+      captured = JSON.parse(init.body as string);
+      return {
+        ok: true,
+        json: async () => structuredOutput({ sentiment: 'neutral', reason: 'нейтрально', summary: 'пересказ' }),
+      };
+    }) as unknown as typeof fetch;
+    return { body: () => captured };
+  }
+
+  it('sends the unchanged shared prompt when no options are given (other channels)', async () => {
+    const captured = captureInstructions();
+    const service = new SentimentAnalysisService(makeConfig(), makeParserService());
+
+    await service.classify('Заголовок', 'a'.repeat(500));
+
+    expect(captured.body().instructions).toBe(buildSentimentPrompt());
+  });
+
+  it('sends the word count in the instructions when the pool asks for it', async () => {
+    const captured = captureInstructions();
+    const service = new SentimentAnalysisService(makeConfig(), makeParserService());
+
+    await service.classify('Заголовок', 'a'.repeat(500), null, { summaryWords: 50 });
+
+    expect(captured.body().instructions).toContain('около 50 слов');
+  });
+
+  it('does not change the response schema — still the same three required fields', async () => {
+    const captured = captureInstructions();
+    const service = new SentimentAnalysisService(makeConfig(), makeParserService());
+
+    await service.classify('Заголовок', 'a'.repeat(500), null, { summaryWords: 50 });
+
+    expect(captured.body().text.format.schema.required).toEqual(['sentiment', 'reason', 'summary']);
+    expect(captured.body().text.format.name).toBe('sentiment_classification');
   });
 });

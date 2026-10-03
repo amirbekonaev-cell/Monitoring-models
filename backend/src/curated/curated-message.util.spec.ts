@@ -5,6 +5,8 @@ import {
   buildEmptyPeriodText,
   buildHeader,
   buildItemBlock,
+  buildItemMessages,
+  buildMoreButtonFallbackText,
   buildPage,
   buildPeriodConfirmationText,
   buildSearchMoreCallbackData,
@@ -268,5 +270,123 @@ describe('buildStatusText', () => {
     const text = buildStatusText(makePool({ firstArticleDate: null, lastArticleDate: null, lastProcessedAt: null }), TZ);
     expect(text).toContain('нет данных');
     expect(text).toContain('ещё не запускалась');
+  });
+});
+
+/**
+ * SEARCH_ONE_ARTICLE_PER_MESSAGE — one message per finding, batched. The invariant the tests below
+ * exist for is the pagination one: walking the batches from offset 0 must yield every finding
+ * exactly once, in order, with no gap and no repeat at the seams.
+ */
+describe('buildItemMessages', () => {
+  function items(count: number, from = 0): CuratedMentionView[] {
+    return Array.from({ length: count }, (_, i) => makeItem({ id: `m-${from + i}`, title: `Находка ${from + i}` }));
+  }
+
+  it('produces one message per finding, numbered from the running offset', () => {
+    const batch = buildItemMessages({ items: items(3), startOffset: 0, total: 3, timezone: TZ, batchSize: 8 });
+
+    expect(batch.messages).toHaveLength(3);
+    expect(batch.messages[0]).toContain('1. ');
+    expect(batch.messages[0]).toContain('Находка 0');
+    expect(batch.messages[2]).toContain('3. ');
+    expect(batch.nextOffset).toBe(3);
+    expect(batch.remaining).toBe(0);
+  });
+
+  it('continues the numbering across pages instead of restarting at 1', () => {
+    const batch = buildItemMessages({ items: items(2, 8), startOffset: 8, total: 20, timezone: TZ, batchSize: 8 });
+
+    expect(batch.messages[0]).toContain('9. ');
+    expect(batch.messages[1]).toContain('10. ');
+    expect(batch.nextOffset).toBe(10);
+    expect(batch.remaining).toBe(10);
+  });
+
+  it('caps the batch at batchSize and leaves the rest for the next press', () => {
+    const batch = buildItemMessages({ items: items(20), startOffset: 0, total: 20, timezone: TZ, batchSize: 8 });
+
+    expect(batch.messages).toHaveLength(8);
+    expect(batch.nextOffset).toBe(8);
+    expect(batch.remaining).toBe(12);
+  });
+
+  it('walks a whole period in batches with no duplicate and no skipped finding', () => {
+    const total = 19;
+    const all = items(total);
+    const seen: string[] = [];
+    let offset = 0;
+    let presses = 0;
+
+    // Exactly what the bot does: fetch from the current offset, send, take nextOffset back.
+    while (offset < total) {
+      const batch = buildItemMessages({
+        items: all.slice(offset, offset + 8),
+        startOffset: offset,
+        total,
+        timezone: TZ,
+        batchSize: 8,
+      });
+      seen.push(...batch.messages);
+      expect(batch.remaining).toBe(total - batch.nextOffset);
+      offset = batch.nextOffset;
+      presses += 1;
+    }
+
+    expect(presses).toBe(3); // 8 + 8 + 3
+    expect(seen).toHaveLength(total);
+    // Numbering is 1..19 across the three batches, each exactly once — the "no duplicates, no
+    // gaps" claim stated as the actual item numbers rather than just a count.
+    expect(seen.map((m) => m.split('.')[0])).toEqual(Array.from({ length: total }, (_, i) => String(i + 1)));
+  });
+
+  it('produces nothing for an empty period', () => {
+    const batch = buildItemMessages({ items: [], startOffset: 0, total: 0, timezone: TZ, batchSize: 8 });
+
+    expect(batch.messages).toEqual([]);
+    expect(batch.nextOffset).toBe(0);
+    expect(batch.remaining).toBe(0);
+  });
+
+  it('reports nothing remaining on the last batch, so the button disappears', () => {
+    const batch = buildItemMessages({ items: items(3, 16), startOffset: 16, total: 19, timezone: TZ, batchSize: 8 });
+
+    expect(batch.messages).toHaveLength(3);
+    expect(batch.remaining).toBe(0);
+  });
+
+  it('never reports a negative remaining when the window shrank between presses', () => {
+    const batch = buildItemMessages({ items: items(2, 8), startOffset: 8, total: 5, timezone: TZ, batchSize: 8 });
+
+    expect(batch.remaining).toBe(0);
+  });
+
+  it('still sends one message per press when batchSize is mistyped as 0', () => {
+    const batch = buildItemMessages({ items: items(5), startOffset: 0, total: 5, timezone: TZ, batchSize: 0 });
+
+    expect(batch.messages).toHaveLength(1);
+    expect(batch.nextOffset).toBe(1);
+  });
+
+  it('never puts a URL in a message', () => {
+    const batch = buildItemMessages({
+      items: [makeItem({ title: 'Статья', summary: 'Пересказ без ссылок.' })],
+      startOffset: 0,
+      total: 1,
+      timezone: TZ,
+      batchSize: 8,
+    });
+
+    expect(batch.messages.join('\n')).not.toContain('http');
+  });
+});
+
+describe('buildMoreButtonFallbackText', () => {
+  it('says how far the reader got, with no URL', () => {
+    const text = buildMoreButtonFallbackText(8, 19);
+
+    expect(text).toContain('8');
+    expect(text).toContain('19');
+    expect(text).not.toContain('http');
   });
 });

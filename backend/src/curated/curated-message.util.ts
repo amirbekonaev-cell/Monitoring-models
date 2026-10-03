@@ -114,6 +114,52 @@ export function buildPage(params: {
   return { text: current, shownCount };
 }
 
+export interface ItemBatch {
+  /** One Telegram message per entry, in display order, already formatted and escaped. */
+  messages: string[];
+  /**
+   * Running index of the first finding NOT in this batch — the `offset` the next
+   * "Показать ещё" carries. Counted over the whole period window (same meaning as buildPage's
+   * pagination offset), and advanced by the number of findings this batch COVERS, not by the
+   * number of messages Telegram accepted: a send that fails is a lost finding, logged by the
+   * caller, never a reason to renumber the rest or hand out the same offset twice.
+   */
+  nextOffset: number;
+  /** Findings still unshown after this batch — the number printed on the button. */
+  remaining: number;
+}
+
+/**
+ * Splits findings into one message per article (SEARCH_ONE_ARTICLE_PER_MESSAGE=true), capped at
+ * `batchSize` per button press. Reuses buildItemBlock, so an item reads exactly the same as it
+ * does inside a packed buildPage() page — only the envelope differs.
+ *
+ * Why a cap at all: Telegram rate-limits a bot to roughly 20 messages/minute into one group, and
+ * the handler sending them runs inside a Vercel invocation that is killed at 60s. A batch plus the
+ * pause between messages has to fit in that budget with room to spare, so the rest of the period
+ * is handed over to the next press instead of being streamed in one go.
+ */
+export function buildItemMessages(params: {
+  items: CuratedMentionView[];
+  /** 0-based index of `items[0]` within the whole period window. */
+  startOffset: number;
+  /** Total findings in the window — what `remaining` is measured against. */
+  total: number;
+  timezone: string;
+  batchSize: number;
+}): ItemBatch {
+  const { items, startOffset, total, timezone } = params;
+  // At least one message per press: a batch size of 0 (a mistyped env value) must not turn the
+  // button into a no-op that can never make progress.
+  const batchSize = Number.isFinite(params.batchSize) && params.batchSize > 0 ? Math.floor(params.batchSize) : 1;
+
+  const batch = items.slice(0, batchSize);
+  const messages = batch.map((item, i) => buildItemBlock(startOffset + i + 1, item, timezone));
+  const nextOffset = startOffset + batch.length;
+
+  return { messages, nextOffset, remaining: Math.max(total - nextOffset, 0) };
+}
+
 /** null when the resulting callback_data would exceed Telegram's 64-byte limit (never happens for
  *  realistic day/offset ranges — a defensive check, not a normal code path). */
 export function buildSearchMoreCallbackData(days: number, offset: number): string | null {
@@ -123,6 +169,16 @@ export function buildSearchMoreCallbackData(days: number, offset: number): strin
 
 export function buildSearchPeriodCallbackData(days: number): string {
   return `search_period:${days}`;
+}
+
+/**
+ * Carrier text for the "Показать ещё" button in one-article-per-message mode when the button
+ * could not ride along on the last article message, because that particular send failed. Without
+ * a fallback carrier, one failed send would strand the reader in the middle of a period with no
+ * way to ask for the rest.
+ */
+export function buildMoreButtonFallbackText(shown: number, total: number): string {
+  return `Показано находок: ${shown} из ${total}.`;
 }
 
 export const RESET_CONFIRM_CALLBACK_DATA = 'pool_reset:confirm';

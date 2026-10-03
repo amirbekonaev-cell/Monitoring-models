@@ -408,6 +408,125 @@ describe('CuratedIngestService.processLink', () => {
   });
 });
 
+/**
+ * CURATED_MIN_ARTICLE_DATE — the optional "too old to be worth a mention" cutoff. Every case below
+ * uses a URL with no date in it (`/article-slug`) and puts the date on the page metadata instead,
+ * so the test controls the article's date exactly rather than inheriting PAGE_URL's 2026-04-20.
+ */
+describe('CuratedIngestService.processLink — отсечка по дате статьи', () => {
+  const DATELESS_URL = 'https://example.com/article-slug';
+  const THRESHOLD = new Date(Date.UTC(2023, 0, 1));
+
+  function harnessWithPageDate(pageDate: Date | null, config: Record<string, unknown> = {}) {
+    return makeHarness({
+      config,
+      parser: jest.fn().mockResolvedValue({ title: 'Заголовок', text: articleBody(), publishedAt: pageDate }),
+    });
+  }
+
+  it('marks an article older than the threshold not_relevant and creates no mention', async () => {
+    const h = harnessWithPageDate(new Date('2019-05-04T08:00:00Z'), { 'curated.minArticleDate': THRESHOLD });
+
+    const outcome = await h.service.processLink(makeLink({ url: DATELESS_URL }), h.context);
+
+    expect(outcome.status).toBe(CuratedLinkStatus.NOT_RELEVANT);
+    expect(outcome.error).toContain('статья старше порога CURATED_MIN_ARTICLE_DATE');
+    expect(h.mentions.createIfNewAndClassify).not.toHaveBeenCalled();
+    expect(h.linksRepo.update).toHaveBeenCalledWith(
+      'link-1',
+      expect.objectContaining({ status: CuratedLinkStatus.NOT_RELEVANT, lastError: outcome.error }),
+    );
+  });
+
+  // The comparison is `<`, not `<=`: "с 2023-01-01" has to include the first of January itself.
+  it('keeps an article published exactly on the threshold day', async () => {
+    const h = harnessWithPageDate(new Date('2023-01-01T00:00:00Z'), { 'curated.minArticleDate': THRESHOLD });
+
+    const outcome = await h.service.processLink(makeLink({ url: DATELESS_URL }), h.context);
+
+    expect(outcome.status).toBe(CuratedLinkStatus.PROCESSED);
+    expect(h.mentions.createIfNewAndClassify).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps an article newer than the threshold', async () => {
+    const h = harnessWithPageDate(new Date('2026-02-02T00:00:00Z'), { 'curated.minArticleDate': THRESHOLD });
+
+    const outcome = await h.service.processLink(makeLink({ url: DATELESS_URL }), h.context);
+
+    expect(outcome.status).toBe(CuratedLinkStatus.PROCESSED);
+  });
+
+  // An undated article is not "old", it is unknown — and it is already excluded from every period
+  // window and counted separately ("без даты"). The threshold must not quietly delete that case.
+  it('does not touch an article with no date at all', async () => {
+    const h = harnessWithPageDate(null, { 'curated.minArticleDate': THRESHOLD });
+
+    const outcome = await h.service.processLink(makeLink({ url: DATELESS_URL }), h.context);
+
+    expect(outcome.status).toBe(CuratedLinkStatus.PROCESSED);
+    expect(outcome.dateSource).toBeNull();
+    expect(h.mentions.createIfNewAndClassify.mock.calls[0][0].publishedAt).toBeNull();
+  });
+
+  it('applies no cutoff when the variable is unset — a 2018 article still becomes a mention', async () => {
+    const h = harnessWithPageDate(new Date('2018-06-01T00:00:00Z'));
+
+    const outcome = await h.service.processLink(makeLink({ url: DATELESS_URL }), h.context);
+
+    expect(outcome.status).toBe(CuratedLinkStatus.PROCESSED);
+    expect(h.mentions.createIfNewAndClassify).toHaveBeenCalledTimes(1);
+  });
+
+  // parseCuratedMinArticleDate() already rejected the malformed value with a warn, leaving null in
+  // config; the service must behave exactly as if nothing was configured, not crash on it.
+  it('ignores an invalid configured value instead of failing the link', async () => {
+    const h = harnessWithPageDate(new Date('2018-06-01T00:00:00Z'), { 'curated.minArticleDate': null });
+
+    const outcome = await h.service.processLink(makeLink({ url: DATELESS_URL }), h.context);
+
+    expect(outcome.status).toBe(CuratedLinkStatus.PROCESSED);
+    expect(h.mentions.createIfNewAndClassify).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('CuratedIngestService.processLink — CURATED_SUMMARY_WORDS', () => {
+  it('asks for no particular summary length when the variable is unset', async () => {
+    const h = makeHarness();
+
+    await h.service.processLink(makeLink(), h.context);
+
+    expect(h.mentions.createIfNewAndClassify.mock.calls[0][0].sentimentOptions).toBeUndefined();
+  });
+
+  it('passes the configured word count to the (single, shared) classifier for pool links', async () => {
+    const h = makeHarness({ config: { 'curated.summaryWords': 50 } });
+
+    await h.service.processLink(makeLink(), h.context);
+
+    expect(h.mentions.createIfNewAndClassify.mock.calls[0][0].sentimentOptions).toEqual({ summaryWords: 50 });
+  });
+
+  it('passes it on the --force re-classification path too', async () => {
+    const h = makeHarness({
+      config: { 'curated.summaryWords': 50 },
+      existingMention: true,
+      existingSentiment: Sentiment.UNDEFINED,
+    });
+
+    await h.service.processLink(makeLink({ mentionId: 'mention-1' }), h.context);
+
+    expect(h.mentions.classifyExisting).toHaveBeenCalledWith('mention-1', { summaryWords: 50 });
+  });
+
+  it.each([0, -5, NaN, undefined])('treats %p as "not configured"', async (value) => {
+    const h = makeHarness({ config: { 'curated.summaryWords': value } });
+
+    await h.service.processLink(makeLink(), h.context);
+
+    expect(h.mentions.createIfNewAndClassify.mock.calls[0][0].sentimentOptions).toBeUndefined();
+  });
+});
+
 describe('humanizeError', () => {
   it('replaces any URL with a host-only placeholder', () => {
     const result = humanizeError(new Error('fetch failed for https://example.com/secret/path'), 'example.com');

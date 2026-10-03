@@ -235,6 +235,36 @@ describe('MentionsService dedup', () => {
     expect(sentimentAnalysisService.classify).toHaveBeenCalledWith(inserted.title, inserted.text, inserted.url);
   });
 
+  // CURATED_SUMMARY_WORDS reaches the model through this service: the pool asks for a longer
+  // summary per insert, and nothing else does. Both halves matter — that it is forwarded when
+  // given, and that the call is byte-identical (no trailing `undefined`) when it is not, since
+  // the other five channels share this one classifier and this one prompt.
+  it('forwards per-insert sentiment options to the classifier, and omits them entirely when unset', async () => {
+    const inserted = { id: 'new-id', title: 't', text: 'x', url: 'https://example.com/a' } as Mention;
+    const setCalls: Record<string, unknown>[] = [];
+    const dataSource = { query: jest.fn(async () => []) } as unknown as DataSource;
+    const classify = jest.fn(async () => ({ sentiment: Sentiment.NEUTRAL, reason: 'r', summary: 's' }));
+    const sentimentAnalysisService = { classify } as unknown as SentimentAnalysisService;
+
+    const withOptions = new MentionsService(
+      makeRepoCapturingSentimentWrites(inserted, setCalls),
+      dataSource,
+      sentimentAnalysisService,
+    );
+    await withOptions.createIfNewAndClassify(makeInput({ sentimentOptions: { summaryWords: 50 } }));
+
+    expect(classify).toHaveBeenLastCalledWith(inserted.title, inserted.text, inserted.url, { summaryWords: 50 });
+
+    const withoutOptions = new MentionsService(
+      makeRepoCapturingSentimentWrites(inserted, setCalls),
+      dataSource,
+      sentimentAnalysisService,
+    );
+    await withoutOptions.createIfNewAndClassify(makeInput());
+
+    expect(classify).toHaveBeenLastCalledWith(inserted.title, inserted.text, inserted.url);
+  });
+
   // Found live: most of the curated pool sat at Sentiment.UNDEFINED forever, because a single
   // transient failure (OpenAI 429/5xx/network — the only cases classify() throws on) was never
   // retried. classifyWithRetries now gives those another go.

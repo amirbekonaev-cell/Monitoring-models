@@ -26,6 +26,39 @@ const SYSTEM_PROMPT =
   'тоном изложения (о чём материал, а не оценка тональности) — этот текст показывается людям ' +
   'вместо полной статьи, поэтому должен быть самодостаточным и понятным без перехода по ссылке.';
 
+/**
+ * Per-call overrides. `undefined`/omitted means every caller gets SYSTEM_PROMPT verbatim — the
+ * shared prompt above is used by all ingestion channels, and changing it for one of them would
+ * silently change the summaries of the other five.
+ */
+export interface SentimentClassifyOptions {
+  /**
+   * Ask for a summary of roughly this many words instead of the default "1-2 sentences, ~250
+   * characters". Only the closed pool passes it (CURATED_SUMMARY_WORDS), because only the pool
+   * shows the summary *instead of* the article — the reader has no link to follow. The response
+   * schema is unchanged either way: still the same three fields, only the length guidance differs.
+   */
+  summaryWords?: number;
+}
+
+/**
+ * SYSTEM_PROMPT with the summary-length sentence replaced when (and only when) a caller asked for
+ * a word count. With no options, or a non-positive/garbage count, the returned string is
+ * byte-for-byte SYSTEM_PROMPT — a test asserts exactly that, because it is the whole guarantee
+ * that the other channels' behaviour is untouched.
+ */
+export function buildSentimentPrompt(options?: SentimentClassifyOptions): string {
+  const words = options?.summaryWords;
+  if (typeof words !== 'number' || !Number.isFinite(words) || words <= 0) {
+    return SYSTEM_PROMPT;
+  }
+  const rounded = Math.round(words);
+  return SYSTEM_PROMPT.replace(
+    'в 1-2 предложения (не более ~250 символов)',
+    `объёмом около ${rounded} слов`,
+  );
+}
+
 const RESPONSE_JSON_SCHEMA = {
   type: 'json_schema' as const,
   name: 'sentiment_classification',
@@ -109,7 +142,12 @@ export class SentimentAnalysisService implements OnModuleInit {
     );
   }
 
-  async classify(title: string, text: string, url?: string | null): Promise<SentimentClassification | null> {
+  async classify(
+    title: string,
+    text: string,
+    url?: string | null,
+    options?: SentimentClassifyOptions,
+  ): Promise<SentimentClassification | null> {
     const apiKey = this.config.get<string>('sentimentAnalysis.apiKey');
     if (!apiKey) {
       this.logger.warn('OPENAI_API_KEY не задан — тональность оставлена как "не определена"');
@@ -140,7 +178,7 @@ export class SentimentAnalysisService implements OnModuleInit {
         },
         body: JSON.stringify({
           model,
-          instructions: SYSTEM_PROMPT,
+          instructions: buildSentimentPrompt(options),
           input: content,
           text: { format: RESPONSE_JSON_SCHEMA },
         }),

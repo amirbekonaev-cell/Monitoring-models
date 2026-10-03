@@ -148,10 +148,9 @@ function makeFakeCuratedLinksRepo(rows: FakeCuratedLinkRow[]): Repository<Curate
   return { count, createQueryBuilder } as unknown as Repository<CuratedLink>;
 }
 
-function makeConfig(): ConfigService {
-  return {
-    get: jest.fn((key: string) => (key === 'curated.timezone' ? 'Asia/Almaty' : undefined)),
-  } as unknown as ConfigService;
+function makeConfig(overrides: Record<string, unknown> = {}): ConfigService {
+  const values: Record<string, unknown> = { 'curated.timezone': 'Asia/Almaty', ...overrides };
+  return { get: jest.fn((key: string) => values[key]) } as unknown as ConfigService;
 }
 
 /**
@@ -325,6 +324,43 @@ describe('CuratedSearchService.findPage', () => {
     expect(view.summary!.length).toBeLessThan(longSummary.length);
     expect(view.summary!.endsWith('…')).toBe(true);
     expect(view.snippet!.length).toBeLessThan(longText.length);
+  });
+
+  // CURATED_SUMMARY_DISPLAY_CHARS. Default 250 is asserted by the test above (which configures
+  // nothing); these two cover the knob itself, needed because a ~50-word summary
+  // (CURATED_SUMMARY_WORDS) arrives cut mid-sentence under the old 250-character cap.
+  it('truncates summary to CURATED_SUMMARY_DISPLAY_CHARS when it is configured', async () => {
+    const longSummary = 'я'.repeat(600);
+    const mentionsRepo = makeFakeMentionsRepo([
+      mention({ id: 'a', publishedAt: new Date('2026-09-10T10:00:00Z'), summary: longSummary }),
+    ]);
+    const service = new CuratedSearchService(
+      mentionsRepo,
+      makeFakeCuratedLinksRepo([]),
+      makeConfig({ 'curated.summaryDisplayChars': 420 }),
+      makeIngest(),
+    );
+
+    const [view] = await service.findPage(7, 0, 10, now);
+
+    expect(view.summary).toHaveLength(421); // 420 characters + the ellipsis
+  });
+
+  it('keeps the 250-character default when the variable is absent or unusable', async () => {
+    const longSummary = 'я'.repeat(600);
+    const rows = [mention({ id: 'a', publishedAt: new Date('2026-09-10T10:00:00Z'), summary: longSummary })];
+
+    for (const configured of [undefined, 0, -1, NaN]) {
+      const service = new CuratedSearchService(
+        makeFakeMentionsRepo(rows),
+        makeFakeCuratedLinksRepo([]),
+        makeConfig({ 'curated.summaryDisplayChars': configured }),
+        makeIngest(),
+      );
+
+      const [view] = await service.findPage(7, 0, 10, now);
+      expect(view.summary).toHaveLength(251);
+    }
   });
 
   it('excludes mentions with no curated_link_id', async () => {
