@@ -3,6 +3,7 @@ import { TelegramBotService } from './telegram-bot.service';
 import { CuratedSearchService, CuratedSearchResult, CuratedMentionView, PoolStats } from '../../curated/curated-search.service';
 import { CuratedResetService } from '../../curated/curated-reset.service';
 import { CuratedLinkStatus } from '../../curated/curated-link.entity';
+import { CuratedMentionsService } from '../../curated/curated-mentions.service';
 import { Sentiment } from '../../mentions/mention.entity';
 import { DEFAULT_SEARCH_PERIOD_DAYS } from '../../curated/search-period.util';
 
@@ -170,6 +171,7 @@ describe('TelegramBotService (closed-pool bot)', () => {
       makeConfig(chatId, mode, extraConfig),
       curatedSearchService,
       curatedResetService,
+      new CuratedMentionsService(),
     );
     await service.onModuleInit();
     return { service, curatedSearchService, curatedResetService };
@@ -197,7 +199,12 @@ describe('TelegramBotService (closed-pool bot)', () => {
 
   it('throws from handleUpdate when TELEGRAM_BOT_TOKEN was never configured', async () => {
     const config = { get: jest.fn(() => '') } as unknown as ConfigService;
-    const service = new TelegramBotService(config, makeCuratedSearchService(), makeCuratedResetService());
+    const service = new TelegramBotService(
+      config,
+      makeCuratedSearchService(),
+      makeCuratedResetService(),
+      new CuratedMentionsService(),
+    );
     await service.onModuleInit();
 
     await expect(service.handleUpdate({} as any)).rejects.toThrow('TELEGRAM_BOT_TOKEN');
@@ -897,6 +904,102 @@ describe('TelegramBotService (closed-pool bot)', () => {
       expect(message).toContain('1. ');
       expect(message).toContain('3. ');
       expect(extra.reply_markup.inline_keyboard[0][0].callback_data).toBe('search_more:7:3');
+    });
+  });
+
+  /**
+   * Команды по вручную проверенным карточкам. Набор — отдельный от закрытого пула источник
+   * данных, бот по нему ничего не ищет и не генерирует: текст берётся из JSON как есть.
+   */
+  describe('/curated_stats и /curated <издание>', () => {
+    const curated = new CuratedMentionsService();
+
+    it('регистрирует обе команды на старте', async () => {
+      await boot();
+      expect(commandHandlers.has('curated_stats')).toBe(true);
+      expect(commandHandlers.has('curated')).toBe(true);
+    });
+
+    it('/curated_stats отдаёт общее число карточек и разбивку по тональности', async () => {
+      await boot();
+      const ctx = makeCtx(-1001);
+
+      await commandHandlers.get('curated_stats')!(ctx);
+
+      const [message] = ctx.reply.mock.calls[0] as unknown as [string, any];
+      const stats = curated.stats();
+      expect(message).toContain(`Всего: <b>${stats.total}</b>`);
+      expect(message).toContain(`🟩 Позитив: ${stats.positive}`);
+      expect(message).toContain(`🟨 Нейтрал: ${stats.neutral}`);
+      expect(message).toContain(`🟥 Негатив: ${stats.negative}`);
+    });
+
+    it('/curated_stats недоступна вне рабочей группы', async () => {
+      await boot();
+      const ctx = makeCtx(-999);
+
+      await commandHandlers.get('curated_stats')!(ctx);
+
+      expect(ctx.reply).toHaveBeenCalledWith('Эта команда доступна только в рабочей группе мониторинга.');
+    });
+
+    it('/curated <издание> отправляет готовый текст карточек, по одному сообщению на карточку', async () => {
+      await boot();
+      const ctx = makeCtx(-1001, { message: { text: '/curated the-tenge.kz' } });
+      const items = curated.bySource('the-tenge.kz');
+
+      await commandHandlers.get('curated')!(ctx);
+
+      // Заголовок пачки + по сообщению на каждую карточку.
+      expect(sendMessageMock).toHaveBeenCalledTimes(items.length + 1);
+      const [, header] = sendMessageMock.mock.calls[0] as [unknown, string, any];
+      expect(header).toContain('the-tenge.kz');
+      const [, first] = sendMessageMock.mock.calls[1] as [unknown, string, any];
+      expect(first).toBe(curated.formatMessage(items[0]));
+    });
+
+    it('/curated у большого издания шлёт пачку с кнопкой «Показать ещё», а не все карточки разом', async () => {
+      await boot();
+      const ctx = makeCtx(-1001, { message: { text: '/curated sknews.kz' } });
+      const items = curated.bySource('sknews.kz');
+      expect(items.length).toBeGreaterThan(8);
+
+      await commandHandlers.get('curated')!(ctx);
+
+      // Заголовок + ровно одна пачка (8), а не все 49 сообщений сразу.
+      expect(sendMessageMock).toHaveBeenCalledTimes(9);
+      const [, , extra] = sendMessageMock.mock.calls[8] as [unknown, string, any];
+      expect(extra.reply_markup.inline_keyboard[0][0].callback_data).toBe('curated_more:sknews.kz:8');
+    });
+
+    it('/curated без аргумента и с неизвестным изданием подсказывает список доменов', async () => {
+      await boot();
+
+      const noArg = makeCtx(-1001, { message: { text: '/curated' } });
+      await commandHandlers.get('curated')!(noArg);
+      expect((noArg.reply.mock.calls[0] as unknown as [string, any])[0]).toContain('Укажите издание');
+
+      const unknown = makeCtx(-1001, { message: { text: '/curated нет-такого.kz' } });
+      await commandHandlers.get('curated')!(unknown);
+      const [message] = unknown.reply.mock.calls[0] as unknown as [string, any];
+      expect(message).toContain('не найдено');
+      expect(message).toContain('sknews.kz');
+      expect(sendMessageMock).not.toHaveBeenCalled();
+    });
+
+    it('кнопка «Показать ещё» досылает следующую пачку того же издания', async () => {
+      await boot();
+      const handler = actionHandlers.get(/^curated_more:.+:\d+$/.toString())!;
+      const items = curated.bySource('sknews.kz');
+      const ctx = makeCtx(-1001, { match: ['curated_more:sknews.kz:8'] });
+
+      await handler(ctx);
+
+      expect(ctx.editMessageReplyMarkup).toHaveBeenCalled();
+      const [, header] = sendMessageMock.mock.calls[0] as [unknown, string, any];
+      expect(header).toContain('показаны 9–16');
+      const [, ninth] = sendMessageMock.mock.calls[1] as [unknown, string, any];
+      expect(ninth).toBe(curated.formatMessage(items[8]));
     });
   });
 });

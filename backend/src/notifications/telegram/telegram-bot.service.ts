@@ -4,7 +4,17 @@ import { Context, Markup, Telegraf } from 'telegraf';
 import { InlineKeyboardMarkup, Update } from 'telegraf/types';
 import { CuratedSearchService, CuratedSearchResult } from '../../curated/curated-search.service';
 import { CuratedResetService } from '../../curated/curated-reset.service';
+import { CuratedMentionsService } from '../../curated/curated-mentions.service';
+import { CuratedMention } from '../../curated/curated-mentions';
 import { searchPeriodLabel } from '../../curated/search-period.util';
+import {
+  CURATED_MENTIONS_BATCH_SIZE,
+  buildCuratedMoreCallbackData,
+  buildCuratedSourceHeader,
+  buildCuratedSourceUsageText,
+  buildCuratedStatsText,
+  parseCuratedMoreCallbackData,
+} from '../../curated/curated-mentions-message.util';
 import {
   EMPTY_POOL_TEXT,
   RESET_CANCELLED_TEXT,
@@ -74,6 +84,7 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
     private readonly config: ConfigService,
     private readonly curatedSearchService: CuratedSearchService,
     private readonly curatedResetService: CuratedResetService,
+    private readonly curatedMentionsService: CuratedMentionsService,
   ) {}
 
   private get periodDays(): number[] {
@@ -144,6 +155,8 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
         { command: 'status', description: 'Статистика пула ссылок' },
         { command: 'search', description: 'Упоминания из пула ссылок за период' },
         { command: 'reset', description: 'Сбросить пул: удалить упоминания, вернуть ссылки в очередь' },
+        { command: 'curated_stats', description: 'Проверенные карточки: сколько и какая тональность' },
+        { command: 'curated', description: 'Проверенные карточки одного издания, например /curated sknews.kz' },
       ]);
     } catch (error) {
       this.logger.warn(`Не удалось задать список команд бота (не критично): ${describeError(error)}`);
@@ -302,6 +315,78 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
         this.logger.error(`Сброс пула из Telegram не удался: ${reason}`);
         await ctx.editMessageText(`Не удалось сбросить пул: ${reason}`);
       }
+    });
+
+    // Вручную проверенные карточки — отдельный набор от закрытого пула (/status, /search).
+    // Бот здесь ничего не генерирует и не ходит в LLM: весь текст написан человеком и лежит в
+    // curated-mentions.data.json.
+    bot.command('curated_stats', async (ctx) => {
+      if (!this.isAuthorizedChat(ctx.chat?.id)) {
+        await this.rejectUnauthorized(ctx);
+        return;
+      }
+      const domainsByName = new Map(this.curatedMentionsService.all().map((m) => [m.sourceName, m.sourceDomain]));
+      await ctx.reply(buildCuratedStatsText(this.curatedMentionsService.stats(), domainsByName), {
+        parse_mode: 'HTML',
+        link_preview_options: { is_disabled: true },
+      });
+    });
+
+    bot.command('curated', async (ctx) => {
+      if (!this.isAuthorizedChat(ctx.chat?.id)) {
+        await this.rejectUnauthorized(ctx);
+        return;
+      }
+
+      const domain = (ctx.message as { text?: string } | undefined)?.text?.trim().split(/\s+/)[1]?.toLowerCase() ?? null;
+      const items = domain ? this.curatedMentionsService.bySource(domain) : [];
+      if (items.length === 0) {
+        await ctx.reply(buildCuratedSourceUsageText(domain, this.curatedDomains()), {
+          parse_mode: 'HTML',
+          link_preview_options: { is_disabled: true },
+        });
+        return;
+      }
+
+      const chatId = ctx.chat?.id;
+      if (chatId === undefined) {
+        return;
+      }
+      await this.sendCuratedBatch(ctx.telegram, chatId, domain as string, items, 0);
+    });
+
+    bot.action(/^curated_more:.+:\d+$/, async (ctx) => {
+      if (!this.isAuthorizedChat(ctx.chat?.id)) {
+        await ctx.answerCbQuery('Эта команда доступна только в рабочей группе мониторинга.');
+        return;
+      }
+
+      const parsed = parseCuratedMoreCallbackData((ctx.match as RegExpMatchArray)[0]);
+      if (!parsed) {
+        await ctx.answerCbQuery('Некорректный запрос');
+        return;
+      }
+
+      const items = this.curatedMentionsService.bySource(parsed.domain);
+      if (items.length === 0) {
+        await ctx.answerCbQuery('Издание не найдено');
+        return;
+      }
+
+      await ctx.answerCbQuery();
+      const chatId = ctx.chat?.id;
+      if (chatId === undefined) {
+        return;
+      }
+
+      // Снимаем клавиатуру с предыдущей пачки, чтобы её нельзя было нажать второй раз.
+      try {
+        await ctx.editMessageReplyMarkup({ inline_keyboard: [] });
+      } catch (error) {
+        this.logger.warn(`Не удалось снять клавиатуру с предыдущей пачки карточек: ${describeError(error)}`);
+      }
+
+      await this.sendCuratedBatch(ctx.telegram, chatId, parsed.domain, items, parsed.offset);
     });
 
     bot.action(/^search_period:(\d+)$/, async (ctx) => {
@@ -526,6 +611,61 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
     }
 
     return messages.length;
+  }
+
+  /** Домены изданий набора, по одному разу, в алфавитном порядке — для подсказки в /curated. */
+  private curatedDomains(): string[] {
+    return [...new Set(this.curatedMentionsService.all().map((m) => m.sourceDomain))].sort();
+  }
+
+  /**
+   * Одна пачка готовых карточек одного издания: заголовок, затем по сообщению на карточку.
+   * Текст берётся из JSON как есть — бот его не собирает и не дополняет.
+   *
+   * Пачками, а не целиком, по той же причине, что и у /search (см. sendItemsOnePerMessage):
+   * у sknews.kz 49 карточек, а Telegram пропускает в группу около 20 сообщений в минуту.
+   * Сбой на одной карточке логируется и не прерывает пачку.
+   */
+  private async sendCuratedBatch(
+    telegram: Telegraf['telegram'],
+    chatId: number,
+    domain: string,
+    items: CuratedMention[],
+    offset: number,
+  ): Promise<void> {
+    const batch = items.slice(offset, offset + CURATED_MENTIONS_BATCH_SIZE);
+    if (batch.length === 0) {
+      await telegram.sendMessage(chatId, 'Больше карточек нет.');
+      return;
+    }
+
+    await telegram.sendMessage(chatId, buildCuratedSourceHeader(items, domain, offset), {
+      parse_mode: 'HTML',
+      link_preview_options: { is_disabled: true },
+    });
+
+    const nextOffset = offset + batch.length;
+    const remaining = items.length - nextOffset;
+    const callbackData = remaining > 0 ? buildCuratedMoreCallbackData(domain, nextOffset) : null;
+    const replyMarkup = callbackData
+      ? Markup.inlineKeyboard([Markup.button.callback(`Показать ещё (осталось ${remaining})`, callbackData)]).reply_markup
+      : undefined;
+
+    for (let i = 0; i < batch.length; i++) {
+      if (i > 0) {
+        await sleep(ONE_PER_MESSAGE_DELAY_MS);
+      }
+      const isLast = i === batch.length - 1;
+      try {
+        await telegram.sendMessage(chatId, this.curatedMentionsService.formatMessage(batch[i]), {
+          parse_mode: 'HTML',
+          link_preview_options: { is_disabled: true },
+          ...(isLast && replyMarkup ? { reply_markup: replyMarkup } : {}),
+        });
+      } catch (error) {
+        this.logger.warn(`Не удалось отправить карточку [${batch[i].id}]: ${describeError(error)}`);
+      }
+    }
   }
 
   private buildMoreKeyboard(days: number, offset: number, remaining: number): InlineKeyboardMarkup | undefined {
