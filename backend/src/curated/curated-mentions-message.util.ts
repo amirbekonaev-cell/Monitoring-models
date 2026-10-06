@@ -72,16 +72,22 @@ export function buildCuratedSourceUsageText(domain: string | null, knownDomains:
   const head = domain
     ? `Издание <code>${escapeHtml(domain)}</code> в наборе не найдено.`
     : 'Укажите издание: <code>/curated sknews.kz</code>';
-  return [head, '', `<b>Доступные издания (${knownDomains.length})</b>`, knownDomains.map((d) => `<code>${escapeHtml(d)}</code>`).join('\n')].join(
-    '\n',
-  );
+  return [
+    head,
+    '',
+    'Весь набор целиком: <code>/curated all</code>',
+    '',
+    `<b>Доступные издания (${knownDomains.length})</b>`,
+    knownDomains.map((d) => `<code>${escapeHtml(d)}</code>`).join('\n'),
+  ].join('\n');
 }
 
-/** Заголовок пачки карточек одного издания. */
+/** Заголовок пачки: либо одно издание, либо весь набор (`all`, новые сверху). */
 export function buildCuratedSourceHeader(mentions: CuratedMention[], domain: string, offset: number): string {
   const shown = Math.min(offset + CURATED_MENTIONS_BATCH_SIZE, mentions.length);
+  const title = domain === 'all' ? 'Все проверенные карточки (новые сверху)' : escapeHtml(domain);
   return (
-    `<b>${escapeHtml(domain)}</b> — карточек: ${mentions.length}` +
+    `<b>${title}</b> — карточек: ${mentions.length}` +
     (mentions.length > CURATED_MENTIONS_BATCH_SIZE ? ` (показаны ${offset + 1}–${shown})` : '')
   );
 }

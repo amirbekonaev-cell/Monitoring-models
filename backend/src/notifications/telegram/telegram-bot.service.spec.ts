@@ -914,6 +914,32 @@ describe('TelegramBotService (closed-pool bot)', () => {
   describe('/curated_stats и /curated <издание>', () => {
     const curated = new CuratedMentionsService();
 
+    /**
+     * Прогон обработчика по виртуальному времени. Полная пачка — 8 сообщений, то есть 7 пауз по
+     * 700 мс ≈ 4.9 с, а дефолтный таймаут jest — 5 с: на реальных таймерах эти тесты проходили
+     * на самой границе и падали через раз. Шаги мелкие и цикл останавливается, как только
+     * обработчик завершился, по образцу теста «fits a full batch well inside the 60-second
+     * Vercel ceiling» выше.
+     */
+    async function runWithFakeTimers(run: () => Promise<void>): Promise<void> {
+      jest.useFakeTimers();
+      try {
+        let settled = false;
+        const promise = run().then(() => {
+          settled = true;
+        });
+        let elapsed = 0;
+        while (!settled && elapsed < 120000) {
+          await jest.advanceTimersByTimeAsync(100);
+          elapsed += 100;
+        }
+        await promise;
+        expect(settled).toBe(true);
+      } finally {
+        jest.useRealTimers();
+      }
+    }
+
     it('регистрирует обе команды на старте', async () => {
       await boot();
       expect(commandHandlers.has('curated_stats')).toBe(true);
@@ -964,12 +990,33 @@ describe('TelegramBotService (closed-pool bot)', () => {
       const items = curated.bySource('sknews.kz');
       expect(items.length).toBeGreaterThan(8);
 
-      await commandHandlers.get('curated')!(ctx);
+      await runWithFakeTimers(() => commandHandlers.get('curated')!(ctx));
 
       // Заголовок + ровно одна пачка (8), а не все 49 сообщений сразу.
       expect(sendMessageMock).toHaveBeenCalledTimes(9);
       const [, , extra] = sendMessageMock.mock.calls[8] as [unknown, string, any];
       expect(extra.reply_markup.inline_keyboard[0][0].callback_data).toBe('curated_more:sknews.kz:8');
+    });
+
+    it('/curated all отправляет весь набор пачками, новые сверху', async () => {
+      await boot();
+      const ctx = makeCtx(-1001, { message: { text: '/curated all' } });
+      const all = curated.sortedByDate();
+
+      await runWithFakeTimers(() => commandHandlers.get('curated')!(ctx));
+
+      expect(sendMessageMock).toHaveBeenCalledTimes(9); // заголовок + первая пачка из 8
+      const [, header] = sendMessageMock.mock.calls[0] as [unknown, string, any];
+      expect(header).toContain(`карточек: ${all.length}`);
+      expect(header).toContain('показаны 1–8');
+      const [, first] = sendMessageMock.mock.calls[1] as [unknown, string, any];
+      expect(first).toBe(curated.formatMessage(all[0]));
+      const [, , extra] = sendMessageMock.mock.calls[8] as [unknown, string, any];
+      expect(extra.reply_markup.inline_keyboard[0][0].callback_data).toBe('curated_more:all:8');
+    });
+
+    it('"all" не совпадает ни с одним реальным изданием набора', () => {
+      expect(curated.bySource('all')).toHaveLength(0);
     });
 
     it('/curated без аргумента и с неизвестным изданием подсказывает список доменов', async () => {
@@ -993,7 +1040,7 @@ describe('TelegramBotService (closed-pool bot)', () => {
       const items = curated.bySource('sknews.kz');
       const ctx = makeCtx(-1001, { match: ['curated_more:sknews.kz:8'] });
 
-      await handler(ctx);
+      await runWithFakeTimers(() => handler(ctx));
 
       expect(ctx.editMessageReplyMarkup).toHaveBeenCalled();
       const [, header] = sendMessageMock.mock.calls[0] as [unknown, string, any];

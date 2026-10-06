@@ -156,7 +156,7 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
         { command: 'search', description: 'Упоминания из пула ссылок за период' },
         { command: 'reset', description: 'Сбросить пул: удалить упоминания, вернуть ссылки в очередь' },
         { command: 'curated_stats', description: 'Проверенные карточки: сколько и какая тональность' },
-        { command: 'curated', description: 'Проверенные карточки одного издания, например /curated sknews.kz' },
+        { command: 'curated', description: 'Проверенные карточки: /curated all или /curated sknews.kz' },
       ]);
     } catch (error) {
       this.logger.warn(`Не удалось задать список команд бота (не критично): ${describeError(error)}`);
@@ -339,7 +339,7 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
       }
 
       const domain = (ctx.message as { text?: string } | undefined)?.text?.trim().split(/\s+/)[1]?.toLowerCase() ?? null;
-      const items = domain ? this.curatedMentionsService.bySource(domain) : [];
+      const items = domain ? this.curatedSelection(domain) : [];
       if (items.length === 0) {
         await ctx.reply(buildCuratedSourceUsageText(domain, this.curatedDomains()), {
           parse_mode: 'HTML',
@@ -367,7 +367,7 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
         return;
       }
 
-      const items = this.curatedMentionsService.bySource(parsed.domain);
+      const items = this.curatedSelection(parsed.domain);
       if (items.length === 0) {
         await ctx.answerCbQuery('Издание не найдено');
         return;
@@ -616,6 +616,19 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
   /** Домены изданий набора, по одному разу, в алфавитном порядке — для подсказки в /curated. */
   private curatedDomains(): string[] {
     return [...new Set(this.curatedMentionsService.all().map((m) => m.sourceDomain))].sort();
+  }
+
+  /**
+   * Что отправляет `/curated <аргумент>`: `all` — весь набор, новые сверху; иначе карточки
+   * одного издания.
+   *
+   * `all` существует ради деплоя на Vercel: там нет ни шелла, ни расписания, поэтому
+   * `npm run send:curated` запустить неоткуда, и выгрузить весь набор в чат можно только
+   * командой бота. Домен `all` ни с чем не конфликтует — это не валидное имя хоста, и в
+   * наборе такого издания нет (закреплено тестом).
+   */
+  private curatedSelection(argument: string): CuratedMention[] {
+    return argument === 'all' ? this.curatedMentionsService.sortedByDate() : this.curatedMentionsService.bySource(argument);
   }
 
   /**

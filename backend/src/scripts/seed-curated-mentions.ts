@@ -2,7 +2,8 @@ import { AppDataSource } from '../database/data-source';
 import { describeDatabase } from './curated-script-context';
 import { hashMentionText } from '../common/hash.util';
 import { Mention, MentionSourceType } from '../mentions/mention.entity';
-import { CuratedLink } from '../curated/curated-link.entity';
+import { CuratedLink, CuratedLinkStatus } from '../curated/curated-link.entity';
+import { CURATED_SOURCE_NAME, CURATED_SOURCE_URL } from '../curated/curated-source-bootstrap.service';
 import { Source, SourceKind, SourceStatus } from '../sources/source.entity';
 import {
   CURATED_MENTIONS,
@@ -44,13 +45,28 @@ import {
  * нельзя. Кроме того, createIfNew не умеет принимать ни готовую тональность, ни
  * `sentimentManual`: он жёстко ставит `notificationSent = isBackfill` и считает тональность сам.
  *
- * Три замка, которые ставит скрипт:
+ * Связь со ссылкой пула (`curated_link_id`) — обязательна, а не косметика
+ * -------------------------------------------------------------------
+ * CuratedSearchService строит и `/search`, и `/status` по условию `curatedLinkId IS NOT NULL`.
+ * Упоминание без этой связи для бота просто не существует — карточки оказались бы в базе, но ни
+ * в поиске, ни в статистике не появились бы.
+ *
+ * Второе следствие важнее. Ссылка, оставшаяся в статусе `pending`, рано или поздно будет
+ * обработана пулом (ленивый проход внутри `/search`, CURATED_LAZY_PROCESS), и он вставит ВТОРОЕ
+ * упоминание на ту же статью: вставки пула идут со `skipDedup: true`, а найти уже существующую
+ * строку он умеет только через `curated_link_id`. Поэтому скрипт проставляет связь и переводит
+ * ссылку в `processed`: карточка и есть результат обработки этой ссылки, просто написанный
+ * человеком, а не моделью. Побочный эффект — пул перестаёт тратить деньги на OpenAI и время на
+ * скачивание 162 страниц, которые человек уже прочитал руками.
+ *
+ * Четыре замка, которые ставит скрипт:
  *  - `sentimentManual = true`  — фоновый классификатор не перетрёт ручную оценку. Это проверено
  *    на уровне SQL: и MentionsService.updateSentiment, и classify-sentiment-backfill.ts пишут
  *    только `WHERE sentiment_manual = false`, а сам backfill ещё и выбирает строки тем же
  *    условием, так что карточки в выборку вообще не попадают.
  *  - `notificationSent = true` — алерт по этим упоминаниям не уйдёт.
  *  - `isBackfill = true` (только у новых строк) — пометка «историческая догрузка».
+ *  - `curated_links.status = processed` — пул не возьмёт эту ссылку в обработку заново.
  *
  * Повторный запуск идемпотентен: на вход подаются одни и те же значения, поэтому второй прогон
  * сообщает «без изменений» и ничего не пишет.
@@ -97,17 +113,38 @@ function dedupeByUrl(items: CuratedMention[]): CuratedMention[] {
 }
 
 /**
- * Источник для НОВОЙ строки. Существующие строки свой `source_id` сохраняют — у материалов пула
- * это системный источник `curated://internal`, и переписывать его значило бы задним числом
- * менять их происхождение.
+ * Системный источник пула (`curated://internal`). Карточка, привязанная к ссылке пула, должна
+ * лежать на том же источнике, что и остальные материалы пула — иначе в админском списке
+ * «Источники» она окажется в чужой строке. Запись создаётся так же, как это делает
+ * CuratedSourceBootstrapService, чтобы скрипт не зависел от того, поднимался ли уже backend.
+ */
+async function resolveCuratedSource(): Promise<Source> {
+  const repo = AppDataSource.getRepository(Source);
+  const existing = await repo.findOne({ where: { url: CURATED_SOURCE_URL } });
+  if (existing) {
+    return existing;
+  }
+  return repo.save(
+    repo.create({
+      url: CURATED_SOURCE_URL,
+      name: CURATED_SOURCE_NAME,
+      type: SourceKind.CURATED,
+      status: SourceStatus.ACTIVE,
+      createdBy: 'seed-curated',
+    }),
+  );
+}
+
+/**
+ * Источник для карточки, которой НЕТ в закрытом пуле. Сейчас таких нет (все 167 ссылок — из
+ * пула), но если набор пополнят ссылкой со стороны, ей нужен обычный источник по домену.
  *
- * Новый источник создаётся со `status = DISABLED`, а не ACTIVE, как было в черновике. Сборщик
- * сейчас ходит только по источникам, которые заводит админ через онбординг
- * (SourceOnboardingService), расписания в проекте нет — то есть ACTIVE прямо сегодня ничего бы
- * не запустил. Но ACTIVE означает «отсюда собираем», и когда фоновый сбор включат обратно, 20
- * изданий из набора начали бы обходиться краулером и плодить вторые копии тех же статей.
- * DISABLED описывает реальную роль такой записи: она нужна как подпись издания, а не как
- * источник для обхода.
+ * Создаётся со `status = DISABLED`, а не ACTIVE, как было в черновике. Сборщик сейчас ходит
+ * только по источникам, которые заводит админ через онбординг (SourceOnboardingService),
+ * расписания в проекте нет — то есть ACTIVE прямо сегодня ничего бы не запустил. Но ACTIVE
+ * означает «отсюда собираем», и когда фоновый сбор включат обратно, издания из набора начали бы
+ * обходиться краулером и плодить вторые копии тех же статей. DISABLED описывает реальную роль
+ * такой записи: подпись издания, а не источник для обхода.
  */
 async function resolveSourceForInsert(card: CuratedMention, cache: Map<string, Source>): Promise<Source> {
   const cached = cache.get(card.sourceDomain);
@@ -136,7 +173,7 @@ async function resolveSourceForInsert(card: CuratedMention, cache: Map<string, S
 }
 
 /** Поля, которые скрипт имеет право переписать у существующей строки. */
-function buildUpdate(card: CuratedMention, existing: Mention): Partial<Mention> {
+function buildUpdate(card: CuratedMention, existing: Mention, link: CuratedLink | undefined): Partial<Mention> {
   const patch: Partial<Mention> = {
     title: card.title,
     text: card.summary,
@@ -145,6 +182,16 @@ function buildUpdate(card: CuratedMention, existing: Mention): Partial<Mention> 
     sentimentManual: true,
     notificationSent: true,
   };
+
+  // Без curated_link_id карточка не видна ни в /search, ни в /status (CuratedSearchService
+  // фильтрует именно по нему), а пул позже вставит на ту же статью вторую строку.
+  if (link && existing.curatedLinkId !== link.id) {
+    patch.curatedLinkId = link.id;
+  }
+  // Ссылка пула остаётся скрытой; если строка почему-то была видимой — закрываем.
+  if (link && !existing.urlHidden) {
+    patch.urlHidden = true;
+  }
 
   // У 13.14 даты на сайте нет. Затирать уже известную дату на null незачем — это потеря
   // информации, а не перенос ручных данных; поэтому дата обновляется, только если она в
@@ -184,15 +231,20 @@ async function run(): Promise<void> {
 
   // Ссылка из закрытого пула остаётся скрытой и после вставки: иначе её увидит
   // неаутентифицированный GET /mentions, и `npm run curated:leak-check` покраснеет.
-  const poolUrls = new Set((await linksRepo.find()).map((link) => normalizeUrl(link.url)));
+  const linksByUrl = new Map<string, CuratedLink>();
+  for (const link of await linksRepo.find()) {
+    linksByUrl.set(normalizeUrl(link.url), link);
+  }
 
   const sourceCache = new Map<string, Source>();
   const existingHashes = new Set((await mentionsRepo.find({ select: ['hash'] })).map((m) => m.hash));
+  const curatedSource = await resolveCuratedSource();
 
   let inserted = 0;
   let updated = 0;
   let unchanged = 0;
   let skipped = 0;
+  let linksClosed = 0;
 
   // База называется до первой записи намеренно. backend/.env задаёт DATABASE_URL, а он в
   // resolveDbConfig() сильнее, чем DB_HOST, — поэтому запуск из backend/ идёт не в локальный
@@ -200,71 +252,96 @@ async function run(): Promise<void> {
   console.log(`База: ${describeDatabase()}`);
   console.log(
     `Карточек: ${CURATED_MENTIONS.length} (уникальных по ссылке: ${cards.length}), ` +
-      `упоминаний в базе: ${byUrl.size}, ссылок в пуле: ${poolUrls.size}`,
+      `упоминаний в базе: ${byUrl.size}, ссылок в пуле: ${linksByUrl.size}`,
   );
   console.log(DRY_RUN ? '\nРЕЖИМ --dry-run: база НЕ изменяется.\n' : '\nЗапись в базу.\n');
 
   for (const card of cards) {
     const key = normalizeUrl(card.url);
     const existing = byUrl.get(key);
+    const link = linksByUrl.get(key);
+
+    let mentionId: string | null = null;
 
     if (existing) {
-      const patch = buildUpdate(card, existing);
+      mentionId = existing.id;
+      const patch = buildUpdate(card, existing, link);
       if (isUnchanged(patch, existing)) {
         unchanged += 1;
+      } else {
+        updated += 1;
+        console.log(
+          `обновить  [${card.id}] ${card.sourceDomain}` +
+            `${link ? ' (ссылка пула, остаётся скрытой)' : ''}` +
+            ` — тональность ${existing.sentiment} -> ${patch.sentiment}`,
+        );
+        if (!DRY_RUN) {
+          await mentionsRepo.update(existing.id, patch);
+        }
+      }
+    } else {
+      const hash = hashMentionText(card.title, card.summary);
+      if (existingHashes.has(hash)) {
+        // hash — UNIQUE на уровне БД. Совпадение здесь означает, что ровно такой заголовок и
+        // пересказ уже лежат в базе под другим адресом; вставка упала бы с ошибкой уникальности.
+        skipped += 1;
+        console.warn(`пропустить [${card.id}] ${card.sourceDomain} — такой заголовок и пересказ уже есть в базе`);
         continue;
       }
-      updated += 1;
-      console.log(
-        `обновить  [${card.id}] ${card.sourceDomain}` +
-          `${existing.urlHidden ? ' (строка пула, остаётся скрытой)' : ''}` +
-          ` — тональность ${existing.sentiment} -> ${patch.sentiment}`,
-      );
+
+      // Карточка из пула ложится на системный источник пула и с его же пометками (скрытый URL,
+      // связь со ссылкой) — она и есть результат обработки этой ссылки, только написанный
+      // человеком. Карточка не из пула получает обычный источник по домену.
+      const source = link ? curatedSource : await resolveSourceForInsert(card, sourceCache);
+      inserted += 1;
+      console.log(`добавить  [${card.id}] ${card.sourceDomain}${link ? ' (ссылка пула — скрытая)' : ''}`);
+
       if (!DRY_RUN) {
-        await mentionsRepo.update(existing.id, patch);
+        const saved = await mentionsRepo.save(
+          mentionsRepo.create({
+            title: card.title,
+            text: card.summary,
+            summary: card.summary,
+            url: card.url,
+            publishedAt: toPublishedAt(card.publishedAt),
+            sourceId: source.id,
+            sourceType: MentionSourceType.NEWS,
+            // Подпись издания в /search берётся отсюда; у материалов пула это group_label из
+            // файла ссылок, а не домен (домен в выдаче восстанавливал бы половину скрытой ссылки).
+            sourceLabel: link ? link.groupLabel ?? CURATED_SOURCE_NAME : null,
+            sentiment: CURATED_SENTIMENT_TO_ENUM[card.sentiment],
+            sentimentManual: true,
+            hash,
+            keywords: KEYWORDS,
+            notificationSent: true,
+            isBackfill: true,
+            urlHidden: Boolean(link),
+            curatedLinkId: link?.id ?? null,
+          }),
+        );
+        existingHashes.add(hash);
+        mentionId = saved.id;
       }
-      continue;
     }
 
-    const hash = hashMentionText(card.title, card.summary);
-    if (existingHashes.has(hash)) {
-      // hash — UNIQUE на уровне БД. Совпадение здесь означает, что ровно такой заголовок и
-      // пересказ уже лежат в базе под другим адресом; вставка упала бы с ошибкой уникальности.
-      skipped += 1;
-      console.warn(`пропустить [${card.id}] ${card.sourceDomain} — такой заголовок и пересказ уже есть в базе`);
-      continue;
-    }
-
-    const source = await resolveSourceForInsert(card, sourceCache);
-    const urlHidden = poolUrls.has(key);
-    inserted += 1;
-    console.log(`добавить  [${card.id}] ${card.sourceDomain}${urlHidden ? ' (ссылка пула — скрытая)' : ''}`);
-
-    if (!DRY_RUN) {
-      await mentionsRepo.save(
-        mentionsRepo.create({
-          title: card.title,
-          text: card.summary,
-          summary: card.summary,
-          url: card.url,
-          publishedAt: toPublishedAt(card.publishedAt),
-          sourceId: source.id,
-          sourceType: MentionSourceType.NEWS,
-          sentiment: CURATED_SENTIMENT_TO_ENUM[card.sentiment],
-          sentimentManual: true,
-          hash,
-          keywords: KEYWORDS,
-          notificationSent: true,
-          isBackfill: true,
-          urlHidden,
-        }),
-      );
-      existingHashes.add(hash);
+    // Ссылка закрывается в `processed` и привязывается к упоминанию — иначе ленивый проход пула
+    // внутри /search обработает её заново и вставит вторую строку на ту же статью.
+    if (link && (link.status !== CuratedLinkStatus.PROCESSED || link.mentionId !== mentionId)) {
+      linksClosed += 1;
+      if (!DRY_RUN && mentionId) {
+        await linksRepo.update(link.id, {
+          status: CuratedLinkStatus.PROCESSED,
+          mentionId,
+          lastError: null,
+          processedAt: link.processedAt ?? new Date(),
+        });
+      }
     }
   }
 
   console.log(
-    `\nИтого: добавить ${inserted}, обновить ${updated}, без изменений ${unchanged}, пропустить ${skipped}.`,
+    `\nИтого: добавить ${inserted}, обновить ${updated}, без изменений ${unchanged}, пропустить ${skipped}.\n` +
+      `Ссылок пула перевести в processed: ${linksClosed} (пул не будет обрабатывать их повторно).`,
   );
   if (DRY_RUN) {
     console.log('Ничего не записано (--dry-run). Повторите команду без флага, чтобы применить.');
