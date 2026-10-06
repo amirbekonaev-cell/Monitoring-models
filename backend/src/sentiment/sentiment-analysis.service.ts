@@ -2,6 +2,7 @@ import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { Sentiment } from '../mentions/mention.entity';
 import { ParserService } from '../collectors/parser/parser.service';
+import { CURATED_SENTIMENT_TO_ENUM, findCuratedByUrl } from '../curated/curated-mentions';
 
 const FETCH_TIMEOUT_MS = 30000;
 const RESPONSES_API_URL = 'https://api.openai.com/v1/responses';
@@ -148,6 +149,24 @@ export class SentimentAnalysisService implements OnModuleInit {
     url?: string | null,
     options?: SentimentClassifyOptions,
   ): Promise<SentimentClassification | null> {
+    // Вручную проверенная карточка (curated-mentions.data.json): тональность и пересказ уже
+    // написаны человеком, поэтому модель не вызывается вообще — ни запроса, ни оплаты, ни
+    // счётчика вызовов. Проверка стоит до чтения ключа намеренно: для этих ссылок тональность
+    // определяется и без OPENAI_API_KEY. Для всех прочих URL ниже всё работает как раньше.
+    //
+    // Замечание про закрытый пул: его упоминания приходят сюда с url = null (см.
+    // MentionsService.classifySentimentInBackground — это защита от повторного скачивания
+    // страницы), поэтому для них отрабатывает не эта ветка, а sentimentManual=true, который
+    // seed:curated проставляет в БД и который блокирует перезапись на уровне SQL.
+    const curated = url ? findCuratedByUrl(url) : undefined;
+    if (curated) {
+      return {
+        sentiment: CURATED_SENTIMENT_TO_ENUM[curated.sentiment],
+        reason: curated.sentimentNote || 'тональность проставлена вручную в проверенной карточке',
+        summary: curated.summary,
+      };
+    }
+
     const apiKey = this.config.get<string>('sentimentAnalysis.apiKey');
     if (!apiKey) {
       this.logger.warn('OPENAI_API_KEY не задан — тональность оставлена как "не определена"');

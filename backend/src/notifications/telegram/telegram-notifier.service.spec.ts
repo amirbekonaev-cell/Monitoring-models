@@ -3,6 +3,7 @@ import { TelegramNotifierService } from './telegram-notifier.service';
 import { TelegramBotService } from './telegram-bot.service';
 import { Mention } from '../../mentions/mention.entity';
 import { Source } from '../../sources/source.entity';
+import { CURATED_MENTIONS, formatCuratedMessage } from '../../curated/curated-mentions';
 
 const sendMessageMock = jest.fn();
 
@@ -107,5 +108,77 @@ describe('TelegramNotifierService', () => {
 
     expect(botService.getBot).toHaveBeenCalled();
     expect(sendMessageMock).toHaveBeenCalledWith('-100', expect.any(String), expect.objectContaining({ parse_mode: 'HTML' }));
+  });
+
+  /**
+   * Интеграция с вручную проверенными карточками (curated-mentions.data.json): для ссылки из
+   * набора в Telegram должен уйти ровно написанный человеком текст, а для любой другой ссылки —
+   * прежний формат, байт в байт. Второе важнее первого: набор покрывает 168 материалов, а
+   * упоминаний в системе больше, и регрессия здесь молча испортила бы все остальные алерты.
+   */
+  describe('готовые карточки упоминаний', () => {
+    const curatedSample = CURATED_MENTIONS[0];
+
+    it('для ссылки из набора отправляет готовый текст карточки, а не собранный из mention', () => {
+      const config = makeConfig({ 'telegramBot.token': 'tok', 'telegramBot.chatId': '-100' });
+      const service = new TelegramNotifierService(config, makeTelegramBotService());
+
+      // Поля mention намеренно "испорчены": если бы сработала обычная логика, в сообщение
+      // попали бы они, а не текст карточки.
+      const message = service.formatMessage(
+        makeMention({
+          url: curatedSample.url,
+          title: 'АВТОМАТИЧЕСКИЙ ЗАГОЛОВОК, КОТОРОГО НЕ ДОЛЖНО БЫТЬ В СООБЩЕНИИ',
+          text: 'Сырой текст статьи, который не должен попасть в сообщение.',
+          summary: 'Пересказ от LLM, который не должен попасть в сообщение.',
+          sentiment: 'undefined' as Mention['sentiment'],
+        }),
+        { name: 'Какой-то источник' } as Source,
+      );
+
+      expect(message).toBe(formatCuratedMessage(curatedSample));
+      expect(message).toContain(curatedSample.title);
+      expect(message).toContain(curatedSample.summary);
+      expect(message).not.toContain('АВТОМАТИЧЕСКИЙ ЗАГОЛОВОК');
+      expect(message).not.toContain('Пересказ от LLM');
+      // Тональность берётся из карточки, а не из поля mention.sentiment ('undefined').
+      expect(message).not.toContain('⬜ Не определена');
+    });
+
+    it('находит карточку, даже если у ссылки нет завершающего слеша или есть utm-хвост', () => {
+      const config = makeConfig({ 'telegramBot.token': 'tok', 'telegramBot.chatId': '-100' });
+      const service = new TelegramNotifierService(config, makeTelegramBotService());
+      const expected = formatCuratedMessage(curatedSample);
+
+      const withoutSlash = curatedSample.url.replace(/\/+$/, '');
+      expect(service.formatMessage(makeMention({ url: withoutSlash }), null)).toBe(expected);
+      expect(service.formatMessage(makeMention({ url: `${curatedSample.url}?utm_source=telegram` }), null)).toBe(expected);
+    });
+
+    it('для ссылки вне набора сохраняет прежнюю логику формирования сообщения', () => {
+      const config = makeConfig({ 'telegramBot.token': 'tok', 'telegramBot.chatId': '-100' });
+      const service = new TelegramNotifierService(config, makeTelegramBotService());
+
+      const message = service.formatMessage(
+        makeMention({ sentiment: 'positive' as Mention['sentiment'], summary: 'QazCloud получил отраслевую награду.' }),
+        { name: 'Example.kz' } as Source,
+      );
+
+      expect(message).toContain('📝 <i>QazCloud получил отраслевую награду.</i>');
+      expect(message).toContain('<blockquote>');
+      expect(message).toContain('Example.kz');
+      expect(message).toContain('🟩 Позитив');
+    });
+
+    it('отправляет готовый текст карточки через sendMentionAlert', async () => {
+      const config = makeConfig({ 'telegramBot.token': 'tok', 'telegramBot.chatId': '-100' });
+      const service = new TelegramNotifierService(config, makeTelegramBotService());
+
+      await service.sendMentionAlert(makeMention({ url: curatedSample.url }), null);
+
+      expect(sendMessageMock).toHaveBeenCalledWith('-100', formatCuratedMessage(curatedSample), {
+        parse_mode: 'HTML',
+      });
+    });
   });
 });

@@ -3,6 +3,7 @@ import { ConfigService } from '@nestjs/config';
 import { Mention, Sentiment } from '../../mentions/mention.entity';
 import { Source } from '../../sources/source.entity';
 import { TelegramBotService } from './telegram-bot.service';
+import { findCuratedByUrl, formatCuratedMessage } from '../../curated/curated-mentions';
 
 const SNIPPET_LENGTH = 350;
 
@@ -56,6 +57,15 @@ export class TelegramNotifierService {
   }
 
   formatMessage(mention: Mention, source: Source | null): string {
+    // Для 168 вручную проверенных материалов заголовок, дата, пересказ и тональность написаны
+    // человеком (curated-mentions.data.json) — берём готовый текст и ничего не генерируем, не
+    // дополняем и не вызываем LLM. Для всех остальных ссылок ниже работает прежняя логика
+    // без единого изменения.
+    const curated = findCuratedByUrl(mention.url);
+    if (curated) {
+      return formatCuratedMessage(curated);
+    }
+
     // mention.sourceLabel wins when present — it's the explicit per-result domain returned by
     // channels that can surface more than one platform per call (K-6, consolidated web search);
     // source?.name covers everything else (one Source row per site/feed/channel).
