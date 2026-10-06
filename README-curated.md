@@ -8,34 +8,29 @@
 
 Скопируйте файлы в репозиторий, сохранив пути:
 
-```
-backend/src/curated/curated-mentions.json        ← данные (единственный источник правды)
-backend/src/curated/curated-mentions.ts          ← типы + поиск + форматирование сообщения
-backend/src/curated/curated-mentions.service.ts  ← Nest-сервис (DI)
-backend/src/curated/curated-mentions.module.ts   ← Nest-модуль
-backend/src/curated/curated-mentions.spec.ts     ← тесты целостности данных
-backend/src/scripts/seed-curated-mentions.ts     ← загрузка карточек в таблицу mentions
-backend/src/scripts/send-curated-mentions.ts     ← рассылка карточек в Telegram
-```
+Всё уже лежит в репозитории:
 
-`resolveJsonModule` в `backend/tsconfig.json` уже включён, поэтому импорт JSON заработает без
-правок конфига. Чтобы JSON попал в `dist` при сборке, добавьте в `backend/nest-cli.json`:
-
-```json
-{
-  "compilerOptions": {
-    "assets": [{ "include": "curated/*.json", "outDir": "dist" }],
-    "watchAssets": true
-  }
-}
+```
+backend/src/curated/curated-mentions.data.json          ← данные (единственный источник правды)
+backend/src/curated/curated-mentions.ts                 ← типы + поиск + форматирование сообщения
+backend/src/curated/curated-mentions.service.ts         ← Nest-сервис (DI)
+backend/src/curated/curated-mentions.module.ts          ← Nest-модуль
+backend/src/curated/curated-mentions.spec.ts            ← тесты целостности данных
+backend/src/curated/curated-mentions-message.util.ts    ← тексты команд /curated_stats, /curated
+backend/src/scripts/seed-curated-mentions.ts            ← перенос карточек в таблицу mentions
+backend/src/scripts/send-curated-mentions.ts            ← рассылка карточек в Telegram
 ```
 
-Добавьте два скрипта в `backend/package.json`:
+**Почему файл данных называется `curated-mentions.data.json`, а не `curated-mentions.json`.**
+Рядом лежит `curated-mentions.ts`. При совпадении базовых имён `tsc` разрешает импорт
+`../curated/curated-mentions` в `.ts` и собирается без единой ошибки, а Node и ts-node — в
+`.json`. Код компилировался, но в рантайме оба скрипта получали голый массив вместо модуля и
+падали на первом же вызове (`getCuratedSortedByDate is not a function`). Разные базовые имена
+убирают неоднозначность.
 
-```json
-"seed:curated": "ts-node -r tsconfig-paths/register src/scripts/seed-curated-mentions.ts",
-"send:curated": "ts-node -r tsconfig-paths/register src/scripts/send-curated-mentions.ts"
-```
+`resolveJsonModule` в `backend/tsconfig.json` уже включён. В `backend/nest-cli.json` добавлены
+`assets` (`curated/*.json` → `dist`), в `backend/package.json` — скрипты `seed:curated` и
+`send:curated`. Отдельно настраивать ничего не нужно.
 
 ## Формат одной записи
 
@@ -103,16 +98,44 @@ if (curated) return formatCuratedMessage(curated);
 
 ## Загрузка в базу
 
+> **Сначала проверьте, в какую базу вы целитесь.** `backend/.env` задаёт `DATABASE_URL`, а он в
+> `resolveDbConfig()` сильнее, чем `DB_HOST`. Поэтому `npm run seed:curated` из `backend/` идёт
+> **не в локальный docker-compose, а в удалённую базу деплоя (Neon)**. Скрипт печатает целевую
+> базу первой строкой — прочитайте её до того, как запускать без `--dry-run`.
+
 ```bash
 cd backend
-npm run seed:curated             # добавить недостающие, существующие пропустить
-npm run seed:curated -- --force  # перезаписать текст и тональность у уже залитых
+npm run seed:curated -- --dry-run   # показать план, ничего не записывая
+npm run seed:curated                # применить
+
+# то же самое, но по локальному стенду docker compose:
+DATABASE_URL= DB_HOST=127.0.0.1 DB_PORT=5432 DB_USER=postgres DB_PASSWORD=postgres DB_NAME=mentions \
+  npx ts-node -r tsconfig-paths/register src/scripts/seed-curated-mentions.ts --dry-run
 ```
 
-Что делает скрипт: находит или создаёт запись в `sources` по домену, затем пишет в `mentions`
-с `sentimentManual: true` (фоновый классификатор не перетрёт ручную оценку),
-`notificationSent: true` (бот не вывалит 168 алертов в чат разом) и `isBackfill: true`.
-Повторный запуск безопасен — идемпотентность по `url`.
+**Что делает скрипт.** Эти 167 статей уже есть в базе: их туда положил закрытый пул ссылок
+(`CuratedIngestService`) со скрытым URL (`url_hidden = true`) и с заголовком/пересказом от
+модели. Карточки описывают те же материалы, только текст и тональность в них написаны руками.
+Поэтому скрипт **не вставляет вторую строку на ту же статью**, а обновляет существующую:
+подменяет машинный текст ручным, ставит `sentimentManual = true` и `notificationSent = true`.
+Строки, которых в базе нет, добавляются; ссылка из пула и при вставке остаётся скрытой.
+
+Сопоставление идёт по нормализованному URL, а не по точному совпадению строки: в пуле ссылки
+лежат без завершающего слеша, а в карточках он есть у 79 из 167. Поиск по точному `url` нашёл
+бы только 88 статей, а для остальных 79 создал бы дубликаты — причём видимые, то есть ссылки
+закрытого пула утекли бы в неаутентифицированный `GET /mentions`.
+
+Три замка, которые ставит скрипт:
+
+- `sentimentManual = true` — фоновый классификатор не перетрёт ручную оценку. Это гарантия на
+  уровне SQL: и `MentionsService.updateSentiment`, и `classify-sentiment-backfill.ts` пишут
+  только `WHERE sentiment_manual = false`, а backfill ещё и выбирает строки тем же условием —
+  карточки в его выборку просто не попадают.
+- `notificationSent = true` — алерты по этим упоминаниям не уходят.
+- `isBackfill = true` (у новых строк) — пометка «историческая догрузка».
+
+Повторный запуск идемпотентен: на вход подаются те же значения, второй прогон сообщает «без
+изменений» и ничего не пишет.
 
 ## Рассылка в Telegram
 
@@ -127,11 +150,38 @@ npm run send:curated -- --limit=10 --delay=1500
 Нужны `TELEGRAM_BOT_TOKEN` и `TELEGRAM_CHAT_ID` в `.env`. Самое длинное сообщение — 927
 символов при лимите Telegram в 4096, так что ничего не обрежется.
 
+`--dry-run` ничего не отправляет и не ходит в сеть — его можно запускать свободно. Без флага
+скрипт шлёт настоящие сообщения в `TELEGRAM_CHAT_ID`; отменить отправку в Telegram нельзя,
+поэтому сначала посмотрите вывод с `--dry-run`.
+
+## Команды бота
+
+| Команда | Что делает |
+|---|---|
+| `/curated_stats` | Сколько карточек всего, разбивка по тональности и по изданиям |
+| `/curated <домен>` | Карточки одного издания, например `/curated sknews.kz` |
+
+Карточки уходят пачками по 8 с паузой 700 мс и кнопкой «Показать ещё»: у sknews.kz их 49, а
+Telegram пропускает в группу около 20 сообщений в минуту — отправка разом получила бы 429 на всю
+пачку. Обе команды работают только в рабочей группе (`TELEGRAM_CHAT_ID`), как `/status` и
+`/search`.
+
+## Встроено в существующий бот
+
+- `TelegramNotifierService.formatMessage` — если для `mention.url` есть карточка, уходит её
+  готовый текст; для всех остальных ссылок прежняя логика не изменилась (закреплено тестом).
+- `SentimentAnalysisService.classify` — для ссылки из набора возвращает тональность и пересказ
+  из карточки, не обращаясь к OpenAI. Проверка стоит до чтения `OPENAI_API_KEY`: для этих
+  материалов тональность определяется даже без ключа.
+
 ## Проверка
 
 ```bash
 cd backend
-npx jest src/curated/curated-mentions.spec.ts
+npx tsc --noEmit                      # типы
+npx jest src/curated                  # карточки + закрытый пул
+npx jest                              # весь набор: 41 сьют, 525 тестов
+npm run build && ls dist/curated/      # JSON должен попасть в dist
 ```
 
 Тесты проверяют: 168 записей, уникальность id, заполненность обязательных полей, корректность
@@ -167,5 +217,10 @@ The Tech — 13.
 
 ## Как править данные
 
-Правьте только `curated-mentions.json` — код трогать не нужно. После правки прогоните тесты
-и, если карточки уже в базе, `npm run seed:curated -- --force`.
+Правьте только `curated-mentions.data.json` — код трогать не нужно. После правки прогоните
+`npx jest src/curated` и, если карточки уже в базе, `npm run seed:curated` (он увидит разницу и
+обновит только изменившиеся строки).
+
+Если меняете число карточек, поправьте и ожидаемое значение в `curated-mentions.spec.ts`
+(`toHaveLength(168)`) — тест специально держит это число фиксированным, чтобы случайная потеря
+записи при редактировании JSON не прошла незамеченной.
