@@ -1,6 +1,12 @@
 import { ConfigService } from '@nestjs/config';
 import { TelegramBotService } from './telegram-bot.service';
-import { CuratedSearchService, CuratedSearchResult, CuratedMentionView, PoolStats } from '../../curated/curated-search.service';
+import {
+  CuratedMentionView,
+  CuratedSearchResult,
+  CuratedSearchSource,
+  PoolStats,
+} from '../../curated/curated-search.types';
+import { CuratedJsonSearchService } from '../../curated/curated-json-search.service';
 import { CuratedResetService } from '../../curated/curated-reset.service';
 import { CuratedLinkStatus } from '../../curated/curated-link.entity';
 import { CuratedMentionsService } from '../../curated/curated-mentions.service';
@@ -105,7 +111,6 @@ function makeSearchResult(overrides: Partial<CuratedSearchResult> = {}): Curated
       [Sentiment.UNDEFINED]: 0,
     },
     undatedCount: 0,
-    processedNow: 0,
     pool: makePoolStats(),
     ...overrides,
   };
@@ -135,13 +140,13 @@ function makeCuratedSearchService(config: {
   pool?: Partial<PoolStats>;
   searchResult?: Partial<CuratedSearchResult>;
   page?: CuratedMentionView[];
-} = {}): CuratedSearchService {
+} = {}): CuratedSearchSource {
   const pool = makePoolStats(config.pool);
   return {
     getPoolStats: jest.fn(async () => pool),
     search: jest.fn(async (periodDays: number) => makeSearchResult({ periodDays, pool, ...config.searchResult })),
     findPage: jest.fn(async () => config.page ?? []),
-  } as unknown as CuratedSearchService;
+  } as unknown as CuratedSearchSource;
 }
 
 describe('TelegramBotService (closed-pool bot)', () => {
@@ -158,13 +163,13 @@ describe('TelegramBotService (closed-pool bot)', () => {
 
   async function boot(
     chatId = '-1001',
-    curatedSearchService: CuratedSearchService = makeCuratedSearchService(),
+    curatedSearchService: CuratedSearchSource = makeCuratedSearchService(),
     mode: 'polling' | 'webhook' = 'webhook',
     curatedResetService: CuratedResetService = makeCuratedResetService(),
     extraConfig: Record<string, unknown> = {},
   ): Promise<{
     service: TelegramBotService;
-    curatedSearchService: CuratedSearchService;
+    curatedSearchService: CuratedSearchSource;
     curatedResetService: CuratedResetService;
   }> {
     const service = new TelegramBotService(
@@ -429,22 +434,52 @@ describe('TelegramBotService (closed-pool bot)', () => {
       expect(curatedSearchService.search).not.toHaveBeenCalled();
     });
 
-    it('never calls any collector service — /search only ever touches CuratedSearchService', async () => {
+    it('never calls any collector or OpenAI service — /search only ever touches the search source', async () => {
       const curatedSearchService = makeCuratedSearchService();
       await boot('-1001', curatedSearchService);
       const ctx = makeCtx('-1001');
+      // fetch is the single way out of the process for both the page reader and the OpenAI client
+      // (CuratedOpenAiReaderService / OpenAiWebSearchService), so one guard covers every path.
+      const fetchSpy = jest.spyOn(global, 'fetch').mockImplementation(() => {
+        throw new Error('сеть не должна использоваться в /search');
+      });
 
-      await actionHandlers.get('/^search_period:(\\d+)$/')!(ctx);
+      try {
+        await actionHandlers.get('/^search_period:(\\d+)$/')!(ctx);
 
-      // The mock constructor takes no collector dependencies at all — this test's real assertion
-      // is structural (see the constructor signature in telegram-bot.service.ts): TelegramBotService
-      // no longer has a way to reach RSS/Parser/Telegram/NewsAPI/VK/OpenAI web search from /search.
-      expect(curatedSearchService.search).toHaveBeenCalledWith(7, expect.any(Date));
+        expect(curatedSearchService.search).toHaveBeenCalledWith(7, expect.any(Date));
+        expect(fetchSpy).not.toHaveBeenCalled();
+      } finally {
+        fetchSpy.mockRestore();
+      }
+
+      // The real assertion is structural (see the constructor signature in telegram-bot.service.ts):
+      // the bot depends on the CuratedSearchSource interface, so it has no way to reach
+      // CuratedIngestService, CuratedOpenAiReaderService, OpenAiWebSearchService or any collector —
+      // nor does it need an OPENAI_API_KEY, which makeConfig() above never supplies.
+      expect(Object.keys(makeCuratedSearchService()).sort()).toEqual(['findPage', 'getPoolStats', 'search']);
     });
 
-    // The CURATED_LAZY_PROCESS pass inside search() downloads pool pages and classifies tone via
-    // OpenAI before reading, so the button press is followed by real seconds of work. The status
-    // line has to go out BEFORE that call, or the chat sits blank and looks broken.
+    it('/status тоже ничего не качает и обходится без OPENAI_API_KEY', async () => {
+      await boot('-1001', makeCuratedSearchService());
+      const ctx = makeCtx('-1001');
+      const fetchSpy = jest.spyOn(global, 'fetch').mockImplementation(() => {
+        throw new Error('сеть не должна использоваться в /status');
+      });
+
+      try {
+        await commandHandlers.get('status')!(ctx);
+
+        expect(ctx.reply).toHaveBeenCalled();
+        expect(fetchSpy).not.toHaveBeenCalled();
+      } finally {
+        fetchSpy.mockRestore();
+      }
+    });
+
+    // The status line goes out before search() and is replaced by the window confirmation after —
+    // feedback that the right button was registered, nothing more. It must no longer claim the bot
+    // is reading source pages or that this may take half a minute: it reads ready-made cards.
     it('posts the "ищу упоминания" status before search() starts, not after it returns', async () => {
       const order: string[] = [];
       const curatedSearchService = makeCuratedSearchService();
@@ -464,18 +499,34 @@ describe('TelegramBotService (closed-pool bot)', () => {
       expect(order).toEqual(['status', 'search', 'result']);
     });
 
-    it('reports how many links this call actually processed, and stays silent about it when none were', async () => {
-      const withWork = makeCuratedSearchService({ searchResult: { processedNow: 4 } });
-      await boot('-1001', withWork);
+    // Both lines described work the bot no longer does: it processes no sources and has no queue.
+    it('never reports processed sources or a pending queue', async () => {
+      await boot(
+        '-1001',
+        makeCuratedSearchService({
+          searchResult: { total: 1 },
+          pool: {
+            byStatus: {
+              [CuratedLinkStatus.PENDING]: 2,
+              [CuratedLinkStatus.PROCESSED]: 165,
+              [CuratedLinkStatus.NOT_RELEVANT]: 0,
+              [CuratedLinkStatus.FAILED]: 1,
+              [CuratedLinkStatus.EXCLUDED]: 0,
+            },
+          },
+          page: [makeMentionView()],
+        }),
+      );
       const ctx = makeCtx('-1001');
-      await actionHandlers.get('/^search_period:(\\d+)$/')!(ctx);
-      expect(ctx.editMessageText).toHaveBeenCalledWith(expect.stringContaining('Обработано источников в этом запросе: 4'));
 
-      const withoutWork = makeCuratedSearchService({ searchResult: { processedNow: 0 } });
-      await boot('-1001', withoutWork);
-      const ctx2 = makeCtx('-1001');
-      await actionHandlers.get('/^search_period:(\\d+)$/')!(ctx2);
-      expect(ctx2.editMessageText).not.toHaveBeenCalledWith(expect.stringContaining('Обработано источников'));
+      await actionHandlers.get('/^search_period:(\\d+)$/')!(ctx);
+
+      for (const call of (ctx.editMessageText as jest.Mock).mock.calls) {
+        expect(String(call[0])).not.toContain('Обработано источников');
+        expect(String(call[0])).not.toContain('это может занять');
+      }
+      const [, message] = sendMessageMock.mock.calls[0] as [unknown, string];
+      expect(message).not.toContain('В очереди на обработку');
     });
 
     it('still runs the search when the status edit fails (an old message can no longer be edited)', async () => {
@@ -555,7 +606,7 @@ describe('TelegramBotService (closed-pool bot)', () => {
       expect(message).not.toMatch(/https?:\/\//);
     });
 
-    it('mentions the undated count and the pending/failed queue in the header when present', async () => {
+    it('mentions the undated count in the header, and never a processing queue', async () => {
       const curatedSearchService = makeCuratedSearchService({
         searchResult: {
           total: 1,
@@ -579,7 +630,7 @@ describe('TelegramBotService (closed-pool bot)', () => {
 
       const [, message] = sendMessageMock.mock.calls[0];
       expect(message).toContain('Без даты публикации (в выборки по периоду не входят): 4');
-      expect(message).toContain('В очереди на обработку: 2 · с ошибкой: 1');
+      expect(message).not.toContain('В очереди на обработку');
     });
 
     it('shows the correct sentiment emoji for each item and a "Показать ещё" button when more remain', async () => {
@@ -610,7 +661,7 @@ describe('TelegramBotService (closed-pool bot)', () => {
           throw new Error('connection terminated unexpectedly');
         }),
         findPage: jest.fn(async () => []),
-      } as unknown as CuratedSearchService;
+      } as unknown as CuratedSearchSource;
       await boot('-1001', curatedSearchService);
       const ctx = makeCtx('-1001');
 
@@ -628,7 +679,7 @@ describe('TelegramBotService (closed-pool bot)', () => {
         getPoolStats: jest.fn(async () => makePoolStats()),
         search: jest.fn(() => new Promise<CuratedSearchResult>((resolve) => (resolveSearch = resolve))),
         findPage: jest.fn(async () => []),
-      } as unknown as CuratedSearchService;
+      } as unknown as CuratedSearchSource;
       await boot('-1001', slowCuratedSearchService);
       const ctx = makeCtx('-1001');
 
@@ -719,14 +770,14 @@ describe('TelegramBotService (closed-pool bot)', () => {
     const ONE_PER_MESSAGE = { 'curated.oneArticlePerMessage': true, 'curated.itemsPerBatch': 8 };
 
     /** findPage() that honours offset/limit, so batching and offsets are exercised for real. */
-    function makePagedSearchService(total: number): CuratedSearchService {
+    function makePagedSearchService(total: number): CuratedSearchSource {
       const pool = makePoolStats();
       const all = Array.from({ length: total }, (_, i) => makeMentionView({ id: `m-${i}`, title: `Находка ${i}` }));
       return {
         getPoolStats: jest.fn(async () => pool),
         search: jest.fn(async (periodDays: number) => makeSearchResult({ periodDays, pool, total })),
         findPage: jest.fn(async (_days: number, offset: number, limit: number) => all.slice(offset, offset + limit)),
-      } as unknown as CuratedSearchService;
+      } as unknown as CuratedSearchSource;
     }
 
     /** Runs a handler under fake timers, advancing past every inter-message pause. */

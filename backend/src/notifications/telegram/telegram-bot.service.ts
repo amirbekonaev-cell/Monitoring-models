@@ -1,8 +1,12 @@
-import { Injectable, Logger, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
+import { Inject, Injectable, Logger, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { Context, Markup, Telegraf } from 'telegraf';
 import { InlineKeyboardMarkup, Update } from 'telegraf/types';
-import { CuratedSearchService, CuratedSearchResult } from '../../curated/curated-search.service';
+import {
+  CURATED_SEARCH_SOURCE,
+  CuratedSearchResult,
+  CuratedSearchSource,
+} from '../../curated/curated-search.types';
 import { CuratedResetService } from '../../curated/curated-reset.service';
 import { CuratedMentionsService } from '../../curated/curated-mentions.service';
 import { CuratedMention } from '../../curated/curated-mentions';
@@ -67,12 +71,15 @@ export type TelegramBotMode = 'polling' | 'webhook';
  * Default: polling everywhere except Vercel (which sets VERCEL=1 itself); TELEGRAM_BOT_MODE
  * overrides it explicitly. See resolveMode() and README "Телеграм-бот: webhook или polling".
  *
- * /status is a pure DB read over the closed pool of pre-vetted links (see CuratedSearchService).
- * /search reads the same pool, but when CURATED_LAZY_PROCESS is on it first does real work:
- * downloading still-unprocessed pool pages, extracting their dates and classifying tone through
- * OpenAI, bounded by CURATED_LAZY_BUDGET_MS. That is why the period handler posts a status line
- * before calling search() — see buildSearchInProgressText. It still never crawls the web for new
- * links: the pool is closed, and nothing here may claim otherwise to the user.
+ * /status and /search both read CURATED_SEARCH_SOURCE, bound to CuratedJsonSearchService: the
+ * ready-made cards in curated-mentions.data.json, already carrying title, date, summary and
+ * sentiment. Both commands are therefore in-memory filters that answer immediately — no DB query,
+ * no page download, no OpenAI call anywhere in the path, and the bot runs with no OPENAI_API_KEY
+ * in the environment at all. The dependency is the interface, not CuratedSearchService: this class
+ * has no way to reach CuratedIngestService, CuratedOpenAiReaderService or OpenAiWebSearchService,
+ * and that is the property to preserve — it is what keeps /search fast and keeps it working when
+ * a third-party API is down. It never crawls the web for new links either: the set is closed, and
+ * nothing here may claim otherwise to the user.
  */
 @Injectable()
 export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
@@ -82,7 +89,8 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
 
   constructor(
     private readonly config: ConfigService,
-    private readonly curatedSearchService: CuratedSearchService,
+    @Inject(CURATED_SEARCH_SOURCE)
+    private readonly curatedSearchService: CuratedSearchSource,
     private readonly curatedResetService: CuratedResetService,
     private readonly curatedMentionsService: CuratedMentionsService,
   ) {}
@@ -408,10 +416,10 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
         return;
       }
 
-      // Status first, work second: search() below is not an instant DB read when the
-      // CURATED_LAZY_PROCESS pass is on — it downloads still-unprocessed pool pages and classifies
-      // their tone through OpenAI before reading (up to CURATED_LAZY_BUDGET_MS). Without this the
-      // chat shows nothing at all for those seconds and looks like the button did nothing.
+      // Acknowledges the press by replacing the period keyboard with a line naming the period,
+      // which is then replaced again by the window confirmation below. search() is an in-memory
+      // filter now, so this is no longer covering up seconds of work — it is just feedback that
+      // the right button was registered.
       try {
         await ctx.editMessageText(buildSearchInProgressText(label));
       } catch (error) {
@@ -422,7 +430,7 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
       try {
         const now = new Date();
         const result = await this.curatedSearchService.search(days, now);
-        await ctx.editMessageText(buildPeriodConfirmationText(label, result.dateFrom, result.dateTo, result.processedNow));
+        await ctx.editMessageText(buildPeriodConfirmationText(label, result.dateFrom, result.dateTo));
         await this.sendFirstResultsPage(ctx.telegram, chatId, days, label, result, now);
       } catch (error) {
         await this.replyWithSearchError(ctx.telegram, chatId, error);

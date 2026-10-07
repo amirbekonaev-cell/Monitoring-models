@@ -2,7 +2,7 @@ import { Sentiment } from '../mentions/mention.entity';
 import { formatSentiment } from '../sentiment/sentiment-display.util';
 import { CuratedLinkStatus } from './curated-link.entity';
 import { formatDateInTimezone, formatIsoDateDisplay } from './curated-date.util';
-import { CuratedMentionView, CuratedSearchResult, PoolStats } from './curated-search.service';
+import { CardSetStats, CuratedMentionView, CuratedSearchResult, PoolStats } from './curated-search.types';
 import { escapeHtml, truncateText } from './text.util';
 
 export const SEARCH_PERIOD_PROMPT_TEXT = 'За какой период показать упоминания из пула ссылок?';
@@ -13,34 +13,35 @@ const TITLE_DISPLAY_LENGTH = 200;
 const CALLBACK_DATA_MAX_BYTES = 64;
 
 /**
- * Shown the moment a period button is pressed, BEFORE CuratedSearchService.search() runs — that
- * call does real work first (the CURATED_LAZY_PROCESS pass downloads still-unprocessed pool
- * pages, extracts their dates and classifies tone through OpenAI, up to CURATED_LAZY_BUDGET_MS),
- * and without this the chat just sits silent for those seconds and looks broken.
+ * Shown the moment a period button is pressed, before the results message replaces it.
  *
- * Deliberately describes only what actually happens: reading source pages and determining tone
- * of links from the pool. It must not claim to be crawling the web for new links — it isn't, and
- * a status line that overstates what the bot does would be a lie to whoever reads it.
+ * Deliberately one short line with no promise about duration: the search is now a filter over the
+ * in-memory card set (CuratedJsonSearchService), so there is nothing to wait for. It used to warn
+ * about "up to half a minute" because the old DB path downloaded pages and called OpenAI first —
+ * saying that now would be a lie, and a status line must never overstate what the bot does.
  */
 export function buildSearchInProgressText(label: string): string {
-  return `Ищу упоминания за ${label}…\nЧитаю страницы источников из пула и определяю тональность — это может занять до полуминуты.`;
+  return `Ищу упоминания за ${label}…`;
 }
 
-export function buildPeriodConfirmationText(
-  label: string,
-  dateFrom: string,
-  dateTo: string,
-  processedNow = 0,
-): string {
-  const base = `Период: ${label} (с ${formatIsoDateDisplay(dateFrom)} по ${formatIsoDateDisplay(dateTo)})`;
-  if (processedNow <= 0) {
-    return base;
-  }
-  return `${base}\nОбработано источников в этом запросе: ${processedNow} (скачаны страницы, определена тональность).`;
+/**
+ * The resolved window, nothing else. There is deliberately no "Обработано источников в этом
+ * запросе" line any more: the bot processes no sources at all now — /search reads ready-made cards
+ * (see CuratedJsonSearchService), so the count was always 0 and the line only ever described work
+ * the old OpenAI path did.
+ */
+export function buildPeriodConfirmationText(label: string, dateFrom: string, dateTo: string): string {
+  return `Период: ${label} (с ${formatIsoDateDisplay(dateFrom)} по ${formatIsoDateDisplay(dateTo)})`;
 }
 
+/**
+ * First lines of the results message: window, totals, sentiment split.
+ *
+ * No queue line ("В очереди на обработку") any more — the cards come from a JSON file that is
+ * never processed, so there is no queue to report and the line could only ever print zeros.
+ */
 export function buildHeader(label: string, result: CuratedSearchResult): string {
-  const { total, bySentiment, undatedCount, pool, dateFrom, dateTo } = result;
+  const { total, bySentiment, undatedCount, dateFrom, dateTo } = result;
   const lines = [
     `<b>Упоминания за ${escapeHtml(label)}</b> (с ${formatIsoDateDisplay(dateFrom)} по ${formatIsoDateDisplay(dateTo)})`,
     `Всего: ${total} · 🟢 ${bySentiment[Sentiment.POSITIVE]} · 🔴 ${bySentiment[Sentiment.NEGATIVE]} · ` +
@@ -51,20 +52,21 @@ export function buildHeader(label: string, result: CuratedSearchResult): string 
     lines.push(`Без даты публикации (в выборки по периоду не входят): ${undatedCount}`);
   }
 
-  const pending = pool.byStatus[CuratedLinkStatus.PENDING] ?? 0;
-  const failed = pool.byStatus[CuratedLinkStatus.FAILED] ?? 0;
-  if (pending > 0 || failed > 0) {
-    lines.push(`В очереди на обработку: ${pending} · с ошибкой: ${failed}`);
-  }
-
   return lines.join('\n');
 }
 
-/** Empty-result text when the pool has data but nothing falls in the chosen period. */
+/**
+ * Empty-result text when there is data but nothing falls in the chosen period. Two wordings,
+ * because the two sources have genuinely different things to say about why: a set of ready-made
+ * cards has a size and a freshest date, a DB pool has a count of links it managed to process.
+ */
 export function buildEmptyPeriodText(label: string, result: CuratedSearchResult, timezone: string): string {
   const { pool } = result;
   const freshest = pool.lastArticleDate ? formatDateInTimezone(pool.lastArticleDate, timezone) : null;
   const freshestClause = freshest ? `, самая свежая статья — ${freshest}` : '';
+  if (pool.cards) {
+    return `За ${label} упоминаний не найдено. Материалов в наборе: ${pool.cards.shown}${freshestClause}.`;
+  }
   return `За ${label} упоминаний в пуле ссылок не найдено. Обработано ссылок: ${pool.byStatus[CuratedLinkStatus.PROCESSED] ?? 0}${freshestClause}.`;
 }
 
@@ -199,22 +201,58 @@ export function buildResetConfirmText(preview: { links: number; mentions: number
     `Упоминаний будет удалено: ${preview.mentions}`,
     '',
     'Это необратимо: вместе с упоминаниями пропадёт уже определённая тональность, включая ручные ' +
-      'правки в веб-интерфейсе. Повторная обработка снова потратит вызовы OpenAI.',
-    'Сами ссылки не теряются — бот обработает их заново по команде /search.',
+      'правки в веб-интерфейсе.',
+    'На /search и /status это НЕ влияет — они читают готовые карточки из curated-mentions.data.json, ' +
+      'а не эту таблицу. Затронуты только лента и дашборд.',
   ].join('\n');
 }
 
 export function buildResetDoneText(outcome: { links: number; mentionsDeleted: number }): string {
   return [
     `Пул сброшен. Удалено упоминаний: ${outcome.mentionsDeleted}, ссылок в очереди: ${outcome.links}.`,
-    'Лента и дашборд сейчас пустые — записи появятся снова по мере того, как /search будет ' +
-      'обрабатывать ссылки.',
+    'Лента и дашборд по этим ссылкам сейчас пустые — наполнить их заново можно скриптом ' +
+      'npm run seed:curated. На /search и /status сброс не повлиял.',
   ].join('\n');
 }
 
-/** /status text — pool statistics only, no URLs, no per-channel breakdown (there are no live
- *  channels left to poll — see CuratedSearchService). */
+/**
+ * /status for the ready-made card set (the bot's source — see CuratedJsonSearchService). Describes
+ * what the set contains, not how far some queue has got: these cards are written by hand and never
+ * processed, so "в очереди", "с ошибкой" and "последняя обработка" have no meaning here and
+ * printing them as zeros would only invite the question of what is stuck.
+ */
+function buildCardSetStatusText(cards: CardSetStats, pool: PoolStats, timezone: string): string {
+  const dateRange =
+    pool.firstArticleDate && pool.lastArticleDate
+      ? `${formatDateInTimezone(pool.firstArticleDate, timezone)} — ${formatDateInTimezone(pool.lastArticleDate, timezone)}`
+      : 'нет данных';
+
+  const lines = [
+    `Готовых карточек: ${cards.total} всего, доступно для /search: ${cards.shown}`,
+    `Тональность: 🟢 ${cards.bySentiment[Sentiment.POSITIVE]} · 🔴 ${cards.bySentiment[Sentiment.NEGATIVE]} · ` +
+      `🟡 ${cards.bySentiment[Sentiment.NEUTRAL]} · ⚪ ${cards.bySentiment[Sentiment.UNDEFINED]}`,
+    `Проверено: ${cards.byStatus.verified} · частично: ${cards.byStatus.partial} · по URL: ${cards.byStatus.unverified}`,
+    `Диапазон дат статей: ${dateRange}`,
+    `Без даты: ${pool.undatedMentions}`,
+  ];
+
+  if (cards.duplicates > 0) {
+    lines.push(`Скрыто как дубликаты: ${cards.duplicates}`);
+  }
+
+  return lines.join('\n');
+}
+
+/**
+ * /status text — statistics only, no URLs, no per-channel breakdown (there are no live channels
+ * left to poll). Renders the card-set variant when the stats came from the JSON source, and the
+ * link-pool variant when they came from the DB one (the CLI scripts).
+ */
 export function buildStatusText(pool: PoolStats, timezone: string): string {
+  if (pool.cards) {
+    return buildCardSetStatusText(pool.cards, pool, timezone);
+  }
+
   const byStatus = pool.byStatus;
   const dateRange =
     pool.firstArticleDate && pool.lastArticleDate

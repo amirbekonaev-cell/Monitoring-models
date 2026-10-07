@@ -376,6 +376,47 @@ describe('CuratedSearchService.findPage', () => {
   });
 });
 
+/**
+ * This service is no longer what the bot reads — /search and /status go through
+ * CuratedJsonSearchService (curated-json-search.service.spec.ts). It stays as the DB-backed
+ * implementation of the same CuratedSearchSource interface, used by the CLI inspection scripts, so
+ * the tests below still pin the SQL-level behaviour its callers rely on.
+ */
+describe('CuratedSearchService как запасной источник (БД)', () => {
+  const now = new Date('2026-09-16T07:00:00Z');
+
+  it('не заполняет cards — форматтеры должны выбрать формулировки про пул ссылок, не про набор карточек', async () => {
+    const service = new CuratedSearchService(
+      makeFakeMentionsRepo([mention({ id: 'a', publishedAt: new Date('2026-09-10T10:00:00Z') })]),
+      makeFakeCuratedLinksRepo([{ status: CuratedLinkStatus.PROCESSED, processedAt: new Date('2026-09-16T08:00:00Z') }]),
+      makeConfig(),
+      makeIngest(),
+    );
+
+    const result = await service.search(7, now);
+    const stats = await service.getPoolStats();
+
+    expect(result.pool.cards).toBeUndefined();
+    expect(stats.cards).toBeUndefined();
+    // И по-прежнему отдаёт статусы ссылок — именно их печатает npm run curated:status.
+    expect(stats.byStatus[CuratedLinkStatus.PROCESSED]).toBe(1);
+    expect(stats.lastProcessedAt).toEqual(new Date('2026-09-16T08:00:00Z'));
+  });
+
+  it('реализует тот же контракт из трёх методов, что и JSON-источник', () => {
+    const service = new CuratedSearchService(
+      makeFakeMentionsRepo([]),
+      makeFakeCuratedLinksRepo([]),
+      makeConfig(),
+      makeIngest(),
+    );
+
+    for (const method of ['search', 'findPage', 'getPoolStats'] as const) {
+      expect(typeof service[method]).toBe('function');
+    }
+  });
+});
+
 describe('CuratedSearchService.getPoolStats', () => {
   it('aggregates link status counts, mention totals, the dated article range, and last-processed time', async () => {
     const mentionsRepo = makeFakeMentionsRepo([

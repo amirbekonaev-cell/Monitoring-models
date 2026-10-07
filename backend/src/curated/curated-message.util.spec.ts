@@ -1,6 +1,6 @@
 import { Sentiment } from '../mentions/mention.entity';
 import { CuratedLinkStatus } from './curated-link.entity';
-import { CuratedMentionView, CuratedSearchResult, PoolStats } from './curated-search.service';
+import { CardSetStats, CuratedMentionView, CuratedSearchResult, PoolStats } from './curated-search.service';
 import {
   buildEmptyPeriodText,
   buildHeader,
@@ -47,7 +47,6 @@ function makeResult(overrides: Partial<CuratedSearchResult> = {}): CuratedSearch
       [Sentiment.UNDEFINED]: 0,
     },
     undatedCount: 0,
-    processedNow: 0,
     pool: makePool(),
     ...overrides,
   };
@@ -101,7 +100,9 @@ describe('buildHeader', () => {
     expect(header).toContain('Без даты публикации (в выборки по периоду не входят): 3');
   });
 
-  it('includes the queue line when there are pending or failed links', () => {
+  // The queue line is gone for good: the bot reads a JSON file that is never processed, so there
+  // is no queue, and a line printing zeros would only raise the question of what is stuck.
+  it('never prints a processing queue, even when the stats still carry pending/failed links', () => {
     const header = buildHeader(
       'Неделя',
       makeResult({
@@ -117,7 +118,8 @@ describe('buildHeader', () => {
         }),
       }),
     );
-    expect(header).toContain('В очереди на обработку: 2 · с ошибкой: 1');
+    expect(header).not.toContain('В очереди на обработку');
+    expect(header).not.toContain('с ошибкой');
   });
 
   it('never contains a URL', () => {
@@ -141,6 +143,29 @@ describe('buildEmptyPeriodText', () => {
 
   it('never contains a URL', () => {
     expect(buildEmptyPeriodText('Неделя', makeResult(), TZ)).not.toMatch(/https?:\/\//);
+  });
+
+  // The JSON source has no "processed links" to report — it has a set of a known size.
+  it('reports the set size instead of a processed-link count when the stats come from the card set', () => {
+    const pool = makePool({
+      cards: {
+        total: 168,
+        shown: 167,
+        duplicates: 1,
+        byStatus: { verified: 109, partial: 19, unverified: 39, duplicate: 0 },
+        bySentiment: {
+          [Sentiment.POSITIVE]: 120,
+          [Sentiment.NEGATIVE]: 2,
+          [Sentiment.NEUTRAL]: 44,
+          [Sentiment.UNDEFINED]: 0,
+        },
+      },
+    });
+
+    const text = buildEmptyPeriodText('Неделя', makeResult({ pool }), TZ);
+
+    expect(text).toBe('За Неделя упоминаний не найдено. Материалов в наборе: 167, самая свежая статья — 15.09.2026.');
+    expect(text).not.toContain('Обработано ссылок');
   });
 });
 
@@ -270,6 +295,53 @@ describe('buildStatusText', () => {
     const text = buildStatusText(makePool({ firstArticleDate: null, lastArticleDate: null, lastProcessedAt: null }), TZ);
     expect(text).toContain('нет данных');
     expect(text).toContain('ещё не запускалась');
+  });
+
+  // The card-set variant (PoolStats.cards present — i.e. the stats came from the JSON source the
+  // bot actually reads). It must not borrow the queue vocabulary of the link pool: these cards are
+  // written by hand, nothing processes them, and "в очереди 0 / ещё не запускалась" would describe
+  // a pipeline that does not exist.
+  describe('набор готовых карточек (источник бота)', () => {
+    function makeCards(overrides: Partial<CardSetStats> = {}): CardSetStats {
+      return {
+        total: 168,
+        shown: 167,
+        duplicates: 1,
+        byStatus: { verified: 109, partial: 19, unverified: 39, duplicate: 0 },
+        bySentiment: {
+          [Sentiment.POSITIVE]: 120,
+          [Sentiment.NEGATIVE]: 2,
+          [Sentiment.NEUTRAL]: 44,
+          [Sentiment.UNDEFINED]: 0,
+        },
+        ...overrides,
+      };
+    }
+
+    it('describes the set: sizes, sentiment split, verification, date range — and no URLs', () => {
+      const text = buildStatusText(makePool({ cards: makeCards(), undatedMentions: 1 }), TZ);
+
+      expect(text).toContain('Готовых карточек: 168 всего, доступно для /search: 167');
+      expect(text).toContain('🟢 120 · 🔴 2 · 🟡 44 · ⚪ 0');
+      expect(text).toContain('Проверено: 109 · частично: 19 · по URL: 39');
+      expect(text).toContain('10.01.2020 — 15.09.2026');
+      expect(text).toContain('Без даты: 1');
+      expect(text).toContain('Скрыто как дубликаты: 1');
+      expect(text).not.toMatch(/https?:\/\//);
+    });
+
+    it('says nothing about a queue, errors or a last processing run', () => {
+      const text = buildStatusText(makePool({ cards: makeCards() }), TZ);
+
+      expect(text).not.toContain('в очереди');
+      expect(text).not.toContain('с ошибкой');
+      expect(text).not.toContain('Последняя обработка');
+    });
+
+    it('omits the duplicates line when there are none', () => {
+      const text = buildStatusText(makePool({ cards: makeCards({ total: 167, duplicates: 0 }) }), TZ);
+      expect(text).not.toContain('Скрыто как дубликаты');
+    });
   });
 });
 

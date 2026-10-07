@@ -1,7 +1,11 @@
 /**
- * The optional top-up pass inside /search (CURATED_LAZY_PROCESS). Its contract is mostly about
- * what it must NOT do — overrun the bot's time budget, waste an OpenAI call on an article that
- * cannot appear in the requested period, or break the DB read it runs in front of.
+ * The optional top-up pass inside CuratedSearchService.search() (CURATED_LAZY_PROCESS).
+ *
+ * It is unreachable from the Telegram bot now: /search and /status read CuratedJsonSearchService,
+ * which has no ingest collaborator at all (see telegram-bot.service.spec.ts). What is tested here
+ * is the pass as the CLI scripts can still hit it, and its contract is mostly about what it must
+ * NOT do — run at all without an OpenAI key, overrun the time budget, waste a call on an article
+ * that cannot appear in the requested period, or break the DB read it runs in front of.
  */
 import { ConfigService } from '@nestjs/config';
 import { Repository } from 'typeorm';
@@ -18,6 +22,8 @@ function makeConfig(overrides: Record<string, unknown> = {}): ConfigService {
     'curated.lazyProcess': true,
     'curated.lazyMaxLinks': 10,
     'curated.lazyBudgetMs': 20000,
+    // The pass needs both the flag AND a key; the tests below that exercise processing supply one.
+    'openaiSocialSearch.apiKey': 'sk-test',
     ...overrides,
   };
   return { get: jest.fn((key: string) => values[key]) } as unknown as ConfigService;
@@ -80,6 +86,20 @@ describe('Ленивая дообработка в /search', () => {
 
     expect(ingest.findLazyCandidates).not.toHaveBeenCalled();
     expect(processLink).not.toHaveBeenCalled();
+  });
+
+  it('ничего не обрабатывает без OPENAI_API_KEY, даже когда флаг включён', async () => {
+    // Без ключа processLink() не смог бы определить ни дату, ни тональность: каждая ссылка
+    // получила бы +1 попытку и статус failed. Честный ответ — не делать ничего.
+    const processLink = jest.fn();
+    const ingest = makeIngest([makeLink('l1', 'https://example.com/a')], processLink);
+    const service = makeService(makeConfig({ 'openaiSocialSearch.apiKey': '' }), ingest);
+
+    const result = await service.search(30, NOW);
+
+    expect(ingest.findLazyCandidates).not.toHaveBeenCalled();
+    expect(processLink).not.toHaveBeenCalled();
+    expect(result.periodDays).toBe(30);
   });
 
   it('обрабатывает ожидающие ссылки перед чтением из БД', async () => {

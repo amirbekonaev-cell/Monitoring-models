@@ -8,59 +8,37 @@ import { CuratedIngestService } from './curated-ingest.service';
 import { subtractCalendarDays, zonedDateString } from './curated-date.util';
 import { extractDateFromUrl } from './curated-article-date.util';
 import { truncateText } from './text.util';
+import {
+  CURATED_DEFAULT_SOURCE_LABEL,
+  CuratedMentionView,
+  CuratedSearchResult,
+  CuratedSearchSource,
+  PoolStats,
+  zeroedLinkStatusRecord,
+  zeroedSentimentRecord,
+} from './curated-search.types';
 
-export const CURATED_DEFAULT_SOURCE_LABEL = 'Подборка материалов';
+// Re-exported so the formatters, scripts and specs that have always imported these from here keep
+// working; the definitions themselves live in curated-search.types.ts, which the JSON source
+// (CuratedJsonSearchService) shares without pulling the ingest/OpenAI chain in with them.
+export {
+  CURATED_DEFAULT_SOURCE_LABEL,
+  CURATED_SEARCH_SOURCE,
+  CardSetStats,
+  CuratedMentionView,
+  CuratedSearchResult,
+  CuratedSearchSource,
+  PoolStats,
+} from './curated-search.types';
+
 /** Default display cap for `summary` — the previous hard-coded value, kept as the default so an
- *  unset CURATED_SUMMARY_DISPLAY_CHARS changes nothing. Raise it alongside CURATED_SUMMARY_WORDS
- *  (a ~50-word summary needs roughly 420 characters, otherwise it arrives truncated mid-sentence). */
+ *  unset CURATED_SUMMARY_DISPLAY_CHARS changes nothing. The JSON source does not truncate at all
+ *  (see CuratedJsonSearchService.findPage); this cap only applies to text read out of the DB. */
 const DEFAULT_SUMMARY_DISPLAY_LENGTH = 250;
 const SNIPPET_DISPLAY_LENGTH = 200;
 /** Generous enough to cover any realistic /search message page (see curated-message.util.ts's
  *  greedy packing) without an extra round-trip — the whole pool is a few hundred links at most. */
 const PAGE_FETCH_LIMIT = 500;
-
-export interface PoolStats {
-  totalLinks: number;
-  byStatus: Record<CuratedLinkStatus, number>;
-  mentionsTotal: number;
-  undatedMentions: number;
-  firstArticleDate: Date | null;
-  lastArticleDate: Date | null;
-  lastProcessedAt: Date | null;
-}
-
-export interface CuratedSearchResult {
-  periodDays: number;
-  /** Calendar dates ("YYYY-MM-DD") in the configured timezone — see curated-date.util.ts. */
-  dateFrom: string;
-  dateTo: string;
-  total: number;
-  bySentiment: Record<Sentiment, number>;
-  /** Curated mentions with no publishedAt at all — never inside any period window, counted here instead. */
-  undatedCount: number;
-  pool: PoolStats;
-  /**
-   * How many pool links this very call actually fetched, dated and classified before reading
-   * (the CURATED_LAZY_PROCESS top-up pass, see lazyProcess). 0 when the pass is off or found
-   * nothing left to do. Reported to the user by the bot so the work it just did is visible
-   * rather than looking like an unexplained pause.
-   */
-  processedNow: number;
-}
-
-export interface CuratedMentionView {
-  id: string;
-  title: string;
-  sourceLabel: string;
-  publishedAt: Date | null;
-  sentiment: Sentiment;
-  /** LLM summary, pre-truncated to CURATED_SUMMARY_DISPLAY_CHARS (~250 by default), or null when
-   *  the mention has none yet. */
-  summary: string | null;
-  /** Pre-truncated (~200 chars) fallback built from the raw text — the message formatter uses
-   *  this only when `summary` is null. */
-  snippet: string | null;
-}
 
 /**
  * Read-only view over the closed pool of pre-vetted links (`curated_links` + the `mentions` rows
@@ -71,9 +49,16 @@ export interface CuratedMentionView {
  * Extended by ПРОМПТ 2's ingestion script (which owns writing to `curated_links`/inserting the
  * mentions themselves) — this service's public method signatures are a contract for that script's
  * callers too, so avoid changing them without a reason that touches both prompts.
+ *
+ * NOT what the Telegram bot reads any more. /search and /status go through the
+ * CURATED_SEARCH_SOURCE binding, which is CuratedJsonSearchService — the ready-made cards in
+ * curated-mentions.data.json, with no DB and no OpenAI anywhere in the path. This DB-backed
+ * implementation of the same CuratedSearchSource interface is kept for the CLI scripts that exist
+ * to inspect that pool (npm run curated:status, npm run curated:leak-check), and so the DB reading
+ * mode stays available if the pool is ever filled for real.
  */
 @Injectable()
-export class CuratedSearchService {
+export class CuratedSearchService implements CuratedSearchSource {
   private readonly logger = new Logger(CuratedSearchService.name);
 
   constructor(
@@ -116,7 +101,7 @@ export class CuratedSearchService {
   async search(periodDays: number, now: Date = new Date()): Promise<CuratedSearchResult> {
     const { tz, dateFrom, dateTo } = this.dateWindow(periodDays, now);
 
-    const processedNow = await this.lazyProcess(dateFrom, now);
+    await this.lazyProcess(dateFrom, now);
 
     const total = await this.inWindowQuery(tz, dateFrom, dateTo).getCount();
 
@@ -138,7 +123,7 @@ export class CuratedSearchService {
 
     const pool = await this.getPoolStats();
 
-    return { periodDays, dateFrom, dateTo, total, bySentiment, undatedCount, pool, processedNow };
+    return { periodDays, dateFrom, dateTo, total, bySentiment, undatedCount, pool };
   }
 
   /**
@@ -170,7 +155,13 @@ export class CuratedSearchService {
   }
 
   /**
-   * Optional top-up pass (CURATED_LAZY_PROCESS=true) run before the DB read: takes up to
+   * Optional top-up pass, OFF unless CURATED_LAZY_PROCESS=true AND an OPENAI_API_KEY is actually
+   * configured — both conditions, because the pass cannot do its job without the key and an
+   * enabled-but-keyless run would spend the whole budget collecting failures. It is unreachable
+   * from the bot either way: /search and /status read CuratedJsonSearchService, which has no
+   * ingest collaborator at all. What is left here is for the CLI scripts.
+   *
+   * What it does when it does run, before the DB read: takes up to
    * CURATED_LAZY_MAX_LINKS still-unprocessed links and processes them inside a
    * CURATED_LAZY_BUDGET_MS budget, so a pool that was only partly filled keeps catching up
    * through ordinary bot usage instead of waiting for someone to run the script.
@@ -186,6 +177,17 @@ export class CuratedSearchService {
    */
   private async lazyProcess(dateFrom: string, now: Date): Promise<number> {
     if (this.config.get<boolean>('curated.lazyProcess') !== true) {
+      return 0;
+    }
+
+    // Reading a page is free, but dating and classifying it is not: processLink() calls OpenAI.
+    // Without a key every link would burn an attempt and come back failed, so the honest answer is
+    // to do nothing rather than to damage the pool while looking busy.
+    if (!this.config.get<string>('openaiSocialSearch.apiKey')) {
+      this.logger.warn(
+        'CURATED_LAZY_PROCESS=true, но OPENAI_API_KEY не задан — ленивая дообработка пропущена ' +
+          '(чтение из БД не затронуто)',
+      );
       return 0;
     }
 
@@ -237,7 +239,7 @@ export class CuratedSearchService {
       .addSelect('COUNT(*)', 'count')
       .groupBy('c.status')
       .getRawMany<{ status: CuratedLinkStatus; count: string }>();
-    const byStatus = zeroedStatusRecord();
+    const byStatus = zeroedLinkStatusRecord();
     for (const row of byStatusRaw) {
       byStatus[row.status] = parseInt(row.count, 10);
     }
@@ -273,12 +275,4 @@ export class CuratedSearchService {
       lastProcessedAt: lastProcessed?.lastProcessedAt ?? null,
     };
   }
-}
-
-function zeroedSentimentRecord(): Record<Sentiment, number> {
-  return Object.values(Sentiment).reduce((acc, s) => ({ ...acc, [s]: 0 }), {} as Record<Sentiment, number>);
-}
-
-function zeroedStatusRecord(): Record<CuratedLinkStatus, number> {
-  return Object.values(CuratedLinkStatus).reduce((acc, s) => ({ ...acc, [s]: 0 }), {} as Record<CuratedLinkStatus, number>);
 }
