@@ -1,6 +1,7 @@
 import { BadRequestException, Body, Controller, Get, NotFoundException, Param, Patch, Query } from '@nestjs/common';
 import { MentionsService, MentionFilters } from './mentions.service';
 import { MentionSourceType, Sentiment } from './mention.entity';
+import { ALL_TIME_PERIOD_DAYS } from '../curated/search-period.util';
 
 interface RawFilterParams {
   sentiment?: string;
@@ -26,6 +27,9 @@ const PERIOD_DAYS: Record<string, number> = {
   '180d': 180,
   '365d': 365,
   '730d': 730,
+  // «Всё время» — тот же приём, что у кнопки бота (ALL_TIME_PERIOD_DAYS): окно шире любой статьи
+  // в базе, поэтому накрывает её целиком, и никакого отдельного режима в resolveRange не нужно.
+  all: ALL_TIME_PERIOD_DAYS,
 };
 
 @Controller('mentions')

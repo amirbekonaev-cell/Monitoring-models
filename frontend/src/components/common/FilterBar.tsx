@@ -21,6 +21,7 @@ const PERIOD_LABELS: Record<PeriodPreset, string> = {
   '180d': 'Полгода',
   '365d': 'Год',
   '730d': '2 года',
+  all: 'Всё время',
   custom: 'Свои даты',
 };
 

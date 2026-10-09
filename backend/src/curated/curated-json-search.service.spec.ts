@@ -16,7 +16,7 @@ import { CuratedJsonSearchService } from './curated-json-search.service';
 import { CuratedMentionsService } from './curated-mentions.service';
 import { CURATED_MENTIONS, CuratedMention } from './curated-mentions';
 import { subtractCalendarDays } from './curated-date.util';
-import { DEFAULT_SEARCH_PERIOD_DAYS } from './search-period.util';
+import { ALL_TIME_PERIOD_DAYS, DEFAULT_SEARCH_PERIOD_DAYS } from './search-period.util';
 import { Sentiment } from '../mentions/mention.entity';
 
 function makeConfig(overrides: Record<string, unknown> = {}): ConfigService {
@@ -139,6 +139,55 @@ describe('CuratedJsonSearchService.search', () => {
     expect(result.dateTo).toBe('2026-09-17');
     expect(result.dateFrom).toBe('2026-09-10');
     expect(result.total).toBe(1);
+  });
+
+  it('«Всё время» накрывает весь набор, а началом окна берёт самую старую статью', async () => {
+    const service = makeService([
+      card({ id: 'oldest', publishedAt: '2018-06-01' }),
+      card({ id: 'middle', publishedAt: '2022-03-15' }),
+      card({ id: 'newest', publishedAt: '2026-08-18' }),
+      card({ id: 'undated', publishedAt: null }),
+    ]);
+
+    const result = await service.search(ALL_TIME_PERIOD_DAYS, now);
+
+    // Не «с 21.10.1926», а дата, которая в наборе действительно есть.
+    expect(result.dateFrom).toBe('2018-06-01');
+    expect(result.dateTo).toBe('2026-09-16');
+    expect(result.total).toBe(3);
+    expect(result.undatedCount).toBe(1);
+  });
+
+  it('зажим начала окна не задевает короткие периоды', async () => {
+    const service = makeService([
+      card({ id: 'oldest', publishedAt: '2018-06-01' }),
+      card({ id: 'recent', publishedAt: '2026-09-10' }),
+    ]);
+
+    const result = await service.search(7, now);
+
+    // Начало окна осталось расчётным: 7 дней назад — это позже первой статьи.
+    expect(result.dateFrom).toBe('2026-09-09');
+    expect(result.total).toBe(1);
+  });
+
+  it('набор без дат не ломает окно — зажимать нечего', async () => {
+    const service = makeService([card({ id: 'undated', publishedAt: null })]);
+
+    const result = await service.search(ALL_TIME_PERIOD_DAYS, now);
+
+    expect(result.dateFrom).toBe(subtractCalendarDays('2026-09-16', ALL_TIME_PERIOD_DAYS));
+    expect(result.total).toBe(0);
+    expect(result.undatedCount).toBe(1);
+  });
+
+  it('набор целиком из будущего не даёт перевёрнутого окна', async () => {
+    const service = makeService([card({ id: 'future', publishedAt: '2030-01-01' })]);
+
+    const result = await service.search(ALL_TIME_PERIOD_DAYS, now);
+
+    expect(result.dateFrom <= result.dateTo).toBe(true);
+    expect(result.total).toBe(0);
   });
 
   it('правильно переходит через февраль високосного года на длинном периоде', async () => {
@@ -345,15 +394,14 @@ describe('CuratedJsonSearchService над настоящим curated-mentions.da
   it('каждая кнопка периода отдаёт ровно те карточки, что попали в окно по дате статьи', async () => {
     const now = new Date('2026-10-07T07:00:00Z');
 
+    const dated = CURATED_MENTIONS.filter((m) => m.status !== 'duplicate' && m.publishedAt !== null);
+    const earliest = dated.map((m) => m.publishedAt!).sort()[0];
+
     for (const days of DEFAULT_SEARCH_PERIOD_DAYS) {
-      const dateFrom = subtractCalendarDays('2026-10-07', days);
-      const expected = CURATED_MENTIONS.filter(
-        (m) =>
-          m.status !== 'duplicate' &&
-          m.publishedAt !== null &&
-          m.publishedAt >= dateFrom &&
-          m.publishedAt <= '2026-10-07',
-      );
+      // Ровно как в dateWindow(): у «Всё время» началом окна стоит первая статья набора,
+      // у остальных — расчётная дата. Иначе ожидание было бы «с 1926 года».
+      const dateFrom = days >= ALL_TIME_PERIOD_DAYS ? earliest : subtractCalendarDays('2026-10-07', days);
+      const expected = dated.filter((m) => m.publishedAt! >= dateFrom && m.publishedAt! <= '2026-10-07');
 
       const result = await service().search(days, now);
       const page = await service().findPage(days, 0, 500, now);
@@ -380,6 +428,41 @@ describe('CuratedJsonSearchService над настоящим curated-mentions.da
       const result = await service().search(days, now);
       expect(result.total).toBeGreaterThan(0);
       expect(await service().findPage(days, 0, 500, now)).toHaveLength(result.total);
+    }
+  });
+
+  /**
+   * «Всё время» не должно зависеть от сегодняшней даты: окно строится от самой старой статьи
+   * набора, а не вычитанием дней, поэтому набор не может со временем «вырасти» из периода. Если
+   * заменить это на вычитание (любое фиксированное число дней), тест упадёт на дате «через 50
+   * лет» — именно так и проверено.
+   */
+  it('«Всё время» отдаёт ВСЕ карточки с датой, сколько бы лет ни прошло', async () => {
+    const dated = CURATED_MENTIONS.filter((m) => m.status !== 'duplicate' && m.publishedAt !== null);
+    const earliest = dated.map((m) => m.publishedAt!).sort()[0];
+
+    // Сегодня и «через 50 лет» — выдача одна и та же, окно всё ещё накрывает набор целиком.
+    for (const today of ['2026-10-07', '2076-10-07']) {
+      const now = new Date(`${today}T07:00:00Z`);
+
+      const result = await service().search(ALL_TIME_PERIOD_DAYS, now);
+      const page = await service().findPage(ALL_TIME_PERIOD_DAYS, 0, 500, now);
+
+      expect(result.total).toBe(dated.length);
+      expect(page).toHaveLength(dated.length);
+      expect(new Set(page.map((item) => item.id))).toEqual(new Set(dated.map((m) => m.id)));
+      expect(result.dateFrom).toBe(earliest);
+      expect(result.dateTo).toBe(today);
+    }
+  });
+
+  it('«Всё время» — самый широкий период: ни один другой не находит больше', async () => {
+    const now = new Date('2026-10-07T07:00:00Z');
+    const allTime = await service().search(ALL_TIME_PERIOD_DAYS, now);
+
+    for (const days of DEFAULT_SEARCH_PERIOD_DAYS) {
+      const result = await service().search(days, now);
+      expect(result.total).toBeLessThanOrEqual(allTime.total);
     }
   });
 

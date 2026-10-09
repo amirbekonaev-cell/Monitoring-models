@@ -3,6 +3,7 @@ import { ConfigService } from '@nestjs/config';
 import { Sentiment } from '../mentions/mention.entity';
 import { CuratedLinkStatus } from './curated-link.entity';
 import { subtractCalendarDays, zonedDateString } from './curated-date.util';
+import { ALL_TIME_PERIOD_DAYS } from './search-period.util';
 import { CuratedMentionsService } from './curated-mentions.service';
 import { CURATED_SENTIMENT_TO_ENUM, CuratedMention, CuratedStatus } from './curated-mentions';
 import {
@@ -58,10 +59,40 @@ export class CuratedJsonSearchService implements CuratedSearchSource {
     return this.config.get<string>('curated.timezone') || 'Asia/Almaty';
   }
 
-  /** Same window arithmetic as the DB source: calendar days in SEARCH_TIMEZONE, not UTC ms. */
+  /**
+   * Same window arithmetic as the DB source: calendar days in SEARCH_TIMEZONE, not UTC ms.
+   *
+   * Исключение одно — «Всё время» (ALL_TIME_PERIOD_DAYS): это метка-признак, а не количество
+   * дней, поэтому дни для неё не вычитаются вовсе — началом окна берётся самая старая статья
+   * набора. Отсюда два следствия: в шапке стоит реальная дата, а не «с 21.10.1926», и период
+   * остаётся полным при любой сегодняшней дате — набор не вырастет из окна со временем.
+   *
+   * Остальные периоды не зажимаются специально: если спросили «Неделя», в шапке должна стоять
+   * неделя, даже когда весь набор новее этой недели. Иначе сообщение отвечало бы не на тот
+   * вопрос, который задали кнопкой.
+   */
   private dateWindow(periodDays: number, now: Date): { dateFrom: string; dateTo: string } {
     const dateTo = zonedDateString(now, this.timezone);
+    if (periodDays >= ALL_TIME_PERIOD_DAYS) {
+      const earliest = this.earliestCardDate();
+      // `earliest <= dateTo` — чтобы набор целиком «из будущего» не дал перевёрнутое окно
+      // (dateFrom > dateTo) в сообщении; выдача в этом случае пуста при любом dateFrom.
+      if (earliest !== null && earliest <= dateTo) {
+        return { dateFrom: earliest, dateTo };
+      }
+    }
     return { dateFrom: subtractCalendarDays(dateTo, periodDays), dateTo };
+  }
+
+  /** Самая старая дата среди видимых карточек, либо null, если дат нет вообще. */
+  private earliestCardDate(): string | null {
+    let earliest: string | null = null;
+    for (const card of this.visibleCards()) {
+      if (card.publishedAt !== null && (earliest === null || card.publishedAt < earliest)) {
+        earliest = card.publishedAt;
+      }
+    }
+    return earliest;
   }
 
   /** Cards /search may show: the deliberate duplicate must not appear twice in one period. */

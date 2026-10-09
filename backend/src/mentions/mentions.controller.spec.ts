@@ -1,6 +1,7 @@
 import { BadRequestException } from '@nestjs/common';
 import { MentionsController } from './mentions.controller';
 import { MentionsService } from './mentions.service';
+import { ALL_TIME_PERIOD_DAYS } from '../curated/search-period.util';
 
 /**
  * Focus: resolveRange()'s period presets — the exact bug found live. The frontend's period
@@ -30,10 +31,12 @@ describe('MentionsController — период /mentions и /mentions/stats', () 
   const PRESETS: [string, number][] = [
     ['7d', 7],
     ['30d', 30],
+    ['60d', 60],
     ['90d', 90],
     ['180d', 180],
     ['365d', 365],
     ['730d', 730],
+    ['all', ALL_TIME_PERIOD_DAYS],
   ];
 
   it.each(PRESETS)('resolves period=%s to a %d-day window ending now', async (period, days) => {

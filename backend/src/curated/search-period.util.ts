@@ -2,8 +2,43 @@ import { Logger } from '@nestjs/common';
 
 const logger = new Logger('SearchPeriodDays');
 
-export const DEFAULT_SEARCH_PERIOD_DAYS: readonly number[] = [1, 3, 7, 14, 30, 60, 90, 180, 365, 730];
-const MAX_SEARCH_PERIOD_DAYS = 3650;
+/**
+ * «Всё время» — метка-признак, а не количество дней, которое кто-то считает.
+ *
+ * CuratedJsonSearchService.dateWindow узнаёт это значение и строит окно
+ * [самая старая статья набора .. сегодня]. То есть сами 36500 дней нигде не вычитаются, и период
+ * остаётся полным независимо от сегодняшней даты: набор не «вырастет» из окна ни через год, ни
+ * через пятьдесят (это закреплено тестом, который прогоняет период с датой «через 50 лет»).
+ *
+ * Почему тогда число, а не признак вроде `days: 'all'`: период едет через `callback_data`
+ * (`search_period:<days>`, регулярка `\d+`), проверяется через `periodDays.includes(days)` и
+ * приходит в `search(periodDays, now)` числом. Отдельный тип пришлось бы протаскивать через все
+ * эти места; число проходит по ним без единой правки.
+ *
+ * Почему именно 36500: сортируется последним среди кнопок (список обязан возрастать), очевидно не
+ * является настоящим запросом «за N дней» и не столкнётся с периодом, который кто-то реально
+ * впишет в SEARCH_PERIOD_DAYS. Вычитание дней для него выполняется только в одном случае — когда
+ * в наборе вообще нет дат; тогда величина всё равно ни на что не влияет, находок нет при любом
+ * окне.
+ */
+export const ALL_TIME_PERIOD_DAYS = 36_500;
+
+export const DEFAULT_SEARCH_PERIOD_DAYS: readonly number[] = [
+  1,
+  3,
+  7,
+  14,
+  30,
+  60,
+  90,
+  180,
+  365,
+  730,
+  ALL_TIME_PERIOD_DAYS,
+];
+
+/** Верхняя граница значения в `SEARCH_PERIOD_DAYS`: ровно «за всё время», больше смысла нет. */
+export const MAX_SEARCH_PERIOD_DAYS = ALL_TIME_PERIOD_DAYS;
 
 /**
  * Parses `SEARCH_PERIOD_DAYS` ("1,3,7,...") into the list of period buttons /search offers.
@@ -61,6 +96,7 @@ const PERIOD_LABELS: Record<number, string> = {
   180: 'Полгода',
   365: 'Год',
   730: '2 года',
+  [ALL_TIME_PERIOD_DAYS]: 'Всё время',
 };
 
 /** Russian declension for a period button/heading; any N without a hand-written form falls back to "N дн.". */
