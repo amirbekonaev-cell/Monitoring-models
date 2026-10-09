@@ -25,6 +25,15 @@ interface FakeMentionRow {
   sourceLabel: string | null;
   summary: string | null;
   text: string | null;
+  /**
+   * Ссылка закрытого пула лежит в строке — как и в настоящей таблице `mentions`.
+   *
+   * Она здесь именно для того, чтобы её МОЖНО было утечь: если сервис однажды начнёт выбирать
+   * колонку `url` и подставлять её в CuratedMentionView, тест «никогда не отдаёт ссылку закрытого
+   * пула» упадёт. Без этого поля в фикстуре тот тест проверял бы только `null ?? null` и пропустил
+   * бы настоящую регрессию — проверено мутацией.
+   */
+  url: string;
 }
 
 function makeFakeMentionsRepo(rows: FakeMentionRow[]): Repository<Mention> {
@@ -176,6 +185,7 @@ function mention(overrides: Partial<FakeMentionRow>): FakeMentionRow {
     sourceLabel: null,
     summary: null,
     text: null,
+    url: 'https://pool.example/closed/secret-article-slug',
     ...overrides,
   };
 }
@@ -324,6 +334,31 @@ describe('CuratedSearchService.findPage', () => {
     expect(view.summary!.length).toBeLessThan(longSummary.length);
     expect(view.summary!.endsWith('…')).toBe(true);
     expect(view.snippet!.length).toBeLessThan(longText.length);
+  });
+
+  /**
+   * Вторая половина границы приватности (первая — в curated-json-search.service.spec.ts): ссылки
+   * ЗАКРЫТОГО пула не выводятся никогда. У готовых карточек `url` заполнен и бот его печатает,
+   * но этот источник отдаёт null — колонка `url` даже не выбирается в select. Тест держит это
+   * состояние: иначе добавление `url` в CuratedMentionView однажды «подтянуло» бы сюда и ссылку
+   * пула, а её видит публичный GET /mentions.
+   */
+  it('никогда не отдаёт ссылку закрытого пула — url всегда null', async () => {
+    const mentionsRepo = makeFakeMentionsRepo([
+      mention({ id: 'a', publishedAt: new Date('2026-09-10T10:00:00Z') }),
+      mention({ id: 'b', publishedAt: new Date('2026-09-11T10:00:00Z') }),
+    ]);
+    const service = new CuratedSearchService(mentionsRepo, makeFakeCuratedLinksRepo([]), makeConfig(), makeIngest());
+
+    const page = await service.findPage(7, 0, 10, now);
+
+    expect(page).toHaveLength(2);
+    for (const view of page) {
+      expect(view.url).toBeNull();
+    }
+    // Ссылка в исходных строках ЕСТЬ (см. mention()), поэтому проверка не вырождается в null ?? null.
+    expect(JSON.stringify(page)).not.toContain('secret-article-slug');
+    expect(JSON.stringify(page)).not.toMatch(/https?:\/\//);
   });
 
   // CURATED_SUMMARY_DISPLAY_CHARS. Default 250 is asserted by the test above (which configures

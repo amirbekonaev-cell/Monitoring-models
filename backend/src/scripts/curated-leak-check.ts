@@ -9,6 +9,13 @@
  * path alone is enough of a leak to check for: `the-tech.kz` appearing as a source name is
  * harmless, but `/qazcloud-i-clever-cloud-podpisali.../` identifies the exact article.
  *
+ * Про ссылки в боте. С недавних пор бот ПОКАЗЫВАЕТ ссылку в сообщении про одну статью — но только
+ * для готовых карточек (curated-mentions.data.json): это публичные материалы из списка, который
+ * человек собрал сам, и выводятся они по явному «Да» в рабочей группе. Закрытого пула это не
+ * касается: проверяемый здесь CuratedSearchService отдаёт `url = null` и не выбирает колонку `url`
+ * из базы, поэтому ни одна из проб ниже ссылку пула содержать не может — включая поштучный вывод,
+ * который для карточек её как раз печатает. См. CuratedMentionView.url.
+ *
  * Exits non-zero on any match, so it can be wired into CI. Prints counters and, on a failure,
  * WHICH endpoint and which link id leaked — never the URL itself.
  */
@@ -16,7 +23,13 @@ import { getRepositoryToken } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { CuratedLink } from '../curated/curated-link.entity';
 import { CuratedSearchService } from '../curated/curated-search.service';
-import { buildHeader, buildPage, buildStatusText } from '../curated/curated-message.util';
+import {
+  buildHeader,
+  buildItemMessages,
+  buildPage,
+  buildStatusText,
+  buildTitleListMessages,
+} from '../curated/curated-message.util';
 import { searchPeriodLabel } from '../curated/search-period.util';
 import { createCuratedScriptContext, describeDatabase } from './curated-script-context';
 
@@ -103,6 +116,14 @@ function probeContainsLink(body: string, link: CuratedLink): boolean {
 }
 
 /** Renders what the bot would actually send for /search and /status, through the real formatters. */
+/**
+ * Весь текст, который бот может собрать по ЭТОМУ источнику, в одной строке.
+ *
+ * Включает и поштучный вывод (buildItemMessages) — тот самый, который для готовых карточек
+ * печатает ссылку строкой «🔗 …». Для закрытого пула он её печатать не должен: CuratedSearchService
+ * ставит `CuratedMentionView.url = null` и колонку `url` из базы не выбирает вовсе. Если однажды
+ * ссылка пула всё-таки доедет до вью, утечку поймает именно эта проба, а не отзыв пользователя.
+ */
 async function renderBotSample(search: CuratedSearchService): Promise<string> {
   const result = await search.search(BOT_SAMPLE_PERIOD_DAYS);
   const items = await search.findPage(BOT_SAMPLE_PERIOD_DAYS, 0, 200);
@@ -111,7 +132,16 @@ async function renderBotSample(search: CuratedSearchService): Promise<string> {
 
   const header = buildHeader(label, result);
   const page = buildPage({ header, items, startIndex: 1, timezone, charLimit: 1_000_000 });
-  return [page.text, buildStatusText(result.pool, timezone)].join('\n\n');
+  const titleList = buildTitleListMessages({ header, items, startIndex: 1, timezone, charLimit: 1_000_000 });
+  const perArticle = buildItemMessages({
+    items,
+    startOffset: 0,
+    total: result.total,
+    timezone,
+    batchSize: items.length || 1,
+  });
+
+  return [page.text, ...titleList, ...perArticle.messages, buildStatusText(result.pool, timezone)].join('\n\n');
 }
 
 async function fetchText(url: string): Promise<string> {

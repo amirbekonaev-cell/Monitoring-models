@@ -125,6 +125,7 @@ function makeMentionView(overrides: Partial<CuratedMentionView> = {}): CuratedMe
     sentiment: Sentiment.POSITIVE,
     summary: 'Короткий пересказ статьи.',
     snippet: null,
+    url: null,
     ...overrides,
   };
 }
@@ -191,6 +192,22 @@ describe('TelegramBotService (closed-pool bot)', () => {
     expect(commandHandlers.has('resume')).toBe(false);
     expect(setMyCommandsMock).toHaveBeenCalled();
     expect(catchMock).toHaveBeenCalled();
+  });
+
+  /**
+   * В меню ровно три команды. /curated_stats и /curated из него убраны: они дублируют то, что
+   * делает /search, и только засоряли список. Обработчики при этом остались — проверено ниже, в
+   * describe('/curated_stats и /curated <издание>'), — то есть команда, набранная руками, и кнопки
+   * в уже отправленных сообщениях продолжают работать.
+   */
+  it('показывает в меню только /search, /status и /reset', async () => {
+    await boot();
+
+    const [commands] = setMyCommandsMock.mock.calls[0] as unknown as [{ command: string }[]];
+    expect(commands.map((c) => c.command)).toEqual(['search', 'status', 'reset']);
+    // Обработчики живы, просто не в меню.
+    expect(commandHandlers.has('curated_stats')).toBe(true);
+    expect(commandHandlers.has('curated')).toBe(true);
   });
 
   it('dispatches an incoming webhook update to the underlying Telegraf instance', async () => {
@@ -633,25 +650,64 @@ describe('TelegramBotService (closed-pool bot)', () => {
       expect(message).not.toContain('В очереди на обработку');
     });
 
-    it('shows the correct sentiment emoji for each item and a "Показать ещё" button when more remain', async () => {
+    /**
+     * Нажатая кнопка периода отвечает СПИСКОМ заголовков, а не сразу карточками: сначала обзор
+     * «что нашлось и сколько», потом вопрос, разворачивать ли статьи по одной.
+     */
+    it('отвечает списком заголовков с тональностью, без пересказов и без ссылок', async () => {
       const items = Array.from({ length: 3 }, (_, i) =>
-        makeMentionView({ id: `m-${i}`, title: `Находка ${i}`, sentiment: Sentiment.NEUTRAL }),
+        makeMentionView({
+          id: `m-${i}`,
+          title: `Находка ${i}`,
+          sentiment: Sentiment.NEUTRAL,
+          summary: 'Этот пересказ в список попадать не должен.',
+          url: `https://example.com/article-${i}`,
+        }),
       );
+      const curatedSearchService = makeCuratedSearchService({ searchResult: { total: 3 }, page: items });
+      await boot('-1001', curatedSearchService);
+      const ctx = makeCtx('-1001');
+
+      await actionHandlers.get('/^search_period:(\\d+)$/')!(ctx);
+
+      const [, message] = sendMessageMock.mock.calls[0] as [unknown, string, any];
+      expect(message).toContain('🟡 Нейтрал');
+      for (const i of [0, 1, 2]) {
+        expect(message).toContain(`Находка ${i}`);
+      }
+      // Обзор — только заголовки: ни пересказа, ни ссылки.
+      expect(message).not.toContain('Этот пересказ');
+      expect(message).not.toMatch(/https?:\/\//);
+    });
+
+    it('после списка спрашивает, выводить ли статьи по одной, кнопками Да/Нет', async () => {
       const curatedSearchService = makeCuratedSearchService({
-        searchResult: { total: 50 }, // far more than the 3 items "fetched" below -> more remain
-        page: items,
+        searchResult: { total: 3 },
+        page: [makeMentionView()],
       });
       await boot('-1001', curatedSearchService);
       const ctx = makeCtx('-1001');
 
       await actionHandlers.get('/^search_period:(\\d+)$/')!(ctx);
 
-      const [, message, extra] = sendMessageMock.mock.calls[0] as [unknown, string, any];
-      expect(message).toContain('🟡 Нейтрал · Находка 0');
-      const button = extra.reply_markup.inline_keyboard[0][0];
-      expect(button.text).toContain('Показать ещё');
-      expect(button.text).toContain('47'); // 50 total - 3 shown
-      expect(button.callback_data).toBe('search_more:7:3');
+      const [, prompt, extra] = sendMessageMock.mock.calls.at(-1) as [unknown, string, any];
+      expect(prompt).toContain('Вывести каждую статью отдельным сообщением?');
+      expect(prompt).toContain('Всего найдено: 3');
+      const [[yes], [no]] = extra.reply_markup.inline_keyboard;
+      expect(yes.callback_data).toBe('search_each:7:0');
+      expect(no.callback_data).toBe('search_each:no');
+    });
+
+    it('«Нет» закрывает вопрос и ничего больше не отправляет', async () => {
+      const curatedSearchService = makeCuratedSearchService();
+      await boot('-1001', curatedSearchService);
+      const ctx = makeCtx('-1001');
+
+      await actionHandlers.get('search_each:no')!(ctx);
+
+      expect(ctx.editMessageText).toHaveBeenCalledWith('Хорошо — оставляю только список заголовков.');
+      expect(sendMessageMock).not.toHaveBeenCalled();
+      expect(curatedSearchService.findPage).not.toHaveBeenCalled();
     });
 
     it('does not throw and reports a clear error (no stack trace, no URL) when the DB read fails', async () => {
@@ -794,39 +850,43 @@ describe('TelegramBotService (closed-pool bot)', () => {
 
     const periodHandler = () => actionHandlers.get('/^search_period:(\\d+)$/')!;
     const moreHandler = () => actionHandlers.get('/^search_more:(\\d+):(\\d+)$/')!;
+    /** «Да, по одной» и её продолжение — поток, на который теперь указывает кнопка. */
+    const eachHandler = () => actionHandlers.get('/^search_each:(\\d+):(\\d+)$/')!;
 
     function sentTexts(): string[] {
       return sendMessageMock.mock.calls.map((call) => call[1] as string);
     }
 
-    it('sends the header first, then each finding as its own message', async () => {
+    it('со включённым флагом не спрашивает: список, затем каждая находка отдельным сообщением', async () => {
       await boot('-1001', makePagedSearchService(3), 'webhook', makeCuratedResetService(), ONE_PER_MESSAGE);
 
       await runHandler(periodHandler(), makeCtx('-1001'));
 
       const texts = sentTexts();
-      expect(texts).toHaveLength(4); // header + 3 findings
+      expect(texts).toHaveLength(4); // список + 3 находки
       expect(texts[0]).toContain('Упоминания за Неделя');
       expect(texts[0]).toContain('Всего: 3');
-      expect(texts[0]).not.toContain('Находка');
+      // Вопроса нет — флаг означает «разворачивать сразу».
+      expect(texts.join('\n')).not.toContain('Вывести каждую статью');
       expect(texts[1]).toContain('1. ');
       expect(texts[1]).toContain('Находка 0');
       expect(texts[2]).toContain('2. ');
       expect(texts[3]).toContain('3. ');
     });
 
-    it('stops at SEARCH_ITEMS_PER_BATCH and offers the rest behind the same search_more button', async () => {
+    it('stops at SEARCH_ITEMS_PER_BATCH and offers the rest behind a search_each button', async () => {
       await boot('-1001', makePagedSearchService(19), 'webhook', makeCuratedResetService(), ONE_PER_MESSAGE);
 
       await runHandler(periodHandler(), makeCtx('-1001'));
 
-      expect(sentTexts()).toHaveLength(9); // header + 8 findings
-      // The button rides on the last finding of the batch; callback_data keeps its existing shape.
+      expect(sentTexts()).toHaveLength(9); // список + 8 находок
+      // Кнопка едет на последней находке пачки и продолжает ИМЕННО поштучный поток (search_each),
+      // а не упакованные страницы.
       const last = sendMessageMock.mock.calls[8] as [unknown, string, any];
       const button = last[2].reply_markup.inline_keyboard[0][0];
       expect(button.text).toBe('Показать ещё (осталось 11)');
-      expect(button.callback_data).toBe('search_more:7:8');
-      // ...and on none of the earlier ones.
+      expect(button.callback_data).toBe('search_each:7:8');
+      // ...и ни на одной из предыдущих.
       expect((sendMessageMock.mock.calls[7] as any)[2].reply_markup).toBeUndefined();
     });
 
@@ -907,15 +967,42 @@ describe('TelegramBotService (closed-pool bot)', () => {
 
       const lastCall = sendMessageMock.mock.calls[sendMessageMock.mock.calls.length - 1] as [unknown, string, any];
       expect(lastCall[1]).toContain('Показано находок: 8 из 19');
-      expect(lastCall[2].reply_markup.inline_keyboard[0][0].callback_data).toBe('search_more:7:8');
+      expect(lastCall[2].reply_markup.inline_keyboard[0][0].callback_data).toBe('search_each:7:8');
     });
 
-    it('never puts a URL in any of the messages it sends', async () => {
+    /**
+     * Граница приватности в одном месте: ссылку печатает только сообщение про одну статью, и
+     * только если источник её дал. У закрытого пула (CuratedSearchService) url всегда null —
+     * именно это и значит `url: null` в makeMentionView по умолчанию.
+     */
+    it('не печатает ссылку, когда источник её не дал (это поведение закрытого пула)', async () => {
       await boot('-1001', makePagedSearchService(19), 'webhook', makeCuratedResetService(), ONE_PER_MESSAGE);
 
       await runHandler(periodHandler(), makeCtx('-1001'));
 
       expect(sentTexts().join('\n')).not.toContain('http');
+    });
+
+    it('печатает ссылку в сообщении про статью — и только в нём, не в списке заголовков', async () => {
+      const withUrl = (total: number): CuratedSearchSource => {
+        const pool = makePoolStats();
+        const all = Array.from({ length: total }, (_, i) =>
+          makeMentionView({ id: `m-${i}`, title: `Находка ${i}`, url: `https://example.com/a-${i}` }),
+        );
+        return {
+          getPoolStats: jest.fn(async () => pool),
+          search: jest.fn(async (periodDays: number) => makeSearchResult({ periodDays, pool, total })),
+          findPage: jest.fn(async (_d: number, offset: number, limit: number) => all.slice(offset, offset + limit)),
+        } as unknown as CuratedSearchSource;
+      };
+      await boot('-1001', withUrl(2), 'webhook', makeCuratedResetService(), ONE_PER_MESSAGE);
+
+      await runHandler(periodHandler(), makeCtx('-1001'));
+
+      const texts = sentTexts();
+      expect(texts[0]).not.toMatch(/https?:\/\//); // список заголовков — без ссылок
+      expect(texts[1]).toContain('🔗 https://example.com/a-0');
+      expect(texts[2]).toContain('🔗 https://example.com/a-1');
     });
 
     it('fits a full batch well inside the 60-second Vercel ceiling', async () => {
@@ -943,18 +1030,24 @@ describe('TelegramBotService (closed-pool bot)', () => {
       }
     });
 
-    it('changes nothing when the flag is off — still one packed page, same button', async () => {
-      const items = Array.from({ length: 3 }, (_, i) => makeMentionView({ id: `m-${i}`, title: `Находка ${i}` }));
-      await boot('-1001', makeCuratedSearchService({ searchResult: { total: 50 }, page: items }));
+    it('с выключенным флагом сначала спрашивает — статьи уходят только после «Да»', async () => {
+      const curatedSearchService = makePagedSearchService(3);
+      await boot('-1001', curatedSearchService);
 
-      await periodHandler()(makeCtx('-1001'));
+      await runHandler(periodHandler(), makeCtx('-1001'));
 
-      expect(sendMessageMock).toHaveBeenCalledTimes(1);
-      const [, message, extra] = sendMessageMock.mock.calls[0] as [unknown, string, any];
-      expect(message).toContain('Упоминания за Неделя');
-      expect(message).toContain('1. ');
-      expect(message).toContain('3. ');
-      expect(extra.reply_markup.inline_keyboard[0][0].callback_data).toBe('search_more:7:3');
+      // Список + вопрос, но ни одной статьи.
+      let texts = sentTexts();
+      expect(texts).toHaveLength(2);
+      expect(texts[0]).toContain('Упоминания за Неделя');
+      expect(texts[1]).toContain('Вывести каждую статью отдельным сообщением?');
+
+      await runHandler(eachHandler(), makeCtx('-1001', { match: ['search_each:7:0', '7', '0'] }));
+
+      texts = sentTexts();
+      expect(texts).toHaveLength(5); // список + вопрос + 3 статьи
+      expect(texts[2]).toContain('Находка 0');
+      expect(texts[4]).toContain('Находка 2');
     });
   });
 

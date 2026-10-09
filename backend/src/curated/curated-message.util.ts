@@ -81,6 +81,70 @@ export function buildItemBlock(index: number, item: CuratedMentionView, timezone
   );
 }
 
+/**
+ * Одна строка списка заголовков: номер, тональность, дата, издание, заголовок. Без пересказа и
+ * без ссылки — список должен давать обзор «что нашлось и сколько», а подробности уходят в
+ * отдельное сообщение по каждой статье.
+ */
+export function buildTitleLine(index: number, item: CuratedMentionView, timezone: string): string {
+  const title = truncateText(item.title, TITLE_DISPLAY_LENGTH);
+  const published = item.publishedAt ? formatDateInTimezone(item.publishedAt, timezone) : 'дата не определена';
+  return `${index}. ${formatSentiment(item.sentiment)} ${published} · ${escapeHtml(item.sourceLabel)}\n${escapeHtml(title)}`;
+}
+
+/**
+ * Полный список заголовков найденного, разбитый на сообщения по `charLimit`.
+ *
+ * Именно список, а не упакованная страница с пересказами (buildPage): сначала читатель видит
+ * ЦЕЛИКОМ, что нашлось за период и сколько этого, и только потом решает, разворачивать ли статьи
+ * по одной. Поэтому здесь нет ни «Показать ещё», ни обрезки по количеству — все найденные
+ * заголовки обязаны уйти, сколько бы сообщений на это ни потребовалось.
+ *
+ * `header` попадает в первое сообщение и считается в тот же бюджет символов. В каждом сообщении
+ * оказывается хотя бы одна строка, даже если она одна уже длиннее лимита — пустых сообщений
+ * Telegram не принимает.
+ */
+export function buildTitleListMessages(params: {
+  header: string | null;
+  items: CuratedMentionView[];
+  /** Номер, под которым показывается `items[0]`. */
+  startIndex: number;
+  timezone: string;
+  charLimit: number;
+}): string[] {
+  const { header, items, startIndex, timezone, charLimit } = params;
+  const messages: string[] = [];
+  let current = header ?? '';
+
+  for (let i = 0; i < items.length; i++) {
+    const line = buildTitleLine(startIndex + i, items[i], timezone);
+    const candidate = current ? `${current}\n\n${line}` : line;
+    if (current && candidate.length > charLimit) {
+      messages.push(current);
+      current = line;
+      continue;
+    }
+    current = candidate;
+  }
+
+  if (current) {
+    messages.push(current);
+  }
+  return messages;
+}
+
+/** Вопрос перед разворачиванием: выводить ли каждую статью отдельным сообщением. */
+export function buildExpandPromptText(total: number): string {
+  return (
+    `Вывести каждую статью отдельным сообщением? Всего найдено: ${total}.\n` +
+    'В каждом сообщении будут пересказ и ссылка на материал.'
+  );
+}
+
+export const SEARCH_EXPAND_YES_TEXT = 'Да, по одной';
+export const SEARCH_EXPAND_NO_TEXT = 'Нет, хватит списка';
+export const SEARCH_EXPAND_DECLINED_TEXT = 'Хорошо — оставляю только список заголовков.';
+
 export interface BuiltPage {
   text: string;
   shownCount: number;
@@ -156,10 +220,30 @@ export function buildItemMessages(params: {
   const batchSize = Number.isFinite(params.batchSize) && params.batchSize > 0 ? Math.floor(params.batchSize) : 1;
 
   const batch = items.slice(0, batchSize);
-  const messages = batch.map((item, i) => buildItemBlock(startOffset + i + 1, item, timezone));
+  const messages = batch.map((item, i) => withLink(buildItemBlock(startOffset + i + 1, item, timezone), item));
   const nextOffset = startOffset + batch.length;
 
   return { messages, nextOffset, remaining: Math.max(total - nextOffset, 0) };
+}
+
+/**
+ * Дописывает ссылку на материал — только в сообщении про ОДНУ статью.
+ *
+ * Ссылка живёт здесь, а не в buildItemBlock, хотя блок у них общий: buildItemBlock используется
+ * ещё и упакованной страницей (buildPage) и списком заголовков, а те обязаны оставаться без
+ * ссылок — на них же смотрит проба «Telegram formatter» в curated:leak-check. Так ссылки попадают
+ * ровно в тот вывод, который пользователь запросил кнопкой «Да, по одной».
+ *
+ * `item.url === null` у источника закрытого пула (CuratedSearchService) — тогда строки просто
+ * нет, и поведение для пула не меняется ни на символ.
+ */
+function withLink(block: string, item: CuratedMentionView): string {
+  if (!item.url) {
+    return block;
+  }
+  // Голый адрес отдельной строкой, а не <a href>: его видно целиком, можно скопировать, и он
+  // читается одинаково в превью уведомления и в самом сообщении.
+  return `${block}\n🔗 ${escapeHtml(item.url)}`;
 }
 
 /** null when the resulting callback_data would exceed Telegram's 64-byte limit (never happens for
@@ -172,6 +256,22 @@ export function buildSearchMoreCallbackData(days: number, offset: number): strin
 export function buildSearchPeriodCallbackData(days: number): string {
   return `search_period:${days}`;
 }
+
+/**
+ * Кнопка «Да, по одной» и продолжение этого же потока («Показать ещё» под последней статьёй).
+ * Отдельный префикс от `search_more`, потому что режимы разные: `search_each` всегда шлёт по
+ * одному сообщению на статью со ссылкой, независимо от SEARCH_ONE_ARTICLE_PER_MESSAGE.
+ *
+ * null — если callback_data не влезает в 64 байта Telegram (для реальных дней/смещений не
+ * случается, защитная проверка).
+ */
+export function buildSearchExpandCallbackData(days: number, offset: number): string | null {
+  const data = `search_each:${days}:${offset}`;
+  return Buffer.byteLength(data, 'utf8') <= CALLBACK_DATA_MAX_BYTES ? data : null;
+}
+
+/** Кнопка «Нет» под вопросом о разворачивании. Без периода — отвечать нечем, нужно только убрать клавиатуру. */
+export const SEARCH_EXPAND_DECLINE_CALLBACK_DATA = 'search_each:no';
 
 /**
  * Carrier text for the "Показать ещё" button in one-article-per-message mode when the button

@@ -37,8 +37,10 @@ const MS_PER_DAY = 86_400_000;
  * OpenAI to re-derive what the JSON already states. The DB pool is still readable through
  * CuratedSearchService, which the CLI inspection scripts use.
  *
- * Privacy: `CuratedMentionView` has no url field and nothing here puts one into a text field — a
- * /search message must never leak a pool link (see README "Приватность").
+ * Privacy: карточки — это публичные новостные материалы из списка, собранного человеком, поэтому
+ * `CuratedMentionView.url` здесь заполняется, и бот показывает ссылку в сообщении про одну статью
+ * (после явного «Да» пользователя). Ссылки ЗАКРЫТОГО пула это не затрагивает: их отдаёт
+ * CuratedSearchService, и там `url` всегда null — см. README "Приватность" и curated:leak-check.
  */
 @Injectable()
 export class CuratedJsonSearchService implements CuratedSearchSource {
@@ -233,7 +235,7 @@ function toMentionView(card: CuratedMention, timeZone: string): CuratedMentionVi
   return {
     id: card.id,
     title: card.title,
-    // The publication's name, never its domain or URL — see the class comment on privacy.
+    // The publication's name, not its domain — the domain belongs in the link, below.
     sourceLabel: card.sourceName,
     publishedAt: card.publishedAt ? cardDate(card.publishedAt, timeZone) : null,
     sentiment: cardSentiment(card),
@@ -241,5 +243,9 @@ function toMentionView(card: CuratedMention, timeZone: string): CuratedMentionVi
     // There is no raw article text in the JSON — the summary IS the text, so there is nothing to
     // fall back to and the formatter never reaches its snippet branch for these items.
     snippet: null,
+    // Публичный адрес материала из списка. Выводится только в сообщении про одну статью, после
+    // явного «Да» пользователя — список заголовков и упакованная страница ссылок не содержат
+    // (buildTitleListMessages / buildItemBlock). См. CuratedMentionView.url.
+    url: card.url,
   };
 }

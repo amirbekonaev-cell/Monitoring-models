@@ -242,16 +242,20 @@ describe('CuratedJsonSearchService.findPage', () => {
     expect(view.summary).not.toContain('…');
   });
 
-  it('показывает название издания и не отдаёт URL ни в одном поле', async () => {
+  /**
+   * Подписью издания идёт его НАЗВАНИЕ, а не домен: домен — часть ссылки, и ей место в отдельном
+   * поле, которое бот печатает только в сообщении про одну статью.
+   */
+  it('подписывает издание названием, а ссылку отдаёт отдельным полем', async () => {
     const service = makeService([
-      card({ id: 'a', publishedAt: '2026-09-10', sourceName: 'Profit.kz', url: 'https://profit.kz/news/secret-path/' }),
+      card({ id: 'a', publishedAt: '2026-09-10', sourceName: 'Profit.kz', url: 'https://profit.kz/news/article/' }),
     ]);
 
     const [view] = await service.findPage(7, 0, 10, now);
 
     expect(view.sourceLabel).toBe('Profit.kz');
-    expect(JSON.stringify(view)).not.toContain('secret-path');
-    expect(JSON.stringify(view)).not.toMatch(/https?:\/\//);
+    expect(view.sourceLabel).not.toContain('profit.kz/');
+    expect(view.url).toBe('https://profit.kz/news/article/');
   });
 
   it('печатает дату карточки как есть, без сдвига на сутки в любом часовом поясе', async () => {
@@ -486,10 +490,29 @@ describe('CuratedJsonSearchService над настоящим curated-mentions.da
     }
   });
 
-  it('ни одна страница /search не содержит URL', async () => {
-    const page = await service().findPage(3650, 0, 500, new Date('2026-10-07T07:00:00Z'));
+  /**
+   * Ссылка у каждой карточки — та самая, что стоит в списке, и именно её бот показывает в
+   * сообщении про статью. Проверяется по всему набору, чтобы потеря поля у одной записи не
+   * прошла незамеченной.
+   */
+  it('каждая карточка отдаёт свою ссылку, и ни одна не теряется и не подменяется', async () => {
+    const page = await service().findPage(ALL_TIME_PERIOD_DAYS, 0, 500, new Date('2026-10-07T07:00:00Z'));
 
     expect(page.length).toBeGreaterThan(100);
-    expect(JSON.stringify(page)).not.toMatch(/https?:\/\//);
+    for (const item of page) {
+      const source = CURATED_MENTIONS.find((m) => m.id === item.id)!;
+      expect(item.url).toBe(source.url);
+      expect(item.url).toMatch(/^https?:\/\//);
+    }
+  });
+
+  /** Ссылка живёт только в `url`: ни заголовок, ни подпись издания, ни пересказ её не содержат. */
+  it('ссылка не просачивается в текстовые поля карточки', async () => {
+    const page = await service().findPage(ALL_TIME_PERIOD_DAYS, 0, 500, new Date('2026-10-07T07:00:00Z'));
+
+    for (const item of page) {
+      const textFields = [item.title, item.sourceLabel, item.summary ?? '', item.snippet ?? ''].join('\n');
+      expect(textFields).not.toMatch(/https?:\/\//);
+    }
   });
 });

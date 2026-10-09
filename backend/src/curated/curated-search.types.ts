@@ -60,6 +60,21 @@ export interface CuratedMentionView {
   /** Pre-truncated (~200 chars) fallback built from the raw text — the message formatter uses
    *  this only when `summary` is null. */
   snippet: string | null;
+  /**
+   * Ссылка на статью — или null, если её выводить нельзя. Здесь проходит граница приватности, и
+   * две реализации заполняют поле по-разному намеренно:
+   *
+   *  - CuratedJsonSearchService ставит адрес из карточки. Это публичные ссылки на новостные
+   *    материалы из вручную собранного списка (curated-mentions.data.json), и бот отдаёт их в
+   *    рабочую группу по явному запросу пользователя — «Да» на вопрос о раскрытии статей.
+   *  - CuratedSearchService (закрытый пул `curated_links`) ставит null и не выбирает колонку
+   *    `url` из базы вообще. Ссылки пула не выводятся нигде — см. README «Приватность» и
+   *    `npm run curated:leak-check`, который проверяет именно этот источник.
+   *
+   * Поэтому наличие поля не ослабляет гарантию по пулу: показывается только то, что человек сам
+   * внёс в список как публичный материал.
+   */
+  url: string | null;
 }
 
 /**

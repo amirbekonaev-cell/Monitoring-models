@@ -3,14 +3,17 @@ import { CuratedLinkStatus } from './curated-link.entity';
 import { CardSetStats, CuratedMentionView, CuratedSearchResult, PoolStats } from './curated-search.service';
 import {
   buildEmptyPeriodText,
+  buildExpandPromptText,
   buildHeader,
   buildItemBlock,
   buildItemMessages,
   buildMoreButtonFallbackText,
   buildPage,
   buildPeriodConfirmationText,
+  buildSearchExpandCallbackData,
   buildSearchMoreCallbackData,
   buildStatusText,
+  buildTitleListMessages,
 } from './curated-message.util';
 
 const TZ = 'Asia/Almaty';
@@ -61,6 +64,10 @@ function makeItem(overrides: Partial<CuratedMentionView> = {}): CuratedMentionVi
     sentiment: Sentiment.NEUTRAL,
     summary: 'Короткий пересказ.',
     snippet: null,
+    // По умолчанию ссылки нет — так ведёт себя источник закрытого пула, и обзорные тексты
+    // (шапка, список заголовков, упакованная страница) обязаны оставаться без ссылок при любом
+    // источнике. Тесты про ссылку задают url явно.
+    url: null,
     ...overrides,
   };
 }
@@ -440,9 +447,13 @@ describe('buildItemMessages', () => {
     expect(batch.nextOffset).toBe(1);
   });
 
-  it('never puts a URL in a message', () => {
+  /**
+   * Граница приватности: ссылка печатается ТОЛЬКО если источник её дал. У закрытого пула
+   * (CuratedSearchService) `url` всегда null — это и есть поведение ниже.
+   */
+  it('не печатает ссылку, когда источник её не дал', () => {
     const batch = buildItemMessages({
-      items: [makeItem({ title: 'Статья', summary: 'Пересказ без ссылок.' })],
+      items: [makeItem({ title: 'Статья', summary: 'Пересказ без ссылок.', url: null })],
       startOffset: 0,
       total: 1,
       timezone: TZ,
@@ -450,6 +461,152 @@ describe('buildItemMessages', () => {
     });
 
     expect(batch.messages.join('\n')).not.toContain('http');
+  });
+
+  it('печатает ссылку отдельной строкой, когда карточка её несёт', () => {
+    const batch = buildItemMessages({
+      items: [makeItem({ title: 'Статья', url: 'https://sknews.kz/news/view/qazcloud' })],
+      startOffset: 0,
+      total: 1,
+      timezone: TZ,
+      batchSize: 8,
+    });
+
+    expect(batch.messages[0]).toContain('\n🔗 https://sknews.kz/news/view/qazcloud');
+  });
+
+  it('экранирует ссылку — она уезжает с parse_mode HTML', () => {
+    const batch = buildItemMessages({
+      items: [makeItem({ url: 'https://example.com/a?x=1&y=2' })],
+      startOffset: 0,
+      total: 1,
+      timezone: TZ,
+      batchSize: 8,
+    });
+
+    expect(batch.messages[0]).toContain('x=1&amp;y=2');
+  });
+});
+
+describe('buildTitleListMessages', () => {
+  const TZ = 'Asia/Almaty';
+
+  function titleItems(count: number): CuratedMentionView[] {
+    return Array.from({ length: count }, (_, i) =>
+      makeItem({
+        id: `m-${i}`,
+        title: `Заголовок ${i}`,
+        summary: 'Пересказ, которого в списке быть не должно.',
+        url: `https://example.com/a-${i}`,
+      }),
+    );
+  }
+
+  it('нумерует все заголовки подряд и не теряет ни одного', () => {
+    const messages = buildTitleListMessages({
+      header: 'ШАПКА',
+      items: titleItems(5),
+      startIndex: 1,
+      timezone: TZ,
+      charLimit: 3500,
+    });
+
+    const joined = messages.join('\n');
+    expect(joined).toContain('ШАПКА');
+    for (let i = 0; i < 5; i++) {
+      expect(joined).toContain(`${i + 1}. `);
+      expect(joined).toContain(`Заголовок ${i}`);
+    }
+  });
+
+  it('список — это обзор: без пересказов и без ссылок', () => {
+    const messages = buildTitleListMessages({
+      header: null,
+      items: titleItems(3),
+      startIndex: 1,
+      timezone: TZ,
+      charLimit: 3500,
+    });
+
+    const joined = messages.join('\n');
+    expect(joined).not.toContain('Пересказ, которого');
+    expect(joined).not.toMatch(/https?:\/\//);
+  });
+
+  /**
+   * Весь список обязан уехать целиком — у обзора нет «Показать ещё». Поэтому при переполнении
+   * лимита он режется на несколько сообщений, а не обрывается.
+   */
+  it('разбивает длинный список на несколько сообщений, сохраняя все строки', () => {
+    const messages = buildTitleListMessages({
+      header: 'ШАПКА',
+      items: titleItems(40),
+      startIndex: 1,
+      timezone: TZ,
+      charLimit: 400,
+    });
+
+    expect(messages.length).toBeGreaterThan(1);
+    for (const message of messages) {
+      expect(message.length).toBeLessThanOrEqual(400);
+    }
+    const numbers = messages
+      .join('\n')
+      .split('\n')
+      .filter((line) => /^\d+\. /.test(line))
+      .map((line) => parseInt(line, 10));
+    expect(numbers).toEqual(Array.from({ length: 40 }, (_, i) => i + 1));
+  });
+
+  it('одна строка длиннее лимита всё равно уходит — пустых сообщений Telegram не принимает', () => {
+    const messages = buildTitleListMessages({
+      header: null,
+      items: [makeItem({ title: 'Очень длинный заголовок '.repeat(20) })],
+      startIndex: 1,
+      timezone: TZ,
+      charLimit: 50,
+    });
+
+    expect(messages).toHaveLength(1);
+    expect(messages[0].length).toBeGreaterThan(50);
+  });
+
+  it('пустая выдача не даёт пустого сообщения', () => {
+    expect(buildTitleListMessages({ header: null, items: [], startIndex: 1, timezone: TZ, charLimit: 3500 })).toEqual([]);
+  });
+
+  it('продолжает нумерацию с startIndex', () => {
+    const [message] = buildTitleListMessages({
+      header: null,
+      items: titleItems(2),
+      startIndex: 9,
+      timezone: TZ,
+      charLimit: 3500,
+    });
+
+    expect(message).toContain('9. ');
+    expect(message).toContain('10. ');
+  });
+});
+
+describe('buildExpandPromptText', () => {
+  it('называет число найденного и обещает ссылку', () => {
+    const text = buildExpandPromptText(166);
+
+    expect(text).toContain('Вывести каждую статью отдельным сообщением?');
+    expect(text).toContain('166');
+    expect(text).toContain('ссылка');
+  });
+});
+
+describe('buildSearchExpandCallbackData', () => {
+  it('кодирует период и смещение', () => {
+    expect(buildSearchExpandCallbackData(36500, 0)).toBe('search_each:36500:0');
+    expect(buildSearchExpandCallbackData(7, 160)).toBe('search_each:7:160');
+  });
+
+  it('не отличается от search_more по длине настолько, чтобы вылезти за 64 байта', () => {
+    expect(buildSearchExpandCallbackData(36500, 999999)!.length).toBeLessThanOrEqual(64);
   });
 });
 

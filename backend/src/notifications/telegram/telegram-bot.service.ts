@@ -25,19 +25,26 @@ import {
   RESET_CANCEL_CALLBACK_DATA,
   RESET_CONFIRM_CALLBACK_DATA,
   RESET_NOTHING_TEXT,
+  SEARCH_EXPAND_DECLINED_TEXT,
+  SEARCH_EXPAND_DECLINE_CALLBACK_DATA,
+  SEARCH_EXPAND_NO_TEXT,
+  SEARCH_EXPAND_YES_TEXT,
   SEARCH_PERIOD_PROMPT_TEXT,
   buildResetConfirmText,
   buildResetDoneText,
   buildEmptyPeriodText,
+  buildExpandPromptText,
   buildHeader,
   buildItemMessages,
   buildMoreButtonFallbackText,
   buildPage,
   buildPeriodConfirmationText,
+  buildSearchExpandCallbackData,
   buildSearchMoreCallbackData,
   buildSearchInProgressText,
   buildSearchPeriodCallbackData,
   buildStatusText,
+  buildTitleListMessages,
 } from '../../curated/curated-message.util';
 
 /** How many curated mentions to pull per fetch — comfortably more than could ever fit under one
@@ -159,12 +166,14 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
     });
 
     try {
+      // Ровно три команды в меню. /curated_stats и /curated из него убраны намеренно: они дублируют
+      // то, что теперь делает /search (список найденного, затем статьи по одной со ссылкой), и
+      // только засоряли меню. Сами обработчики ниже оставлены — их можно вызвать, набрав команду
+      // руками, и кнопки в уже отправленных сообщениях продолжают работать.
       await this.bot.telegram.setMyCommands([
+        { command: 'search', description: 'Упоминания за период: список, затем статьи по одной' },
         { command: 'status', description: 'Статистика пула ссылок' },
-        { command: 'search', description: 'Упоминания из пула ссылок за период' },
         { command: 'reset', description: 'Сбросить пул: удалить упоминания, вернуть ссылки в очередь' },
-        { command: 'curated_stats', description: 'Проверенные карточки: сколько и какая тональность' },
-        { command: 'curated', description: 'Проверенные карточки: /curated all или /curated sknews.kz' },
       ]);
     } catch (error) {
       this.logger.warn(`Не удалось задать список команд бота (не критично): ${describeError(error)}`);
@@ -503,8 +512,79 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
         await this.replyWithSearchError(ctx.telegram, chatId, error);
       }
     });
+
+    // «Нет» под вопросом о разворачивании. Отвечать нечем — список заголовков уже отправлен, —
+    // поэтому только подтверждение и снятая клавиатура, чтобы вопрос не остался висеть открытым.
+    bot.action(SEARCH_EXPAND_DECLINE_CALLBACK_DATA, async (ctx) => {
+      if (!this.isAuthorizedChat(ctx.chat?.id)) {
+        await ctx.answerCbQuery('Эта команда доступна только в рабочей группе мониторинга.');
+        return;
+      }
+
+      await ctx.answerCbQuery();
+      try {
+        await ctx.editMessageText(SEARCH_EXPAND_DECLINED_TEXT);
+      } catch (error) {
+        this.logger.warn(`Не удалось закрыть вопрос о разворачивании: ${describeError(error)}`);
+      }
+    });
+
+    // «Да, по одной» и её продолжение («Показать ещё» под последней статьёй): одна статья — одно
+    // сообщение, с пересказом и ссылкой. Отдельная ветка от search_more, которая остаётся для
+    // упакованных страниц и для кнопок в уже отправленных сообщениях.
+    bot.action(/^search_each:(\d+):(\d+)$/, async (ctx) => {
+      if (!this.isAuthorizedChat(ctx.chat?.id)) {
+        await ctx.answerCbQuery('Эта команда доступна только в рабочей группе мониторинга.');
+        return;
+      }
+
+      const match = ctx.match as RegExpMatchArray;
+      const days = parseInt(match[1], 10);
+      const offset = parseInt(match[2], 10);
+      if (!this.periodDays.includes(days) || !Number.isInteger(offset) || offset < 0) {
+        await ctx.answerCbQuery('Некорректный запрос');
+        return;
+      }
+
+      await ctx.answerCbQuery();
+      const chatId = ctx.chat?.id;
+      if (chatId === undefined) {
+        return;
+      }
+
+      // Клавиатуру снимаем сразу: иначе «Да» или «Показать ещё» можно нажать второй раз и получить
+      // те же статьи дважды.
+      try {
+        await ctx.editMessageReplyMarkup({ inline_keyboard: [] });
+      } catch (error) {
+        this.logger.warn(`Не удалось снять клавиатуру с вопроса /search: ${describeError(error)}`);
+      }
+
+      try {
+        const now = new Date();
+        const result = await this.curatedSearchService.search(days, now);
+        const sent = await this.sendItemsOnePerMessage(ctx.telegram, chatId, days, result, offset, now);
+        if (sent === 0) {
+          await ctx.telegram.sendMessage(chatId, 'Больше записей нет.');
+        }
+      } catch (error) {
+        await this.replyWithSearchError(ctx.telegram, chatId, error);
+      }
+    });
   }
 
+  /**
+   * Ответ на нажатую кнопку периода: СПИСОК всего найденного, затем вопрос о разворачивании.
+   *
+   * Два шага, а не сразу полные карточки, потому что за широкий период их сотни: сначала читатель
+   * целиком видит, что нашлось и сколько (заголовок, дата, издание — по строке на материал), и
+   * только потом решает, нужны ли пересказы со ссылками по одному сообщению на статью. Список
+   * уходит ПОЛНОСТЬЮ, сколькими бы сообщениями он ни был — обрезать обзор нечем, иначе он
+   * перестаёт быть обзором.
+   *
+   * SEARCH_ONE_ARTICLE_PER_MESSAGE=true пропускает вопрос и разворачивает сразу — для чата, где
+   * его всегда подтверждают.
+   */
   private async sendFirstResultsPage(
     telegram: Telegraf['telegram'],
     chatId: number,
@@ -523,26 +603,52 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
       return;
     }
 
-    const header = buildHeader(label, result);
+    const items = await this.curatedSearchService.findPage(days, 0, result.total, now);
+    const messages = buildTitleListMessages({
+      header: buildHeader(label, result),
+      items,
+      startIndex: 1,
+      timezone: this.timezone,
+      charLimit: this.charLimit,
+    });
 
-    // One article per message: the header goes out on its own first (exactly the same text as in
-    // packed mode), then each finding as its own message. Nothing about buildPage's code path is
-    // touched when the flag is off.
+    for (let i = 0; i < messages.length; i++) {
+      if (i > 0) {
+        await sleep(ONE_PER_MESSAGE_DELAY_MS);
+      }
+      await telegram.sendMessage(chatId, messages[i], {
+        parse_mode: 'HTML',
+        link_preview_options: { is_disabled: true },
+      });
+    }
+
     if (this.oneArticlePerMessage) {
-      await telegram.sendMessage(chatId, header, { parse_mode: 'HTML', link_preview_options: { is_disabled: true } });
       await this.sendItemsOnePerMessage(telegram, chatId, days, result, 0, now);
       return;
     }
 
-    const items = await this.curatedSearchService.findPage(days, 0, PAGE_FETCH_BATCH_SIZE, now);
-    const { text, shownCount } = buildPage({ header, items, startIndex: 1, timezone: this.timezone, charLimit: this.charLimit });
-    const remaining = result.total - shownCount;
-    const replyMarkup = remaining > 0 ? this.buildMoreKeyboard(days, shownCount, remaining) : undefined;
+    await this.sendExpandPrompt(telegram, chatId, days, result.total);
+  }
 
-    await telegram.sendMessage(chatId, text, {
-      parse_mode: 'HTML',
-      link_preview_options: { is_disabled: true },
-      ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
+  /** Вопрос «выводить ли каждую статью отдельным сообщением» с кнопками Да/Нет. */
+  private async sendExpandPrompt(
+    telegram: Telegraf['telegram'],
+    chatId: number,
+    days: number,
+    total: number,
+  ): Promise<void> {
+    const yes = buildSearchExpandCallbackData(days, 0);
+    if (yes === null) {
+      // callback_data не влезло — спрашивать бессмысленно, кнопка всё равно не уедет.
+      this.logger.warn(`Не удалось собрать кнопку разворачивания для периода ${days} дн.`);
+      return;
+    }
+
+    await telegram.sendMessage(chatId, buildExpandPromptText(total), {
+      reply_markup: Markup.inlineKeyboard([
+        [Markup.button.callback(SEARCH_EXPAND_YES_TEXT, yes)],
+        [Markup.button.callback(SEARCH_EXPAND_NO_TEXT, SEARCH_EXPAND_DECLINE_CALLBACK_DATA)],
+      ]).reply_markup,
     });
   }
 
@@ -583,7 +689,7 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
       return 0;
     }
 
-    const replyMarkup = remaining > 0 ? this.buildMoreKeyboard(days, nextOffset, remaining) : undefined;
+    const replyMarkup = remaining > 0 ? this.buildEachMoreKeyboard(days, nextOffset, remaining) : undefined;
     let keyboardDelivered = replyMarkup === undefined;
 
     for (let i = 0; i < messages.length; i++) {
@@ -690,7 +796,24 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
   }
 
   private buildMoreKeyboard(days: number, offset: number, remaining: number): InlineKeyboardMarkup | undefined {
-    const callbackData = buildSearchMoreCallbackData(days, offset);
+    return this.buildContinueKeyboard(buildSearchMoreCallbackData(days, offset), days, offset, remaining);
+  }
+
+  /**
+   * «Показать ещё» для потока «одна статья — одно сообщение»: продолжает ИМЕННО его (search_each),
+   * а не упакованные страницы. Иначе нажатие после «Да, по одной» переключало бы вывод на другой
+   * формат посреди периода.
+   */
+  private buildEachMoreKeyboard(days: number, offset: number, remaining: number): InlineKeyboardMarkup | undefined {
+    return this.buildContinueKeyboard(buildSearchExpandCallbackData(days, offset), days, offset, remaining);
+  }
+
+  private buildContinueKeyboard(
+    callbackData: string | null,
+    days: number,
+    offset: number,
+    remaining: number,
+  ): InlineKeyboardMarkup | undefined {
     if (!callbackData) {
       this.logger.error(
         `callback_data для кнопки "Показать ещё" превысил 64 байта (days=${days}, offset=${offset}) — кнопка не показана`,

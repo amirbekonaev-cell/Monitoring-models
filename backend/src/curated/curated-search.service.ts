@@ -151,6 +151,9 @@ export class CuratedSearchService implements CuratedSearchSource {
       sentiment: m.sentiment,
       summary: m.summary ? truncateText(m.summary, summaryDisplayLength) : null,
       snippet: m.text ? truncateText(m.text, SNIPPET_DISPLAY_LENGTH) : null,
+      // Ссылки закрытого пула не выводятся никогда: колонка `url` даже не выбирается в select
+      // выше, так что подставить её здесь нечему. См. CuratedMentionView.url и curated:leak-check.
+      url: null,
     }));
   }
 
