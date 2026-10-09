@@ -15,6 +15,8 @@ import { ConfigService } from '@nestjs/config';
 import { CuratedJsonSearchService } from './curated-json-search.service';
 import { CuratedMentionsService } from './curated-mentions.service';
 import { CURATED_MENTIONS, CuratedMention } from './curated-mentions';
+import { subtractCalendarDays } from './curated-date.util';
+import { DEFAULT_SEARCH_PERIOD_DAYS } from './search-period.util';
 import { Sentiment } from '../mentions/mention.entity';
 
 function makeConfig(overrides: Record<string, unknown> = {}): ConfigService {
@@ -328,6 +330,56 @@ describe('CuratedJsonSearchService над настоящим curated-mentions.da
     for (const item of page) {
       const source = expected.find((m) => m.id === item.id)!;
       expect(item.summary).toBe(source.summary.trim());
+    }
+  });
+
+  /**
+   * Главная гарантия набора: для КАЖДОЙ кнопки периода выдача — это ровно те карточки, чья дата
+   * статьи попала в окно. Ни одной лишней, ни одной потерянной.
+   *
+   * Отдельным тестом, а не только на «Год»/«10 лет», потому что именно это ломалось раньше:
+   * /search ходил в таблицу `mentions`, где лежало 2 строки, и «2 месяца»/«3 месяца» отдавали
+   * почти пустой ответ при 167 готовых карточках в файле. Ожидаемое снова считается из самого
+   * файла — тест не надо править при добавлении карточки.
+   */
+  it('каждая кнопка периода отдаёт ровно те карточки, что попали в окно по дате статьи', async () => {
+    const now = new Date('2026-10-07T07:00:00Z');
+
+    for (const days of DEFAULT_SEARCH_PERIOD_DAYS) {
+      const dateFrom = subtractCalendarDays('2026-10-07', days);
+      const expected = CURATED_MENTIONS.filter(
+        (m) =>
+          m.status !== 'duplicate' &&
+          m.publishedAt !== null &&
+          m.publishedAt >= dateFrom &&
+          m.publishedAt <= '2026-10-07',
+      );
+
+      const result = await service().search(days, now);
+      const page = await service().findPage(days, 0, 500, now);
+
+      expect({ days, from: result.dateFrom, total: result.total }).toEqual({
+        days,
+        from: dateFrom,
+        total: expected.length,
+      });
+      expect(new Set(page.map((item) => item.id))).toEqual(new Set(expected.map((m) => m.id)));
+    }
+  });
+
+  it('«2 месяца» и «3 месяца» находят материалы, а не пустую выдачу', async () => {
+    // Якорь — самая свежая карточка в наборе: от неё оба окна гарантированно непустые, какой бы
+    // ни стала дата последней статьи после правки списка.
+    const newest = CURATED_MENTIONS.filter((m) => m.publishedAt !== null)
+      .map((m) => m.publishedAt!)
+      .sort()
+      .pop()!;
+    const now = new Date(`${newest}T07:00:00Z`);
+
+    for (const days of [60, 90]) {
+      const result = await service().search(days, now);
+      expect(result.total).toBeGreaterThan(0);
+      expect(await service().findPage(days, 0, 500, now)).toHaveLength(result.total);
     }
   });
 

@@ -8,8 +8,8 @@ import {
 } from './curated-mentions';
 
 describe('curated mentions', () => {
-  it('содержит все 168 карточек', () => {
-    expect(CURATED_MENTIONS).toHaveLength(168);
+  it('содержит все 167 карточек', () => {
+    expect(CURATED_MENTIONS).toHaveLength(167);
   });
 
   it('у каждой карточки заполнены обязательные поля', () => {
@@ -25,6 +25,28 @@ describe('curated mentions', () => {
   it('id уникальны', () => {
     const ids = new Set(CURATED_MENTIONS.map((m) => m.id));
     expect(ids.size).toBe(CURATED_MENTIONS.length);
+  });
+
+  /**
+   * Нормализованный URL — ключ, по которому карточку находит бот (findCuratedByUrl) и по которому
+   * seed:curated сопоставляет её со ссылкой закрытого пула. Две карточки на один ключ означают,
+   * что одна из них недостижима по ссылке, а в базе окажется одна запись вместо двух. Ровно это
+   * было у 3.14 — копии 3.10; в списке их больше нет, и тест держит это состояние.
+   */
+  it('нормализованные URL уникальны — ни одна карточка не перекрывает другую', () => {
+    const byKey = new Map<string, string[]>();
+    for (const m of CURATED_MENTIONS) {
+      const key = normalizeUrl(m.url);
+      byKey.set(key, [...(byKey.get(key) ?? []), m.id]);
+    }
+    const collisions = [...byKey.entries()].filter(([, ids]) => ids.length > 1);
+    expect(collisions).toEqual([]);
+  });
+
+  it('каждая карточка находится по своему URL', () => {
+    for (const m of CURATED_MENTIONS) {
+      expect(findCuratedByUrl(m.url)?.id).toBe(m.id);
+    }
   });
 
   it('дата либо null, либо корректный ISO-день', () => {

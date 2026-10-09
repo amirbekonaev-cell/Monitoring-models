@@ -351,20 +351,6 @@
     "status": "unverified"
   },
   {
-    "id": "3.14",
-    "sourceName": "DKNews",
-    "sourceDomain": "dknews.kz",
-    "title": "Будущее онлайн-аптек в Казахстане",
-    "url": "https://dknews.kz/ru/biznes/327160-budushchee-onlayn-aptek-v-kazahstane",
-    "publishedAt": "2024-05-20",
-    "publishedAtText": "20.05.2024",
-    "summary": "Основатель стартапа Daribar рассказал о развитии сервиса онлайн-заказа лекарств и получении гранта VK Cloud на облачную инфраструктуру. Роль QazCloud — базовая техническая опора: локализация платформы в дата-центре QazCloud обеспечила стартапу соответствие законодательству, надежную работу с данными и высокую скорость отклика для казахстанских пользователей.",
-    "sentiment": "positive",
-    "sentimentNote": "подчёркиваются ключевые преимущества локального дата-центра QazCloud — высокая надежность, скорость работы сервиса и соблюдение требований законодательства РК",
-    "status": "duplicate",
-    "duplicateOf": "3.10"
-  },
-  {
     "id": "3.15",
     "sourceName": "DKNews",
     "sourceDomain": "dknews.kz",

@@ -16,6 +16,7 @@ const PERIOD_LABELS: Record<PeriodPreset, string> = {
   today: 'Сегодня',
   '7d': '7 дней',
   '30d': '30 дней',
+  '60d': '2 месяца',
   '90d': '3 месяца',
   '180d': 'Полгода',
   '365d': 'Год',

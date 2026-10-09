@@ -21,6 +21,7 @@ const DAY_MS = 24 * 60 * 60 * 1000;
 const PERIOD_DAYS: Record<string, number> = {
   '7d': 7,
   '30d': 30,
+  '60d': 60,
   '90d': 90,
   '180d': 180,
   '365d': 365,

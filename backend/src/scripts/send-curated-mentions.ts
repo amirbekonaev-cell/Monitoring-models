@@ -13,7 +13,7 @@ import {
  *
  * Запуск:
  *   npm run send:curated -- --dry-run            показать, что уйдёт, ничего не отправляя
- *   npm run send:curated                         отправить все 168 карточек (новые сверху)
+ *   npm run send:curated                         отправить все 167 карточек (новые сверху)
  *   npm run send:curated -- --source=sknews.kz   только карточки одного издания
  *   npm run send:curated -- --id=17.13           ровно одну карточку
  *   npm run send:curated -- --limit=10           первые N карточек

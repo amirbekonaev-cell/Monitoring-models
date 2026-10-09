@@ -2,7 +2,7 @@ import { Logger } from '@nestjs/common';
 
 const logger = new Logger('SearchPeriodDays');
 
-export const DEFAULT_SEARCH_PERIOD_DAYS: readonly number[] = [1, 3, 7, 14, 30, 90, 180, 365, 730];
+export const DEFAULT_SEARCH_PERIOD_DAYS: readonly number[] = [1, 3, 7, 14, 30, 60, 90, 180, 365, 730];
 const MAX_SEARCH_PERIOD_DAYS = 3650;
 
 /**
@@ -56,6 +56,7 @@ const PERIOD_LABELS: Record<number, string> = {
   7: 'Неделя',
   14: 'Две недели',
   30: 'Месяц',
+  60: '2 месяца',
   90: '3 месяца',
   180: 'Полгода',
   365: 'Год',
