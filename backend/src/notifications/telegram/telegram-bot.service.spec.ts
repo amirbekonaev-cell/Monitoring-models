@@ -8,6 +8,7 @@ import {
 } from '../../curated/curated-search.types';
 import { CuratedJsonSearchService } from '../../curated/curated-json-search.service';
 import { CuratedResetService } from '../../curated/curated-reset.service';
+import { DashboardPublishService } from '../../curated/dashboard-publish.service';
 import { CuratedLinkStatus } from '../../curated/curated-link.entity';
 import { CuratedMentionsService } from '../../curated/curated-mentions.service';
 import { Sentiment } from '../../mentions/mention.entity';
@@ -130,6 +131,24 @@ function makeMentionView(overrides: Partial<CuratedMentionView> = {}): CuratedMe
   };
 }
 
+/**
+ * Перенос выдачи в дашборд. По умолчанию отрабатывает успешно и сообщает, сколько материалов
+ * туда легло; тест про недоступную базу подменяет publish на падающий.
+ */
+function makeDashboardPublishService(published = 3): DashboardPublishService {
+  return {
+    publish: jest.fn(async (periodDays: number) => ({
+      periodDays,
+      dateFrom: '2026-07-10',
+      dateTo: '2026-10-10',
+      removed: 0,
+      published,
+    })),
+    clear: jest.fn(async () => 0),
+    count: jest.fn(async () => 0),
+  } as unknown as DashboardPublishService;
+}
+
 function makeCuratedResetService(preview = { links: 169, mentions: 167 }): CuratedResetService {
   return {
     preview: jest.fn(async () => preview),
@@ -168,19 +187,22 @@ describe('TelegramBotService (closed-pool bot)', () => {
     mode: 'polling' | 'webhook' = 'webhook',
     curatedResetService: CuratedResetService = makeCuratedResetService(),
     extraConfig: Record<string, unknown> = {},
+    dashboardPublishService: DashboardPublishService = makeDashboardPublishService(),
   ): Promise<{
     service: TelegramBotService;
     curatedSearchService: CuratedSearchSource;
     curatedResetService: CuratedResetService;
+    dashboardPublishService: DashboardPublishService;
   }> {
     const service = new TelegramBotService(
       makeConfig(chatId, mode, extraConfig),
       curatedSearchService,
       curatedResetService,
       new CuratedMentionsService(),
+      dashboardPublishService,
     );
     await service.onModuleInit();
-    return { service, curatedSearchService, curatedResetService };
+    return { service, curatedSearchService, curatedResetService, dashboardPublishService };
   }
 
   it('registers /status and /search on init, without starting a long-poll connection in webhook mode', async () => {
@@ -226,6 +248,7 @@ describe('TelegramBotService (closed-pool bot)', () => {
       makeCuratedSearchService(),
       makeCuratedResetService(),
       new CuratedMentionsService(),
+      makeDashboardPublishService(),
     );
     await service.onModuleInit();
 
@@ -431,6 +454,42 @@ describe('TelegramBotService (closed-pool bot)', () => {
   });
 
   describe('search_period callback', () => {
+    /**
+     * Главное в этой истории: нажатая кнопка периода не только отвечает в Telegram, но и
+     * переписывает дашборд веб-интерфейса под эту же выдачу. Проверяется и период (дашборд обязан
+     * совпасть с сообщением), и строка-отчёт в подтверждении окна.
+     */
+    it('переносит выдачу за выбранный период в дашборд и сообщает об этом', async () => {
+      const dashboard = makeDashboardPublishService(12);
+      await boot('-1001', makeCuratedSearchService(), 'webhook', makeCuratedResetService(), {}, dashboard);
+      const ctx = makeCtx('-1001', { match: ['search_period:90', '90'] });
+
+      await actionHandlers.get('/^search_period:(\\d+)$/')!(ctx);
+
+      expect(dashboard.publish).toHaveBeenCalledWith(90, expect.any(Date));
+      const texts = (ctx.editMessageText as jest.Mock).mock.calls.map(([text]) => text as string);
+      expect(texts.some((text) => text.includes('Дашборд обновлён, материалов в веб-интерфейсе: 12'))).toBe(true);
+    });
+
+    /**
+     * Недоступная база (на стенде её может не быть поднято вовсе) не должна стоить пользователю
+     * ответа: /search читает карточки из JSON и обязан работать без неё. Но и промолчать нельзя —
+     * иначе человек пойдёт искать в веб-интерфейсе то, чего туда не попало.
+     */
+    it('отвечает как обычно, если дашборд обновить не удалось, и честно говорит об этом', async () => {
+      const dashboard = makeDashboardPublishService();
+      (dashboard.publish as jest.Mock).mockRejectedValue(new Error('база недоступна'));
+      await boot('-1001', makeCuratedSearchService(), 'webhook', makeCuratedResetService(), {}, dashboard);
+      const ctx = makeCtx('-1001');
+
+      await actionHandlers.get('/^search_period:(\\d+)$/')!(ctx);
+
+      const texts = (ctx.editMessageText as jest.Mock).mock.calls.map(([text]) => text as string);
+      expect(texts.some((text) => text.includes('Дашборд обновить не удалось'))).toBe(true);
+      // Сама выдача при этом ушла в чат.
+      expect(sendMessageMock).toHaveBeenCalled();
+    });
+
     it('rejects the callback from an unauthorized chat without ever touching the curated pool', async () => {
       const { curatedSearchService } = await boot('-1001');
       const ctx = makeCtx('999999');

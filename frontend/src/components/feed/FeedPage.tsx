@@ -11,7 +11,9 @@ import { MentionCard } from './MentionCard';
 import styles from './FeedPage.module.css';
 
 const PAGE_SIZE = 25;
-const DEFAULT_FILTERS: MentionsFilters = { period: '7d' };
+// «Всё время» — по той же причине, что и на дашборде (см. DashboardPage): в ленте лежит
+// последняя выдача бота, и её даты старше недели.
+const DEFAULT_FILTERS: MentionsFilters = { period: 'all' };
 
 export function FeedPage() {
   const [filters, setFilters] = useState<MentionsFilters>(DEFAULT_FILTERS);

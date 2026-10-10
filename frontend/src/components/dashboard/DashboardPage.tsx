@@ -11,7 +11,11 @@ import { SentimentBreakdownChart } from './SentimentBreakdownChart';
 import { TopSourcesTable } from './TopSourcesTable';
 import styles from './DashboardPage.module.css';
 
-const DEFAULT_FILTERS: MentionsFilters = { period: '7d' };
+// «Всё время», а не неделя: дашборд показывает последнюю выдачу Telegram-бота целиком (её
+// кладёт туда DashboardPublishService), а материалы набора — исторические, с датами за
+// несколько лет. С недельным периодом по умолчанию человек открывал бы дашборд и видел ноль
+// сразу после того, как бот отчитался о сотне найденных упоминаний.
+const DEFAULT_FILTERS: MentionsFilters = { period: 'all' };
 
 export function DashboardPage() {
   const [filters, setFilters] = useState<MentionsFilters>(DEFAULT_FILTERS);

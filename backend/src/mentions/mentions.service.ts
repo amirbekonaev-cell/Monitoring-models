@@ -562,14 +562,21 @@ export class MentionsService {
       bySentiment[row.sentiment] = parseInt(row.count, 10);
     }
 
+    // Подпись источника — имя записи в `sources`, а если её нет, то `source_label` самого
+    // упоминания. Второе нужно каналам, у которых записи-источника и не должно быть: выдача
+    // Telegram-бота, которую DashboardPublishService кладёт в ленту, подписана изданием
+    // ("SK News", "Profit.kz") именно так, и без этого COALESCE весь дашборд показывал бы одну
+    // строку «Без источника». Группировка при этом по-прежнему включает source_id, поэтому для
+    // обычных упоминаний (sourceLabel = null) разбивка не изменилась.
     const topSourcesQb = this.mentionsRepo
       .createQueryBuilder('m')
       .leftJoin(Source, 's', 's.id = m.sourceId')
       .select('m.sourceId', 'sourceId')
-      .addSelect('s.name', 'name')
+      .addSelect('COALESCE(s.name, m.source_label)', 'name')
       .addSelect('COUNT(*)', 'count')
       .groupBy('m.sourceId')
       .addGroupBy('s.name')
+      .addGroupBy('m.source_label')
       .orderBy('count', 'DESC')
       .limit(10);
     this.applyFilters(topSourcesQb, query);
