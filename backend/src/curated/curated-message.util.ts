@@ -25,13 +25,39 @@ export function buildSearchInProgressText(label: string): string {
 }
 
 /**
- * The resolved window, nothing else. There is deliberately no "Обработано источников в этом
- * запросе" line any more: the bot processes no sources at all now — /search reads ready-made cards
- * (see CuratedJsonSearchService), so the count was always 0 and the line only ever described work
- * the old OpenAI path did.
+ * Чем закончилась перезапись дашборда под эту выдачу — см. DashboardPublishService.
+ * `published === null` означает, что запись в базу не удалась и в веб-интерфейсе осталась
+ * прежняя выдача; промолчать об этом нельзя, иначе человек будет искать там материалы, которых
+ * туда не попало.
  */
-export function buildPeriodConfirmationText(label: string, dateFrom: string, dateTo: string): string {
-  return `Период: ${label} (с ${formatIsoDateDisplay(dateFrom)} по ${formatIsoDateDisplay(dateTo)})`;
+export interface DashboardPublishNote {
+  published: number | null;
+}
+
+/**
+ * The resolved window, plus — when the search also rewrote the dashboard — one line saying so.
+ *
+ * There is deliberately no "Обработано источников в этом запросе" line any more: the bot processes
+ * no sources at all now — /search reads ready-made cards (see CuratedJsonSearchService), so the
+ * count was always 0 and the line only ever described work the old OpenAI path did.
+ */
+export function buildPeriodConfirmationText(
+  label: string,
+  dateFrom: string,
+  dateTo: string,
+  dashboard?: DashboardPublishNote,
+): string {
+  const period = `Период: ${label} (с ${formatIsoDateDisplay(dateFrom)} по ${formatIsoDateDisplay(dateTo)})`;
+  if (!dashboard) {
+    return period;
+  }
+  // Без согласования числительного намеренно: "материалов: 7" читается одинаково верно при любом
+  // количестве, а правило согласования в русском пришлось бы держать в утилите сообщений.
+  const note =
+    dashboard.published === null
+      ? 'Дашборд обновить не удалось — в веб-интерфейсе осталась прежняя выдача.'
+      : `Дашборд обновлён, материалов в веб-интерфейсе: ${dashboard.published}.`;
+  return [period, note].join('\n');
 }
 
 /**
@@ -310,8 +336,8 @@ export function buildResetConfirmText(preview: { links: number; mentions: number
 export function buildResetDoneText(outcome: { links: number; mentionsDeleted: number }): string {
   return [
     `Пул сброшен. Удалено упоминаний: ${outcome.mentionsDeleted}, ссылок в очереди: ${outcome.links}.`,
-    'Лента и дашборд по этим ссылкам сейчас пустые — наполнить их заново можно скриптом ' +
-      'npm run seed:curated. На /search и /status сброс не повлиял.',
+    'Лента и дашборд по этим ссылкам сейчас пустые — наполнить их заново можно кнопкой периода ' +
+      'в /search: выдача за этот период и окажется в дашборде. На /search и /status сброс не повлиял.',
   ].join('\n');
 }
 

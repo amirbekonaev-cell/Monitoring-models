@@ -25,6 +25,7 @@
     "curated:leak-check": "ts-node -r tsconfig-paths/register src/scripts/curated-leak-check.ts",
     "seed:curated": "ts-node -r tsconfig-paths/register src/scripts/seed-curated-mentions.ts",
     "send:curated": "ts-node -r tsconfig-paths/register src/scripts/send-curated-mentions.ts",
+    "dashboard:reset": "ts-node -r tsconfig-paths/register src/scripts/dashboard-reset.ts",
     "test": "jest",
     "test:watch": "jest --watch"
   },

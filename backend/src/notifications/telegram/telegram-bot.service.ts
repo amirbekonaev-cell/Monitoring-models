@@ -8,6 +8,7 @@ import {
   CuratedSearchSource,
 } from '../../curated/curated-search.types';
 import { CuratedResetService } from '../../curated/curated-reset.service';
+import { DashboardPublishService } from '../../curated/dashboard-publish.service';
 import { CuratedMentionsService } from '../../curated/curated-mentions.service';
 import { CuratedMention } from '../../curated/curated-mentions';
 import { searchPeriodLabel } from '../../curated/search-period.util';
@@ -20,6 +21,7 @@ import {
   parseCuratedMoreCallbackData,
 } from '../../curated/curated-mentions-message.util';
 import {
+  DashboardPublishNote,
   EMPTY_POOL_TEXT,
   RESET_CANCELLED_TEXT,
   RESET_CANCEL_CALLBACK_DATA,
@@ -100,6 +102,7 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
     private readonly curatedSearchService: CuratedSearchSource,
     private readonly curatedResetService: CuratedResetService,
     private readonly curatedMentionsService: CuratedMentionsService,
+    private readonly dashboardPublishService: DashboardPublishService,
   ) {}
 
   private get periodDays(): number[] {
@@ -439,7 +442,12 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
       try {
         const now = new Date();
         const result = await this.curatedSearchService.search(days, now);
-        await ctx.editMessageText(buildPeriodConfirmationText(label, result.dateFrom, result.dateTo));
+        // Нажатая кнопка периода — единственное, что решает, какие материалы лежат в дашборде и
+        // ленте веб-интерфейса: выдача за этот период заменяет там всё, что было раньше (см.
+        // DashboardPublishService). Поэтому запись идёт здесь, а не после отправки сообщений, —
+        // иначе сбой на отправке оставил бы в веб-интерфейсе прежний набор.
+        const dashboard = await this.publishToDashboard(days, now);
+        await ctx.editMessageText(buildPeriodConfirmationText(label, result.dateFrom, result.dateTo, dashboard));
         await this.sendFirstResultsPage(ctx.telegram, chatId, days, label, result, now);
       } catch (error) {
         await this.replyWithSearchError(ctx.telegram, chatId, error);
@@ -821,6 +829,24 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
       return undefined;
     }
     return Markup.inlineKeyboard([Markup.button.callback(`Показать ещё (осталось ${remaining})`, callbackData)]).reply_markup;
+  }
+
+  /**
+   * Перезаписывает дашборд и ленту веб-интерфейса выдачей за этот период.
+   *
+   * Ошибка здесь НЕ срывает ответ в Telegram: база может быть недоступна (на стенде её может не
+   * быть поднято вовсе), а /search обязан отвечать и без неё — это вся причина, по которой он
+   * читает карточки из JSON. Поэтому сбой логируется и уезжает в сообщение отдельной строкой
+   * (published: null), чтобы человек не искал в веб-интерфейсе то, чего туда не попало.
+   */
+  private async publishToDashboard(days: number, now: Date): Promise<DashboardPublishNote> {
+    try {
+      const outcome = await this.dashboardPublishService.publish(days, now);
+      return { published: outcome.published };
+    } catch (error) {
+      this.logger.error(`Не удалось перенести выдачу /search в дашборд: ${describeError(error)}`);
+      return { published: null };
+    }
   }
 
   private async replyWithSearchError(

@@ -19,7 +19,9 @@ export function TopSourcesTable({ topSources }: { topSources: MentionsStats['top
       </thead>
       <tbody>
         {topSources.map((source) => (
-          <tr key={source.sourceId ?? 'none'}>
+          // Подпись входит в ключ: у материалов из выдачи бота записи в `sources` нет вовсе
+          // (sourceId === null), и ключ по одному sourceId совпал бы у всех изданий сразу.
+          <tr key={source.sourceId ?? source.name ?? 'none'}>
             <td className={styles.name}>{source.name ?? 'Без источника'}</td>
             <td className={styles.count}>{source.count}</td>
             <td className={styles.shareCell}>
