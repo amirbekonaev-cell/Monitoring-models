@@ -5,13 +5,16 @@ import { TelegramWebhookController } from './telegram-webhook.controller';
 import { CuratedModule } from '../../curated/curated.module';
 import { CuratedMentionsModule } from '../../curated/curated-mentions.module';
 import { DashboardPublishModule } from '../../curated/dashboard-publish.module';
+import { LiveSearchModule } from '../../live-search/live-search.module';
 
 @Module({
   // CuratedModule — закрытый пул ссылок (/status, /search). CuratedMentionsModule — вручную
   // проверенные карточки (/curated_stats, /curated <издание>). Разные наборы данных и разные
   // команды, несмотря на похожие имена.
   // DashboardPublishModule — перенос выдачи /search в дашборд и ленту веб-интерфейса.
-  imports: [CuratedModule, CuratedMentionsModule, DashboardPublishModule],
+  // LiveSearchModule — живой проход по RSS-лентам внутри паузы /search. Базу и OpenAI не трогает,
+  // так что свойство «/search отвечает и без них» сохраняется — см. LiveSearchModule.
+  imports: [CuratedModule, CuratedMentionsModule, DashboardPublishModule, LiveSearchModule],
   controllers: [TelegramWebhookController],
   providers: [TelegramNotifierService, TelegramBotService],
   exports: [TelegramNotifierService, TelegramBotService],

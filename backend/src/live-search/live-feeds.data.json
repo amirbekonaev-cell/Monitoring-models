@@ -1,0 +1,19 @@
+[
+  { "sourceName": "365info", "domain": "365info.kz", "feedUrl": "https://365info.kz/rss" },
+  { "sourceName": "Aikyn", "domain": "aikyn.kz", "feedUrl": "http://aikyn.kz/feed.xml" },
+  { "sourceName": "Aleminform", "domain": "aleminform.kz", "feedUrl": "https://aleminform.kz/feed/" },
+  { "sourceName": "Bizmedia", "domain": "bizmedia.kz", "feedUrl": "https://bizmedia.kz/rss" },
+  { "sourceName": "Bluescreen", "domain": "bluescreen.kz", "feedUrl": "https://bluescreen.kz/feed/" },
+  { "sourceName": "Digital Business", "domain": "digitalbusiness.kz", "feedUrl": "https://digitalbusiness.kz/rss" },
+  { "sourceName": "Inbusiness", "domain": "inbusiness.kz", "feedUrl": "https://inbusiness.kz/ru/rss" },
+  { "sourceName": "Infozakon", "domain": "infozakon.kz", "feedUrl": "https://infozakon.kz/rss.xml" },
+  { "sourceName": "Infozakon (қаз)", "domain": "qaz.infozakon.kz", "feedUrl": "https://qaz.infozakon.kz/rss.xml" },
+  { "sourceName": "Kursiv", "domain": "kz.kursiv.media", "feedUrl": "https://kz.kursiv.media/rss" },
+  { "sourceName": "Matritca", "domain": "matritca.kz", "feedUrl": "https://matritca.kz/feed/" },
+  { "sourceName": "Optimism", "domain": "optimism.kz", "feedUrl": "https://optimism.kz/rss" },
+  { "sourceName": "Profit.kz", "domain": "profit.kz", "feedUrl": "https://profit.kz/rss/" },
+  { "sourceName": "Qazaqpress", "domain": "qazaqpress.kz", "feedUrl": "https://qazaqpress.kz/rss" },
+  { "sourceName": "Sputnik Казахстан", "domain": "ru.sputnik.kz", "feedUrl": "https://ru.sputnik.kz/export/rss2/archive/index.xml" },
+  { "sourceName": "The Tech", "domain": "the-tech.kz", "feedUrl": "https://the-tech.kz/feed/" },
+  { "sourceName": "Yujanka", "domain": "yujanka.kz", "feedUrl": "https://yujanka.kz/feed/" }
+]

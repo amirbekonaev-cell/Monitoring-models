@@ -144,6 +144,22 @@ export default () => ({
     // сообщениями должна укладываться в бюджет вызова с большим запасом.
     itemsPerBatch: parseInt(process.env.SEARCH_ITEMS_PER_BATCH || '8', 10),
   },
+  liveSearch: {
+    // Живой проход по RSS-лентам изданий внутри /search (см. LiveRssSearchService). Единственный
+    // канал сбора, который успевает отработать в запросе: замерено на реальной сети — 17 лент
+    // параллельно за 3.2 с, 1760 материалов, у всех есть дата. Идёт ВНУТРИ паузы
+    // SEARCH_MIN_DURATION_MS, поэтому к длительности /search ничего не добавляет.
+    // Выключается только явным SEARCH_LIVE_RSS=false.
+    enabled: process.env.SEARCH_LIVE_RSS !== 'false',
+    // Потолок на весь проход и на одну ленту. Оба — внешним Promise.race: `timeout` у rss-parser
+    // на замере не сработал, лента висела минутами с выставленными ему 15 с.
+    budgetMs: parseInt(process.env.SEARCH_LIVE_RSS_BUDGET_MS || '12000', 10),
+    feedTimeoutMs: parseInt(process.env.SEARCH_LIVE_RSS_FEED_TIMEOUT_MS || '8000', 10),
+    // Формы названия компании для живого прохода. Пусто — формы по умолчанию (те же, что сеет
+    // npm run seed:keywords). Дублируются в коде, а не читаются из таблицы `keywords`, потому что
+    // /search обязан работать без базы — см. brand-match.util.ts.
+    brandForms: process.env.LIVE_SEARCH_BRAND_FORMS || '',
+  },
   excludedDomains: {
     // Comma-separated domain blacklist (each entry also covers its subdomains) — a domain here
     // must never appear in `sources` (admin "add by link") or `mentions` (K-1/K-6 whole-web
