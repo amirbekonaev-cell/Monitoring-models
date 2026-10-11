@@ -8,6 +8,7 @@ import {
 } from '../../curated/curated-search.types';
 import { CuratedJsonSearchService } from '../../curated/curated-json-search.service';
 import { CuratedResetService } from '../../curated/curated-reset.service';
+import { LiveRssOutcome, LiveRssSearchService } from '../../live-search/live-rss-search.service';
 import { DashboardPublishService } from '../../curated/dashboard-publish.service';
 import { CuratedLinkStatus } from '../../curated/curated-link.entity';
 import { CuratedMentionsService } from '../../curated/curated-mentions.service';
@@ -156,6 +157,28 @@ function makeCuratedResetService(preview = { links: 169, mentions: 167 }): Curat
   } as unknown as CuratedResetService;
 }
 
+/**
+ * Живой проход по лентам. По умолчанию «лент ноль» — то есть выключён: подавляющая часть тестов в
+ * этом файле проверяет выдачу НАБОРА, и примешивать к ней сетевой канал там нечего. Тесты самого
+ * прохода подставляют свой outcome.
+ */
+function makeLiveRssSearchService(outcome: Partial<LiveRssOutcome> | null = null): LiveRssSearchService {
+  return {
+    feedCount: outcome === null ? 0 : 17,
+    collect: jest.fn(async () => ({
+      feedsTotal: 0,
+      feedsOk: 0,
+      feedsFailed: 0,
+      itemsSeen: 0,
+      finds: [],
+      alreadyKnown: 0,
+      undated: 0,
+      elapsedMs: 0,
+      ...(outcome ?? {}),
+    })),
+  } as unknown as LiveRssSearchService;
+}
+
 function makeCuratedSearchService(config: {
   pool?: Partial<PoolStats>;
   searchResult?: Partial<CuratedSearchResult>;
@@ -188,11 +211,13 @@ describe('TelegramBotService (closed-pool bot)', () => {
     curatedResetService: CuratedResetService = makeCuratedResetService(),
     extraConfig: Record<string, unknown> = {},
     dashboardPublishService: DashboardPublishService = makeDashboardPublishService(),
+    liveRssSearchService: LiveRssSearchService = makeLiveRssSearchService(),
   ): Promise<{
     service: TelegramBotService;
     curatedSearchService: CuratedSearchSource;
     curatedResetService: CuratedResetService;
     dashboardPublishService: DashboardPublishService;
+    liveRssSearchService: LiveRssSearchService;
   }> {
     const service = new TelegramBotService(
       makeConfig(chatId, mode, extraConfig),
@@ -200,9 +225,10 @@ describe('TelegramBotService (closed-pool bot)', () => {
       curatedResetService,
       new CuratedMentionsService(),
       dashboardPublishService,
+      liveRssSearchService,
     );
     await service.onModuleInit();
-    return { service, curatedSearchService, curatedResetService, dashboardPublishService };
+    return { service, curatedSearchService, curatedResetService, dashboardPublishService, liveRssSearchService };
   }
 
   it('registers /status and /search on init, without starting a long-poll connection in webhook mode', async () => {
@@ -249,6 +275,7 @@ describe('TelegramBotService (closed-pool bot)', () => {
       makeCuratedResetService(),
       new CuratedMentionsService(),
       makeDashboardPublishService(),
+      makeLiveRssSearchService(),
     );
     await service.onModuleInit();
 
@@ -594,6 +621,134 @@ describe('TelegramBotService (closed-pool bot)', () => {
         await actionHandlers.get('/^search_period:(\\d+)$/')!(ctx);
 
         expect(sendMessageMock).toHaveBeenCalled();
+      });
+    });
+
+    /**
+     * Живой проход по RSS-лентам внутри /search. Главное, что здесь проверяется, — он остаётся
+     * ДОБАВЛЕНИЕМ: выдача набора уходит первой и не зависит от того, что проход нашёл, успел или
+     * упал. Сам проход протестирован отдельно (live-rss-search.service.spec.ts).
+     */
+    describe('живой проход по лентам', () => {
+      const PACING_MS = 300;
+
+      function bootWithLive(live: ReturnType<typeof makeLiveRssSearchService>, extra: Record<string, unknown> = {}) {
+        return boot(
+          '-1001',
+          makeCuratedSearchService({ searchResult: { total: 1 }, page: [makeMentionView()] }),
+          'webhook',
+          makeCuratedResetService(),
+          extra,
+          makeDashboardPublishService(),
+          live,
+        );
+      }
+
+      function sentTexts(): string[] {
+        return sendMessageMock.mock.calls.map(([, text]) => text as string);
+      }
+
+      it('отправляет отчёт о проходе после выдачи набора, даже когда нового нет', async () => {
+        await bootWithLive(makeLiveRssSearchService({ feedsTotal: 17, feedsOk: 17, itemsSeen: 1760 }));
+        const ctx = makeCtx('-1001');
+
+        await actionHandlers.get('/^search_period:(\\d+)$/')!(ctx);
+
+        const texts = sentTexts();
+        const reportIndex = texts.findIndex((text) => text.includes('Живой проход по RSS-лентам'));
+        expect(reportIndex).toBeGreaterThan(0);
+        expect(texts[reportIndex]).toContain('Опрошено лент: 17 из 17');
+        // Отчёт идёт ПОСЛЕ выдачи набора: заголовок выдачи отправлен раньше.
+        expect(texts.slice(0, reportIndex).some((text) => text.includes('Упоминания за'))).toBe(true);
+      });
+
+      it('найденное уходит отдельными сообщениями со ссылкой', async () => {
+        await bootWithLive(
+          makeLiveRssSearchService({
+            feedsTotal: 17,
+            feedsOk: 17,
+            itemsSeen: 1760,
+            finds: [
+              {
+                title: 'QazCloud открыл дата-центр',
+                url: 'https://the-tech.kz/svezhaya-statya/',
+                publishedAt: new Date('2026-10-11T10:00:00Z'),
+                sourceName: 'The Tech',
+                domain: 'the-tech.kz',
+                snippet: null,
+              },
+            ],
+          }),
+        );
+        const ctx = makeCtx('-1001');
+
+        await actionHandlers.get('/^search_period:(\\d+)$/')!(ctx);
+
+        const texts = sentTexts();
+        expect(texts.some((text) => text.includes('Новых упоминаний за'))).toBe(true);
+        expect(texts.some((text) => text.includes('https://the-tech.kz/svezhaya-statya/'))).toBe(true);
+      });
+
+      /** Проход — добавление; его падение не вправе превратить работающий /search в ошибку. */
+      it('упавший проход не ломает выдачу и не отправляет отчёт', async () => {
+        const live = makeLiveRssSearchService();
+        (live.collect as jest.Mock).mockRejectedValue(new Error('сеть недоступна'));
+        await bootWithLive(live);
+        const ctx = makeCtx('-1001');
+
+        await actionHandlers.get('/^search_period:(\\d+)$/')!(ctx);
+
+        const texts = sentTexts();
+        expect(texts.some((text) => text.includes('Упоминания за'))).toBe(true);
+        expect(texts.some((text) => text.includes('Живой проход'))).toBe(false);
+        expect(texts.some((text) => text.includes('Не удалось выполнить поиск'))).toBe(false);
+      });
+
+      it('выключенный проход (лент ноль) не добавляет ни одного сообщения', async () => {
+        await bootWithLive(makeLiveRssSearchService());
+        const ctx = makeCtx('-1001');
+
+        await actionHandlers.get('/^search_period:(\\d+)$/')!(ctx);
+
+        expect(sentTexts().some((text) => text.includes('Живой проход'))).toBe(false);
+      });
+
+      it('проход получает тот же период, что и выдача набора', async () => {
+        const live = makeLiveRssSearchService({ feedsTotal: 17, feedsOk: 17 });
+        await bootWithLive(live);
+        const ctx = makeCtx('-1001', { match: ['search_period:90', '90'] });
+
+        await actionHandlers.get('/^search_period:(\\d+)$/')!(ctx);
+
+        expect(live.collect).toHaveBeenCalledWith(90, expect.any(Date));
+      });
+
+      /**
+       * Суть выбранной схемы: проход идёт ВНУТРИ паузы темпа выдачи, а не после неё, поэтому
+       * ожидание наполняется настоящей работой и при этом ни на что не удлиняется.
+       */
+      it('идёт параллельно паузе, не удлиняя её', async () => {
+        const live = makeLiveRssSearchService({ feedsTotal: 17, feedsOk: 17 });
+        (live.collect as jest.Mock).mockImplementation(
+          async () =>
+            new Promise((resolve) =>
+              setTimeout(
+                () => resolve({ feedsTotal: 17, feedsOk: 17, feedsFailed: 0, itemsSeen: 1760, finds: [], alreadyKnown: 0, undated: 0, elapsedMs: 200 }),
+                200,
+              ),
+            ),
+        );
+        await bootWithLive(live, { 'curated.minDurationMs': PACING_MS });
+        const ctx = makeCtx('-1001');
+
+        const startedAt = Date.now();
+        await actionHandlers.get('/^search_period:(\\d+)$/')!(ctx);
+        const elapsed = Date.now() - startedAt;
+
+        expect(elapsed).toBeGreaterThanOrEqual(PACING_MS);
+        // 200 мс прохода уложились внутрь 300 мс паузы, а не добавились к ним.
+        expect(elapsed).toBeLessThan(PACING_MS + 200);
+        expect(sentTexts().some((text) => text.includes('Живой проход'))).toBe(true);
       });
     });
 

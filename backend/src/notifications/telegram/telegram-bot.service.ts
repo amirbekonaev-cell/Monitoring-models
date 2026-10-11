@@ -13,6 +13,8 @@ import { CuratedMentionsService } from '../../curated/curated-mentions.service';
 import { CuratedMention } from '../../curated/curated-mentions';
 import { searchPeriodLabel } from '../../curated/search-period.util';
 import { buildSearchProgressText, planSearchProgress } from '../../curated/search-progress.util';
+import { LiveRssOutcome, LiveRssSearchService } from '../../live-search/live-rss-search.service';
+import { buildLiveFindsMessages, buildLiveRssReportText } from '../../live-search/live-rss-message.util';
 import {
   CURATED_MENTIONS_BATCH_SIZE,
   buildCuratedMoreCallbackData,
@@ -104,6 +106,7 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
     private readonly curatedResetService: CuratedResetService,
     private readonly curatedMentionsService: CuratedMentionsService,
     private readonly dashboardPublishService: DashboardPublishService,
+    private readonly liveRssSearchService: LiveRssSearchService,
   ) {}
 
   private get periodDays(): number[] {
@@ -456,6 +459,10 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
       try {
         const now = new Date();
         const result = await this.curatedSearchService.search(days, now);
+        // Проход по лентам запускается ЗДЕСЬ и не дожидается: он идёт параллельно с паузой темпа
+        // выдачи (3.2 с работы внутри 30 с ожидания), поэтому к длительности /search не
+        // добавляет ничего. Ошибка внутри него уже обработана — см. startLiveRssPass.
+        const livePass = this.startLiveRssPass(days, now);
         // Нажатая кнопка периода — единственное, что решает, какие материалы лежат в дашборде и
         // ленте веб-интерфейса: выдача за этот период заменяет там всё, что было раньше (см.
         // DashboardPublishService). Поэтому запись идёт здесь, а не после отправки сообщений, —
@@ -464,6 +471,9 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
         await this.showSearchProgress(ctx, label, result, startedAt);
         await ctx.editMessageText(buildPeriodConfirmationText(label, result.dateFrom, result.dateTo, dashboard));
         await this.sendFirstResultsPage(ctx.telegram, chatId, days, label, result, now);
+        // После выдачи набора, а не до неё: проверенные человеком материалы — главный ответ на
+        // нажатую кнопку, а отчёт живого прохода к нему добавление.
+        await this.sendLiveRssReport(ctx.telegram, chatId, label, await livePass);
       } catch (error) {
         await this.replyWithSearchError(ctx.telegram, chatId, error);
       }
@@ -594,6 +604,64 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
         await this.replyWithSearchError(ctx.telegram, chatId, error);
       }
     });
+  }
+
+  /**
+   * Запускает живой проход по RSS-лентам и СРАЗУ отдаёт обещание, не дожидаясь его: проход идёт
+   * параллельно с паузой темпа выдачи, то есть внутри тех 30 секунд, которые /search и так ждёт
+   * (замер: 3.2 с на 17 лент). Благодаря этому ожидание перестаёт быть пустым, а длительность
+   * вызова не растёт ни на миллисекунду.
+   *
+   * Любая ошибка гасится здесь же и превращается в `null`: проход — это добавление к выдаче
+   * набора, и упавшая лента (или весь проход) не вправе превратить работающий /search в сообщение
+   * об ошибке. Это то же правило, по которому живёт ленивая дообработка в CuratedSearchService.
+   */
+  private startLiveRssPass(days: number, now: Date): Promise<LiveRssOutcome | null> {
+    return this.liveRssSearchService.collect(days, now).catch((error) => {
+      this.logger.warn(`Живой проход по лентам пропущен (выдача набора не затронута): ${describeError(error)}`);
+      return null;
+    });
+  }
+
+  /**
+   * Отчёт живого прохода — отдельными сообщениями после выдачи набора.
+   *
+   * Отдельно от набора потому, что набор проверен человеком, а находки прохода нет: смешать их в
+   * одном списке значило бы выдать непроверенное за проверенное. Отчёт уходит и когда находок нет
+   * («опрошено 17 лент, 1760 материалов, нового нет») — это проверяемое утверждение о работе,
+   * которая действительно была выполнена, и ровно то, чем ожидание отличается от пустой паузы.
+   *
+   * `outcome === null` — проход упал целиком; тогда не отправляется ничего. Писать в чат «ленты не
+   * опрошены» нечего: человек просил упоминания, набор он уже получил, а о сбое есть запись в
+   * логе. Выключенный SEARCH_LIVE_RSS выглядит так же — лент в проходе ноль, сообщения нет.
+   */
+  private async sendLiveRssReport(
+    telegram: Telegraf['telegram'],
+    chatId: number,
+    label: string,
+    outcome: LiveRssOutcome | null,
+  ): Promise<void> {
+    if (outcome === null || outcome.feedsTotal === 0) {
+      return;
+    }
+
+    try {
+      await telegram.sendMessage(chatId, buildLiveRssReportText(outcome, label, this.timezone), {
+        parse_mode: 'HTML',
+        link_preview_options: { is_disabled: true },
+      });
+
+      for (const message of buildLiveFindsMessages(outcome.finds, this.timezone)) {
+        await sleep(ONE_PER_MESSAGE_DELAY_MS);
+        await telegram.sendMessage(chatId, message, {
+          parse_mode: 'HTML',
+          link_preview_options: { is_disabled: true },
+        });
+      }
+    } catch (error) {
+      // Выдача набора уже отправлена — сбой на отчёте не должен выглядеть как сбой поиска.
+      this.logger.warn(`Не удалось отправить отчёт живого прохода: ${describeError(error)}`);
+    }
   }
 
   /**
