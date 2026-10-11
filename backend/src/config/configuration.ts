@@ -1,6 +1,7 @@
 import { resolveDbConfig } from './database.util';
 import { parseCuratedMinArticleDate } from '../curated/curated-min-article-date.util';
 import { parseSearchPeriodDays } from '../curated/search-period.util';
+import { parseSearchMinDurationMs } from '../curated/search-progress.util';
 import { resolveTelegramBotMode } from '../notifications/telegram/telegram-bot-mode.util';
 
 export default () => ({
@@ -132,6 +133,12 @@ export default () => ({
     // true — каждая находка /search уходит отдельным сообщением (порциями, см. ниже), а не
     // упакованной в одну "страницу" по messageCharLimit. По умолчанию false = прежний вывод.
     oneArticlePerMessage: process.env.SEARCH_ONE_ARTICLE_PER_MESSAGE === 'true',
+    // Минимальное время от нажатия кнопки периода до первой страницы выдачи. Набор карточек
+    // фильтруется за миллисекунды, и мгновенный ответ читается как «всё было готово заранее», а
+    // не как ответ на заданный период; 30 с — темп, в котором видно счётчик проверенных
+    // материалов. 0 — отдавать сразу (прежнее поведение). Потолок — см. search-progress.util.ts:
+    // весь /search это один 60-секундный вызов на Vercel, и отправка сообщений тоже в него входит.
+    minDurationMs: parseSearchMinDurationMs(process.env.SEARCH_MIN_DURATION_MS),
     // Сколько отдельных сообщений отправлять за одно нажатие кнопки. Ограничение сверху — лимит
     // Telegram (~20 сообщений/мин в группу) и 60-секундный потолок Vercel: порция × пауза между
     // сообщениями должна укладываться в бюджет вызова с большим запасом.
