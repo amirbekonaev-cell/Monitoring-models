@@ -490,6 +490,113 @@ describe('TelegramBotService (closed-pool bot)', () => {
       expect(sendMessageMock).toHaveBeenCalled();
     });
 
+    /**
+     * Темп выдачи (SEARCH_MIN_DURATION_MS). Набор карточек фильтруется в памяти за миллисекунды,
+     * и выдача, пришедшая в ту же секунду, читается как «у бота всё было заготовлено заранее».
+     * Здесь проверяется ровно то, что не видно из кода: до истечения паузы в чат не уходит НИ
+     * одного сообщения выдачи, а счётчик за это время успевает дойти до конца набора.
+     *
+     * 300 мс вместо тридцати секунд — та же логика на масштабе, который не замедляет прогон.
+     */
+    describe('темп выдачи (SEARCH_MIN_DURATION_MS)', () => {
+      const PACING_MS = 300;
+
+      function makeCards(total: number) {
+        return makeCuratedSearchService({
+          pool: {
+            cards: {
+              total,
+              shown: total,
+              duplicates: 0,
+              byStatus: { verified: total, partial: 0, unverified: 0, duplicate: 0 },
+              bySentiment: {
+                [Sentiment.POSITIVE]: total,
+                [Sentiment.NEGATIVE]: 0,
+                [Sentiment.NEUTRAL]: 0,
+                [Sentiment.UNDEFINED]: 0,
+              },
+            },
+          },
+          searchResult: { total: 1 },
+          page: [makeMentionView()],
+        });
+      }
+
+      it('держит выдачу заданное время и только потом отправляет её', async () => {
+        await boot('-1001', makeCards(166), 'webhook', makeCuratedResetService(), {
+          'curated.minDurationMs': PACING_MS,
+        });
+        const ctx = makeCtx('-1001');
+
+        const startedAt = Date.now();
+        await actionHandlers.get('/^search_period:(\\d+)$/')!(ctx);
+
+        expect(Date.now() - startedAt).toBeGreaterThanOrEqual(PACING_MS);
+        expect(sendMessageMock).toHaveBeenCalled();
+      });
+
+      it('за время ожидания показывает счётчик, доходящий до всего набора', async () => {
+        await boot('-1001', makeCards(166), 'webhook', makeCuratedResetService(), {
+          'curated.minDurationMs': PACING_MS,
+        });
+        const ctx = makeCtx('-1001');
+
+        await actionHandlers.get('/^search_period:(\\d+)$/')!(ctx);
+
+        const texts = (ctx.editMessageText as jest.Mock).mock.calls.map(([text]) => text as string);
+        const progress = texts.filter((text) => text.includes('Проверено:'));
+        expect(progress.length).toBeGreaterThan(1);
+        expect(progress[progress.length - 1]).toContain('Проверено: 166 из 166 материалов');
+        // Подтверждение окна по-прежнему последнее, уже без счётчика.
+        expect(texts[texts.length - 1]).toContain('Период:');
+      });
+
+      /** Пустой период, отвеченный мгновенно, выглядит так же неправдоподобно, как и непустой. */
+      it('выдерживает паузу и для периода без находок', async () => {
+        const empty = makeCuratedSearchService({ searchResult: { total: 0 } });
+        await boot('-1001', empty, 'webhook', makeCuratedResetService(), { 'curated.minDurationMs': PACING_MS });
+        const ctx = makeCtx('-1001');
+
+        const startedAt = Date.now();
+        await actionHandlers.get('/^search_period:(\\d+)$/')!(ctx);
+
+        expect(Date.now() - startedAt).toBeGreaterThanOrEqual(PACING_MS);
+        expect(sendMessageMock).toHaveBeenCalled();
+      });
+
+      /**
+       * Регрессия: без настройки /search отвечает ровно как до этой истории — сразу и без кадров
+       * прогресса. Все остальные тесты в этом файле бутуют бота как раз без неё.
+       */
+      it('без SEARCH_MIN_DURATION_MS отвечает сразу и не рисует счётчик', async () => {
+        await boot('-1001', makeCards(166));
+        const ctx = makeCtx('-1001');
+
+        const startedAt = Date.now();
+        await actionHandlers.get('/^search_period:(\\d+)$/')!(ctx);
+
+        expect(Date.now() - startedAt).toBeLessThan(PACING_MS);
+        const texts = (ctx.editMessageText as jest.Mock).mock.calls.map(([text]) => text as string);
+        expect(texts.some((text) => text.includes('Проверено:'))).toBe(false);
+      });
+
+      /** Перерисовка — косметика: её сбой не должен стоить человеку выдачи. */
+      it('выдача уходит, даже если перерисовать счётчик не удалось', async () => {
+        await boot('-1001', makeCards(166), 'webhook', makeCuratedResetService(), {
+          'curated.minDurationMs': PACING_MS,
+        });
+        const ctx = makeCtx('-1001', {
+          editMessageText: jest.fn(async () => {
+            throw new Error('message is not modified');
+          }),
+        });
+
+        await actionHandlers.get('/^search_period:(\\d+)$/')!(ctx);
+
+        expect(sendMessageMock).toHaveBeenCalled();
+      });
+    });
+
     it('rejects the callback from an unauthorized chat without ever touching the curated pool', async () => {
       const { curatedSearchService } = await boot('-1001');
       const ctx = makeCtx('999999');

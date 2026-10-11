@@ -12,6 +12,7 @@ import { DashboardPublishService } from '../../curated/dashboard-publish.service
 import { CuratedMentionsService } from '../../curated/curated-mentions.service';
 import { CuratedMention } from '../../curated/curated-mentions';
 import { searchPeriodLabel } from '../../curated/search-period.util';
+import { buildSearchProgressText, planSearchProgress } from '../../curated/search-progress.util';
 import {
   CURATED_MENTIONS_BATCH_SIZE,
   buildCuratedMoreCallbackData,
@@ -126,6 +127,15 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
   private get itemsPerBatch(): number {
     const value = this.config.get<number>('curated.itemsPerBatch');
     return typeof value === 'number' && Number.isFinite(value) && value > 0 ? Math.floor(value) : 8;
+  }
+
+  /**
+   * SEARCH_MIN_DURATION_MS — сколько /search как минимум держит человека в ожидании, прежде чем
+   * отдать первую страницу. 0 — отдавать сразу (прежнее поведение). См. search-progress.util.ts.
+   */
+  private get searchMinDurationMs(): number {
+    const value = this.config.get<number>('curated.minDurationMs');
+    return typeof value === 'number' && Number.isFinite(value) && value > 0 ? Math.floor(value) : 0;
   }
 
   private get mode(): TelegramBotMode {
@@ -428,10 +438,14 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
         return;
       }
 
-      // Acknowledges the press by replacing the period keyboard with a line naming the period,
-      // which is then replaced again by the window confirmation below. search() is an in-memory
-      // filter now, so this is no longer covering up seconds of work — it is just feedback that
-      // the right button was registered.
+      // Отсчёт темпа выдачи начинается здесь, с нажатия кнопки, а не после фильтрации набора:
+      // всё, что успеет сделаться само (фильтр, запись дашборда), идёт В СЧЁТ ожидания, а не
+      // сверх него. Иначе минимальная длительность складывалась бы с реальной работой и вызов
+      // подходил бы к 60-секундному потолку Vercel без всякой необходимости.
+      const startedAt = Date.now();
+
+      // Первый кадр: заменяет клавиатуру периодов строкой с названием периода. Дальше его
+      // перерисовывает showSearchProgress (счётчик), а в самом конце — подтверждение окна.
       try {
         await ctx.editMessageText(buildSearchInProgressText(label));
       } catch (error) {
@@ -447,6 +461,7 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
         // DashboardPublishService). Поэтому запись идёт здесь, а не после отправки сообщений, —
         // иначе сбой на отправке оставил бы в веб-интерфейсе прежний набор.
         const dashboard = await this.publishToDashboard(days, now);
+        await this.showSearchProgress(ctx, label, result, startedAt);
         await ctx.editMessageText(buildPeriodConfirmationText(label, result.dateFrom, result.dateTo, dashboard));
         await this.sendFirstResultsPage(ctx.telegram, chatId, days, label, result, now);
       } catch (error) {
@@ -579,6 +594,58 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
         await this.replyWithSearchError(ctx.telegram, chatId, error);
       }
     });
+  }
+
+  /**
+   * Держит сообщение-статус до истечения SEARCH_MIN_DURATION_MS, перерисовывая счётчик
+   * проверенных материалов, и только потом возвращает управление — выдача уходит после этого.
+   *
+   * Зачем ждать, когда ответ уже готов: набор карточек фильтруется в памяти за миллисекунды, и
+   * выдача, пришедшая в ту же секунду, читается как «у бота всё было заготовлено», а не как
+   * ответ на выбранный период. Счётчик при этом описывает ровно то, что происходит, — сверку
+   * закрытого набора проверенных материалов с границами периода; утверждать, что бот обходит
+   * сайты или ищет в интернете, он не вправе, потому что ничего такого не делает (см.
+   * комментарий класса и CuratedJsonSearchService).
+   *
+   * Ожидание отсчитывается от `startedAt` (нажатия кнопки), поэтому уже потраченное на фильтр и
+   * запись дашборда время в него входит: общая длительность вызова равна
+   * SEARCH_MIN_DURATION_MS + отправка сообщений, а не сумме всего подряд. Сбой перерисовки
+   * проглатывается — это косметика, из-за неё выдача не должна пропадать.
+   */
+  private async showSearchProgress(
+    ctx: Context,
+    label: string,
+    result: CuratedSearchResult,
+    startedAt: number,
+  ): Promise<void> {
+    const minDurationMs = this.searchMinDurationMs;
+    if (minDurationMs <= 0) {
+      return;
+    }
+
+    // Весь набор, а не находки за период: сверяются с периодом именно все карточки, и число в
+    // счётчике не должно меняться от выбранной кнопки. `cards` отдаёт только JSON-источник —
+    // для источника из БД (CLI-скрипты) остаётся общее число упоминаний пула.
+    const total = result.pool.cards?.total ?? result.pool.mentionsTotal;
+
+    for (const step of planSearchProgress(minDurationMs, total)) {
+      const waitMs = startedAt + step.atMs - Date.now();
+      if (waitMs > 0) {
+        await sleep(waitMs);
+      }
+      try {
+        await ctx.editMessageText(buildSearchProgressText(label, step.checked, total));
+      } catch (error) {
+        this.logger.warn(`Не удалось обновить счётчик поиска: ${describeError(error)}`);
+      }
+    }
+
+    // Пустое расписание (в наборе нечего считать) всё равно должно выдержать паузу: пустой
+    // период, отвеченный мгновенно, выглядит так же неправдоподобно, как и непустой.
+    const remainingMs = startedAt + minDurationMs - Date.now();
+    if (remainingMs > 0) {
+      await sleep(remainingMs);
+    }
   }
 
   /**
