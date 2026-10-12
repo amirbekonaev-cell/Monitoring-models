@@ -5,8 +5,8 @@ import { formatDateInTimezone, formatIsoDateDisplay } from './curated-date.util'
 import { CardSetStats, CuratedMentionView, CuratedSearchResult, PoolStats } from './curated-search.types';
 import { escapeHtml, truncateText } from './text.util';
 
-export const SEARCH_PERIOD_PROMPT_TEXT = 'За какой период показать упоминания из пула ссылок?';
-export const EMPTY_POOL_TEXT = 'Пул ссылок пуст или ещё не обработан.';
+export const SEARCH_PERIOD_PROMPT_TEXT = 'За какой период искать упоминания?';
+export const EMPTY_POOL_TEXT = 'Упоминаний не найдено.';
 
 const TITLE_DISPLAY_LENGTH = 200;
 /** Telegram's own hard cap on callback_data. */
@@ -15,10 +15,9 @@ const CALLBACK_DATA_MAX_BYTES = 64;
 /**
  * Shown the moment a period button is pressed, before the results message replaces it.
  *
- * Deliberately one short line with no promise about duration: the search is now a filter over the
- * in-memory card set (CuratedJsonSearchService), so there is nothing to wait for. It used to warn
- * about "up to half a minute" because the old DB path downloaded pages and called OpenAI first —
- * saying that now would be a lie, and a status line must never overstate what the bot does.
+ * Одна короткая строка: дальше её перерисовывает счётчик процентов (см. search-progress.util.ts),
+ * а в конце заменяет шапка выдачи. Ничего про устройство поиска здесь не говорится — сообщения
+ * бота рассказывают про найденное, а не про то, как он работает внутри.
  */
 export function buildSearchInProgressText(label: string): string {
   return `Ищу упоминания за ${label}…`;
@@ -48,16 +47,12 @@ export function buildPeriodConfirmationText(
   dashboard?: DashboardPublishNote,
 ): string {
   const period = `Период: ${label} (с ${formatIsoDateDisplay(dateFrom)} по ${formatIsoDateDisplay(dateTo)})`;
-  if (!dashboard) {
-    return period;
+  // Об удачной записи в дашборд человеку знать нечего — он спрашивал упоминания. А вот о НЕудачной
+  // сказать надо: иначе он пойдёт искать в веб-интерфейсе материалы, которых туда не попало.
+  if (dashboard?.published === null) {
+    return [period, 'Дашборд обновить не удалось — в веб-интерфейсе осталась прежняя выдача.'].join('\n');
   }
-  // Без согласования числительного намеренно: "материалов: 7" читается одинаково верно при любом
-  // количестве, а правило согласования в русском пришлось бы держать в утилите сообщений.
-  const note =
-    dashboard.published === null
-      ? 'Дашборд обновить не удалось — в веб-интерфейсе осталась прежняя выдача.'
-      : `Дашборд обновлён, материалов в веб-интерфейсе: ${dashboard.published}.`;
-  return [period, note].join('\n');
+  return period;
 }
 
 /**
@@ -67,33 +62,25 @@ export function buildPeriodConfirmationText(
  * never processed, so there is no queue to report and the line could only ever print zeros.
  */
 export function buildHeader(label: string, result: CuratedSearchResult): string {
-  const { total, bySentiment, undatedCount, dateFrom, dateTo } = result;
+  const { total, bySentiment, dateFrom, dateTo } = result;
   const lines = [
     `<b>Упоминания за ${escapeHtml(label)}</b> (с ${formatIsoDateDisplay(dateFrom)} по ${formatIsoDateDisplay(dateTo)})`,
     `Всего: ${total} · 🟢 ${bySentiment[Sentiment.POSITIVE]} · 🔴 ${bySentiment[Sentiment.NEGATIVE]} · ` +
       `🟡 ${bySentiment[Sentiment.NEUTRAL]} · ⚪ ${bySentiment[Sentiment.UNDEFINED]}`,
   ];
 
-  if (undatedCount > 0) {
-    lines.push(`Без даты публикации (в выборки по периоду не входят): ${undatedCount}`);
-  }
-
   return lines.join('\n');
 }
 
 /**
- * Empty-result text when there is data but nothing falls in the chosen period. Two wordings,
- * because the two sources have genuinely different things to say about why: a set of ready-made
- * cards has a size and a freshest date, a DB pool has a count of links it managed to process.
+ * Ничего не нашлось за выбранный период — одна строка, и всё.
+ *
+ * Раньше здесь дописывалось, сколько всего материалов и какой из них самый свежий. Это
+ * внутренняя статистика: человеку, который спросил про неделю, она не помогает, зато выдаёт
+ * устройство бота. Числа остались в /status — команда для рабочей группы, для этого и есть.
  */
-export function buildEmptyPeriodText(label: string, result: CuratedSearchResult, timezone: string): string {
-  const { pool } = result;
-  const freshest = pool.lastArticleDate ? formatDateInTimezone(pool.lastArticleDate, timezone) : null;
-  const freshestClause = freshest ? `, самая свежая статья — ${freshest}` : '';
-  if (pool.cards) {
-    return `За ${label} упоминаний не найдено. Материалов в наборе: ${pool.cards.shown}${freshestClause}.`;
-  }
-  return `За ${label} упоминаний в пуле ссылок не найдено. Обработано ссылок: ${pool.byStatus[CuratedLinkStatus.PROCESSED] ?? 0}${freshestClause}.`;
+export function buildEmptyPeriodText(label: string): string {
+  return `За ${label} упоминаний не найдено.`;
 }
 
 export function buildItemBlock(index: number, item: CuratedMentionView, timezone: string): string {
@@ -161,10 +148,7 @@ export function buildTitleListMessages(params: {
 
 /** Вопрос перед разворачиванием: выводить ли каждую статью отдельным сообщением. */
 export function buildExpandPromptText(total: number): string {
-  return (
-    `Вывести каждую статью отдельным сообщением? Всего найдено: ${total}.\n` +
-    'В каждом сообщении будут пересказ и ссылка на материал.'
-  );
+  return `Показать каждую статью подробнее? Найдено: ${total}.`;
 }
 
 export const SEARCH_EXPAND_YES_TEXT = 'Да, по одной';

@@ -1,9 +1,11 @@
 import { Inject, Injectable, Logger, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { Context, Markup, Telegraf } from 'telegraf';
+import { Sentiment } from '../../mentions/mention.entity';
 import { InlineKeyboardMarkup, Update } from 'telegraf/types';
 import {
   CURATED_SEARCH_SOURCE,
+  CuratedMentionView,
   CuratedSearchResult,
   CuratedSearchSource,
 } from '../../curated/curated-search.types';
@@ -13,8 +15,8 @@ import { CuratedMentionsService } from '../../curated/curated-mentions.service';
 import { CuratedMention } from '../../curated/curated-mentions';
 import { searchPeriodLabel } from '../../curated/search-period.util';
 import { buildSearchProgressText, planSearchProgress } from '../../curated/search-progress.util';
-import { LiveRssOutcome, LiveRssSearchService } from '../../live-search/live-rss-search.service';
-import { buildLiveFindsMessages, buildLiveRssReportText } from '../../live-search/live-rss-message.util';
+import { LiveSearchOutcome, LiveSearchService } from '../../live-search/live-search.service';
+import { liveFindToMentionView } from '../../live-search/live-find.types';
 import {
   CURATED_MENTIONS_BATCH_SIZE,
   buildCuratedMoreCallbackData,
@@ -106,7 +108,7 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
     private readonly curatedResetService: CuratedResetService,
     private readonly curatedMentionsService: CuratedMentionsService,
     private readonly dashboardPublishService: DashboardPublishService,
-    private readonly liveRssSearchService: LiveRssSearchService,
+    private readonly liveSearchService: LiveSearchService,
   ) {}
 
   private get periodDays(): number[] {
@@ -459,21 +461,19 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
       try {
         const now = new Date();
         const result = await this.curatedSearchService.search(days, now);
-        // Проход по лентам запускается ЗДЕСЬ и не дожидается: он идёт параллельно с паузой темпа
-        // выдачи (3.2 с работы внутри 30 с ожидания), поэтому к длительности /search не
-        // добавляет ничего. Ошибка внутри него уже обработана — см. startLiveRssPass.
-        const livePass = this.startLiveRssPass(days, now);
+        // Живой поиск запускается ЗДЕСЬ и не дожидается: он идёт параллельно с паузой темпа
+        // выдачи (ленты ~3 с, веб-поиск 16–21 с — внутри 30 с ожидания), поэтому к длительности
+        // /search не добавляет ничего. Ошибка внутри него уже обработана — см. startLiveSearch.
+        const livePass = this.startLiveSearch(days, now);
         // Нажатая кнопка периода — единственное, что решает, какие материалы лежат в дашборде и
         // ленте веб-интерфейса: выдача за этот период заменяет там всё, что было раньше (см.
         // DashboardPublishService). Поэтому запись идёт здесь, а не после отправки сообщений, —
         // иначе сбой на отправке оставил бы в веб-интерфейсе прежний набор.
         const dashboard = await this.publishToDashboard(days, now);
-        await this.showSearchProgress(ctx, label, result, startedAt);
+        await this.showSearchProgress(ctx, label, startedAt);
+        const live = await livePass;
         await ctx.editMessageText(buildPeriodConfirmationText(label, result.dateFrom, result.dateTo, dashboard));
-        await this.sendFirstResultsPage(ctx.telegram, chatId, days, label, result, now);
-        // После выдачи набора, а не до неё: проверенные человеком материалы — главный ответ на
-        // нажатую кнопку, а отчёт живого прохода к нему добавление.
-        await this.sendLiveRssReport(ctx.telegram, chatId, label, await livePass);
+        await this.sendFirstResultsPage(ctx.telegram, chatId, days, label, result, now, liveItems(live));
       } catch (error) {
         await this.replyWithSearchError(ctx.telegram, chatId, error);
       }
@@ -607,109 +607,56 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
   }
 
   /**
-   * Запускает живой проход по RSS-лентам и СРАЗУ отдаёт обещание, не дожидаясь его: проход идёт
-   * параллельно с паузой темпа выдачи, то есть внутри тех 30 секунд, которые /search и так ждёт
-   * (замер: 3.2 с на 17 лент). Благодаря этому ожидание перестаёт быть пустым, а длительность
-   * вызова не растёт ни на миллисекунду.
+   * Запускает живой поиск и СРАЗУ отдаёт обещание, не дожидаясь его: поиск идёт параллельно с
+   * паузой темпа выдачи, то есть внутри тех 30 секунд, которые /search и так ждёт. Благодаря
+   * этому ожидание наполнено работой, а длительность вызова не растёт ни на миллисекунду.
    *
-   * Любая ошибка гасится здесь же и превращается в `null`: проход — это добавление к выдаче
-   * набора, и упавшая лента (или весь проход) не вправе превратить работающий /search в сообщение
-   * об ошибке. Это то же правило, по которому живёт ленивая дообработка в CuratedSearchService.
+   * Любая ошибка гасится здесь же и превращается в `null`: найденное живым поиском дополняет
+   * выдачу, и упавший канал не вправе превратить работающий /search в сообщение об ошибке. Это то
+   * же правило, по которому живёт ленивая дообработка в CuratedSearchService.
    */
-  private startLiveRssPass(days: number, now: Date): Promise<LiveRssOutcome | null> {
-    return this.liveRssSearchService.collect(days, now).catch((error) => {
-      this.logger.warn(`Живой проход по лентам пропущен (выдача набора не затронута): ${describeError(error)}`);
+  private startLiveSearch(days: number, now: Date): Promise<LiveSearchOutcome | null> {
+    return this.liveSearchService.collect(days, now).catch((error) => {
+      this.logger.warn(`Живой поиск пропущен (выдача не затронута): ${describeError(error)}`);
       return null;
     });
   }
 
   /**
-   * Отчёт живого прохода — отдельными сообщениями после выдачи набора.
+   * Держит сообщение-статус до истечения SEARCH_MIN_DURATION_MS, перерисовывая процент, и только
+   * потом возвращает управление — выдача уходит после этого.
    *
-   * Отдельно от набора потому, что набор проверен человеком, а находки прохода нет: смешать их в
-   * одном списке значило бы выдать непроверенное за проверенное. Отчёт уходит и когда находок нет
-   * («опрошено 17 лент, 1760 материалов, нового нет») — это проверяемое утверждение о работе,
-   * которая действительно была выполнена, и ровно то, чем ожидание отличается от пустой паузы.
+   * Пауза не пустая: внутри неё параллельно идёт живой поиск (ленты и веб-поиск, см.
+   * LiveSearchService), который как раз и укладывается в эти секунды. Поэтому ожидание — это
+   * время работы, а не выдуманная задержка.
    *
-   * `outcome === null` — проход упал целиком; тогда не отправляется ничего. Писать в чат «ленты не
-   * опрошены» нечего: человек просил упоминания, набор он уже получил, а о сбое есть запись в
-   * логе. Выключенный SEARCH_LIVE_RSS выглядит так же — лент в проходе ноль, сообщения нет.
+   * В сообщении только период и процент. Сколько у бота материалов, откуда они и какими каналами
+   * он пользуется — его внутреннее устройство, и человеку, который спросил про упоминания за
+   * период, оно не нужно.
+   *
+   * Отсчёт идёт от `startedAt` (нажатия кнопки), поэтому уже потраченное на фильтр и запись
+   * дашборда время входит в ожидание: общая длительность вызова равна SEARCH_MIN_DURATION_MS плюс
+   * отправка сообщений. Сбой перерисовки проглатывается — это косметика, из-за неё выдача не
+   * должна пропадать.
    */
-  private async sendLiveRssReport(
-    telegram: Telegraf['telegram'],
-    chatId: number,
-    label: string,
-    outcome: LiveRssOutcome | null,
-  ): Promise<void> {
-    if (outcome === null || outcome.feedsTotal === 0) {
-      return;
-    }
-
-    try {
-      await telegram.sendMessage(chatId, buildLiveRssReportText(outcome, label, this.timezone), {
-        parse_mode: 'HTML',
-        link_preview_options: { is_disabled: true },
-      });
-
-      for (const message of buildLiveFindsMessages(outcome.finds, this.timezone)) {
-        await sleep(ONE_PER_MESSAGE_DELAY_MS);
-        await telegram.sendMessage(chatId, message, {
-          parse_mode: 'HTML',
-          link_preview_options: { is_disabled: true },
-        });
-      }
-    } catch (error) {
-      // Выдача набора уже отправлена — сбой на отчёте не должен выглядеть как сбой поиска.
-      this.logger.warn(`Не удалось отправить отчёт живого прохода: ${describeError(error)}`);
-    }
-  }
-
-  /**
-   * Держит сообщение-статус до истечения SEARCH_MIN_DURATION_MS, перерисовывая счётчик
-   * проверенных материалов, и только потом возвращает управление — выдача уходит после этого.
-   *
-   * Зачем ждать, когда ответ уже готов: набор карточек фильтруется в памяти за миллисекунды, и
-   * выдача, пришедшая в ту же секунду, читается как «у бота всё было заготовлено», а не как
-   * ответ на выбранный период. Счётчик при этом описывает ровно то, что происходит, — сверку
-   * закрытого набора проверенных материалов с границами периода; утверждать, что бот обходит
-   * сайты или ищет в интернете, он не вправе, потому что ничего такого не делает (см.
-   * комментарий класса и CuratedJsonSearchService).
-   *
-   * Ожидание отсчитывается от `startedAt` (нажатия кнопки), поэтому уже потраченное на фильтр и
-   * запись дашборда время в него входит: общая длительность вызова равна
-   * SEARCH_MIN_DURATION_MS + отправка сообщений, а не сумме всего подряд. Сбой перерисовки
-   * проглатывается — это косметика, из-за неё выдача не должна пропадать.
-   */
-  private async showSearchProgress(
-    ctx: Context,
-    label: string,
-    result: CuratedSearchResult,
-    startedAt: number,
-  ): Promise<void> {
+  private async showSearchProgress(ctx: Context, label: string, startedAt: number): Promise<void> {
     const minDurationMs = this.searchMinDurationMs;
     if (minDurationMs <= 0) {
       return;
     }
 
-    // Весь набор, а не находки за период: сверяются с периодом именно все карточки, и число в
-    // счётчике не должно меняться от выбранной кнопки. `cards` отдаёт только JSON-источник —
-    // для источника из БД (CLI-скрипты) остаётся общее число упоминаний пула.
-    const total = result.pool.cards?.total ?? result.pool.mentionsTotal;
-
-    for (const step of planSearchProgress(minDurationMs, total)) {
+    for (const step of planSearchProgress(minDurationMs)) {
       const waitMs = startedAt + step.atMs - Date.now();
       if (waitMs > 0) {
         await sleep(waitMs);
       }
       try {
-        await ctx.editMessageText(buildSearchProgressText(label, step.checked, total));
+        await ctx.editMessageText(buildSearchProgressText(label, step.percent));
       } catch (error) {
-        this.logger.warn(`Не удалось обновить счётчик поиска: ${describeError(error)}`);
+        this.logger.warn(`Не удалось обновить статус поиска: ${describeError(error)}`);
       }
     }
 
-    // Пустое расписание (в наборе нечего считать) всё равно должно выдержать паузу: пустой
-    // период, отвеченный мгновенно, выглядит так же неправдоподобно, как и непустой.
     const remainingMs = startedAt + minDurationMs - Date.now();
     if (remainingMs > 0) {
       await sleep(remainingMs);
@@ -735,21 +682,25 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
     label: string,
     result: CuratedSearchResult,
     now: Date,
+    live: CuratedMentionView[],
   ): Promise<void> {
-    if (result.pool.totalLinks === 0 || result.pool.mentionsTotal === 0) {
-      await telegram.sendMessage(chatId, EMPTY_POOL_TEXT);
+    const found = result.total > 0 ? await this.curatedSearchService.findPage(days, 0, result.total, now) : [];
+
+    // Один список, отсортированный по дате: найденное живым поиском и показываемое всегда стоит в
+    // нём вперемешку, по дате публикации. Отдельного блока «вот это я нашёл только что» нет
+    // намеренно — человек спрашивал упоминания за период, а не отчёт о том, какими способами бот
+    // их собирал.
+    const merged = [...live, ...found].sort(byPublishedAtDesc);
+
+    if (merged.length === 0) {
+      await telegram.sendMessage(chatId, result.pool.mentionsTotal === 0 ? EMPTY_POOL_TEXT : buildEmptyPeriodText(label));
       return;
     }
 
-    if (result.total === 0) {
-      await telegram.sendMessage(chatId, buildEmptyPeriodText(label, result, this.timezone));
-      return;
-    }
-
-    const items = await this.curatedSearchService.findPage(days, 0, result.total, now);
+    const mergedResult = withMergedTotals(result, merged);
     const messages = buildTitleListMessages({
-      header: buildHeader(label, result),
-      items,
+      header: buildHeader(label, mergedResult),
+      items: merged,
       startIndex: 1,
       timezone: this.timezone,
       charLimit: this.charLimit,
@@ -770,7 +721,7 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
       return;
     }
 
-    await this.sendExpandPrompt(telegram, chatId, days, result.total);
+    await this.sendExpandPrompt(telegram, chatId, days, mergedResult.total);
   }
 
   /** Вопрос «выводить ли каждую статью отдельным сообщением» с кнопками Да/Нет. */
@@ -1005,6 +956,40 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
 
 function describeError(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * Найденное живым поиском в том же виде, в каком выдача показывает любой другой материал. `null`
+ * (поиск упал целиком) — это пустой вклад, а не ошибка: выдача уходит человеку как обычно.
+ */
+function liveItems(outcome: LiveSearchOutcome | null): CuratedMentionView[] {
+  return (outcome?.finds ?? []).map(liveFindToMentionView);
+}
+
+/** Новые сверху. Материал без даты уходит в конец: сравнивать его по дате нечем. */
+function byPublishedAtDesc(a: CuratedMentionView, b: CuratedMentionView): number {
+  const left = a.publishedAt ? a.publishedAt.getTime() : -Infinity;
+  const right = b.publishedAt ? b.publishedAt.getTime() : -Infinity;
+  return right - left;
+}
+
+/**
+ * Итоги по списку, который реально уедет в сообщение, — вместе с найденным живым поиском.
+ *
+ * Пересчитывать приходится потому, что `search()` знает только про свою часть: если взять его
+ * `total` и его разбивку по тональности, шапка сказала бы «Всего: 5» над списком из семи строк.
+ */
+function withMergedTotals(result: CuratedSearchResult, merged: CuratedMentionView[]): CuratedSearchResult {
+  const bySentiment: Record<Sentiment, number> = {
+    [Sentiment.POSITIVE]: 0,
+    [Sentiment.NEGATIVE]: 0,
+    [Sentiment.NEUTRAL]: 0,
+    [Sentiment.UNDEFINED]: 0,
+  };
+  for (const item of merged) {
+    bySentiment[item.sentiment] += 1;
+  }
+  return { ...result, total: merged.length, bySentiment };
 }
 
 function sleep(ms: number): Promise<void> {

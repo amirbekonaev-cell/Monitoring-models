@@ -12,8 +12,8 @@ import { LiveSearchModule } from '../../live-search/live-search.module';
   // проверенные карточки (/curated_stats, /curated <издание>). Разные наборы данных и разные
   // команды, несмотря на похожие имена.
   // DashboardPublishModule — перенос выдачи /search в дашборд и ленту веб-интерфейса.
-  // LiveSearchModule — живой проход по RSS-лентам внутри паузы /search. Базу и OpenAI не трогает,
-  // так что свойство «/search отвечает и без них» сохраняется — см. LiveSearchModule.
+  // LiveSearchModule — живой поиск внутри паузы /search: RSS-ленты и веб-поиск. Базу не трогает,
+  // без OPENAI_API_KEY остаются ленты — см. LiveSearchModule.
   imports: [CuratedModule, CuratedMentionsModule, DashboardPublishModule, LiveSearchModule],
   controllers: [TelegramWebhookController],
   providers: [TelegramNotifierService, TelegramBotService],

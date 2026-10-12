@@ -11,7 +11,7 @@ function makeConfig(extra: Record<string, unknown> = {}): ConfigService {
   const values: Record<string, unknown> = {
     'curated.timezone': 'Asia/Almaty',
     'liveSearch.enabled': true,
-    'liveSearch.budgetMs': 12000,
+    'liveSearch.rssBudgetMs': 12000,
     'liveSearch.feedTimeoutMs': 8000,
     'liveSearch.brandForms': '',
     ...extra,
@@ -219,7 +219,7 @@ describe('LiveRssSearchService', () => {
     it('зависшая лента обрывается по своему потолку, проход завершается', async () => {
       const service = new LiveRssSearchService(
         makeRss({ [FIRST_FEED]: 'hang', [SECOND_FEED]: [item()] }),
-        makeConfig({ 'liveSearch.feedTimeoutMs': 50, 'liveSearch.budgetMs': 5000 }),
+        makeConfig({ 'liveSearch.feedTimeoutMs': 50, 'liveSearch.rssBudgetMs': 5000 }),
       );
 
       const startedAt = Date.now();

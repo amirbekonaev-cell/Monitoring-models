@@ -4,7 +4,9 @@ import { RssService, ParsedRssItem } from '../collectors/rss/rss.service';
 import { hasCurated, normalizeUrl } from '../curated/curated-mentions';
 import { subtractCalendarDays, zonedDateString } from '../curated/curated-date.util';
 import { ALL_TIME_PERIOD_DAYS } from '../curated/search-period.util';
+import { Sentiment } from '../mentions/mention.entity';
 import { matchesBrand, parseBrandForms } from './brand-match.util';
+import { LiveFind } from './live-find.types';
 import rawFeeds from './live-feeds.data.json';
 
 /** Одна лента: публикация, её домен и адрес фида. */
@@ -16,23 +18,13 @@ export interface LiveFeed {
 
 export const LIVE_FEEDS: LiveFeed[] = rawFeeds as LiveFeed[];
 
-/** Найденное живым проходом упоминание. Не карточка: человеком оно не проверено. */
-export interface LiveRssFind {
-  title: string;
-  url: string;
-  publishedAt: Date;
-  sourceName: string;
-  domain: string;
-  snippet: string | null;
-}
-
 /** Чем закончился проход — всё это уходит в сообщение, чтобы отчёт был проверяемым. */
 export interface LiveRssOutcome {
   feedsTotal: number;
   feedsOk: number;
   feedsFailed: number;
   itemsSeen: number;
-  finds: LiveRssFind[];
+  finds: LiveFind[];
   /** Совпадения, уже имеющиеся в наборе карточек, — в finds они не попадают. */
   alreadyKnown: number;
   /** Совпадения без даты: поместить их в период нечем, поэтому они не показываются. */
@@ -45,7 +37,7 @@ const SNIPPET_MAX_CHARS = 200;
 /** Потолок на ОДНУ ленту. Замерено: самая медленная из 17 отдаётся за ~3.2 с. */
 const DEFAULT_FEED_TIMEOUT_MS = 8000;
 
-/** Потолок на весь проход. 17 лент параллельно укладываются в ~3.2 с — это запас втрое. */
+/** Потолок на обход лент. 17 лент параллельно укладываются в ~3.2 с — это запас втрое. */
 const DEFAULT_BUDGET_MS = 12000;
 
 /**
@@ -94,7 +86,7 @@ export class LiveRssSearchService {
   }
 
   private get budgetMs(): number {
-    return positiveInt(this.config.get<number>('liveSearch.budgetMs'), DEFAULT_BUDGET_MS);
+    return positiveInt(this.config.get<number>('liveSearch.rssBudgetMs'), DEFAULT_BUDGET_MS);
   }
 
   private get feedTimeoutMs(): number {
@@ -175,12 +167,16 @@ export class LiveRssSearchService {
           publishedAt: item.publishedAt,
           sourceName: feed.sourceName,
           domain: feed.domain,
-          snippet: item.text ? item.text.slice(0, SNIPPET_MAX_CHARS).trim() || null : null,
+          // Описание из фида — это тизер, а не пересказ, но лучше него у ленты ничего нет.
+          summary: item.text ? item.text.slice(0, SNIPPET_MAX_CHARS).trim() || null : null,
+          // Тональность по ленте не определяется: выдумывать её нечем, а врать нельзя. Веб-поиск
+          // отдаёт её сам (см. OpenAiNewsSearchService), у ленты остаётся «не определена».
+          sentiment: Sentiment.UNDEFINED,
         });
       }
     }
 
-    outcome.finds.sort((a, b) => b.publishedAt.getTime() - a.publishedAt.getTime());
+    outcome.finds.sort((a, b) => (b.publishedAt as Date).getTime() - (a.publishedAt as Date).getTime());
     outcome.elapsedMs = Date.now() - startedAt;
 
     this.logger.log(

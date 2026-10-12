@@ -79,9 +79,14 @@ describe('buildPeriodConfirmationText', () => {
     );
   });
 
-  it('добавляет строку о перезаписанном дашборде, когда выдача туда перенесена', () => {
+  /**
+   * На успехе — только период, одной строкой. Строка про дашборд ушла: человек спрашивал
+   * упоминания, а не про устройство бота, и её число к тому же расходилось с числом в списке —
+   * в дашборд попадает не всё, что уезжает в сообщение.
+   */
+  it('на успешной записи в дашборд не добавляет ничего', () => {
     expect(buildPeriodConfirmationText('3 месяца', '2026-07-10', '2026-10-10', { published: 12 })).toBe(
-      'Период: 3 месяца (с 10.07.2026 по 10.10.2026)\nДашборд обновлён, материалов в веб-интерфейсе: 12.',
+      'Период: 3 месяца (с 10.07.2026 по 10.10.2026)',
     );
   });
 
@@ -92,10 +97,12 @@ describe('buildPeriodConfirmationText', () => {
     );
   });
 
-  // Пустая выдача — тоже результат: дашборд очищен, и про это сказано тем же способом.
-  it('сообщает про ноль материалов так же, как про любое другое число', () => {
-    expect(buildPeriodConfirmationText('Неделя', '2026-09-09', '2026-09-16', { published: 0 })).toContain(
-      'Дашборд обновлён, материалов в веб-интерфейсе: 0.',
+  it('без сведений о дашборде отдаёт ровно одну строку с периодом', () => {
+    expect(buildPeriodConfirmationText('Неделя', '2026-09-09', '2026-09-16')).toBe(
+      'Период: Неделя (с 09.09.2026 по 16.09.2026)',
+    );
+    expect(buildPeriodConfirmationText('Неделя', '2026-09-09', '2026-09-16', { published: 0 })).toBe(
+      'Период: Неделя (с 09.09.2026 по 16.09.2026)',
     );
   });
 });
@@ -122,9 +129,14 @@ describe('buildHeader', () => {
     expect(header).not.toContain('В очереди на обработку');
   });
 
-  it('includes the undated line only when undatedCount > 0', () => {
+  /**
+   * Строка про материалы без даты убрана: рядом с «Всего: N» она только путает, а знать её
+   * человеку незачем — это внутренняя статистика. Числа остались в /status.
+   */
+  it('не печатает строку про материалы без даты', () => {
     const header = buildHeader('Неделя', makeResult({ total: 1, undatedCount: 3 }));
-    expect(header).toContain('Без даты публикации (в выборки по периоду не входят): 3');
+    expect(header).not.toContain('Без даты');
+    expect(header).toContain('Всего: 1');
   });
 
   // The queue line is gone for good: the bot reads a JSON file that is never processed, so there
@@ -156,43 +168,24 @@ describe('buildHeader', () => {
 });
 
 describe('buildEmptyPeriodText', () => {
-  it('reports the processed-link count and the freshest article date', () => {
-    const text = buildEmptyPeriodText('Неделя', makeResult(), TZ);
-    expect(text).toBe(
-      'За Неделя упоминаний в пуле ссылок не найдено. Обработано ссылок: 169, самая свежая статья — 15.09.2026.',
-    );
+  /**
+   * Одна строка, и всё. Раньше здесь дописывалось, сколько у бота всего материалов и какой из них
+   * самый свежий, — это внутренняя статистика: человеку, спросившему про неделю, она не нужна,
+   * зато выдаёт устройство бота. Числа остались в /status, команде рабочей группы.
+   */
+  it('сообщает только то, что за период ничего не нашлось', () => {
+    expect(buildEmptyPeriodText('Неделя')).toBe('За Неделя упоминаний не найдено.');
   });
 
-  it('omits the freshest-article clause when the pool has no dated mentions at all', () => {
-    const text = buildEmptyPeriodText('Неделя', makeResult({ pool: makePool({ lastArticleDate: null }) }), TZ);
-    expect(text).toBe('За Неделя упоминаний в пуле ссылок не найдено. Обработано ссылок: 169.');
+  it('не рассказывает, сколько у бота материалов и откуда они', () => {
+    const text = buildEmptyPeriodText('Всё время').toLowerCase();
+    for (const leak of ['в наборе', 'обработано', 'пул', 'лент', 'самая свежая']) {
+      expect(text).not.toContain(leak);
+    }
   });
 
   it('never contains a URL', () => {
-    expect(buildEmptyPeriodText('Неделя', makeResult(), TZ)).not.toMatch(/https?:\/\//);
-  });
-
-  // The JSON source has no "processed links" to report — it has a set of a known size.
-  it('reports the set size instead of a processed-link count when the stats come from the card set', () => {
-    const pool = makePool({
-      cards: {
-        total: 168,
-        shown: 167,
-        duplicates: 1,
-        byStatus: { verified: 109, partial: 19, unverified: 39, duplicate: 0 },
-        bySentiment: {
-          [Sentiment.POSITIVE]: 120,
-          [Sentiment.NEGATIVE]: 2,
-          [Sentiment.NEUTRAL]: 44,
-          [Sentiment.UNDEFINED]: 0,
-        },
-      },
-    });
-
-    const text = buildEmptyPeriodText('Неделя', makeResult({ pool }), TZ);
-
-    expect(text).toBe('За Неделя упоминаний не найдено. Материалов в наборе: 167, самая свежая статья — 15.09.2026.');
-    expect(text).not.toContain('Обработано ссылок');
+    expect(buildEmptyPeriodText('Неделя')).not.toMatch(/https?:\/\//);
   });
 });
 
@@ -610,12 +603,10 @@ describe('buildTitleListMessages', () => {
 });
 
 describe('buildExpandPromptText', () => {
-  it('называет число найденного и обещает ссылку', () => {
+  it('одна короткая строка с числом найденного', () => {
     const text = buildExpandPromptText(166);
 
-    expect(text).toContain('Вывести каждую статью отдельным сообщением?');
-    expect(text).toContain('166');
-    expect(text).toContain('ссылка');
+    expect(text).toBe('Показать каждую статью подробнее? Найдено: 166.');
   });
 });
 
