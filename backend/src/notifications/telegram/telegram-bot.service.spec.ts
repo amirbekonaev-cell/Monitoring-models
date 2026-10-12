@@ -8,7 +8,7 @@ import {
 } from '../../curated/curated-search.types';
 import { CuratedJsonSearchService } from '../../curated/curated-json-search.service';
 import { CuratedResetService } from '../../curated/curated-reset.service';
-import { LiveRssOutcome, LiveRssSearchService } from '../../live-search/live-rss-search.service';
+import { LiveSearchOutcome, LiveSearchService } from '../../live-search/live-search.service';
 import { DashboardPublishService } from '../../curated/dashboard-publish.service';
 import { CuratedLinkStatus } from '../../curated/curated-link.entity';
 import { CuratedMentionsService } from '../../curated/curated-mentions.service';
@@ -158,25 +158,20 @@ function makeCuratedResetService(preview = { links: 169, mentions: 167 }): Curat
 }
 
 /**
- * Живой проход по лентам. По умолчанию «лент ноль» — то есть выключён: подавляющая часть тестов в
- * этом файле проверяет выдачу НАБОРА, и примешивать к ней сетевой канал там нечего. Тесты самого
- * прохода подставляют свой outcome.
+ * Живой поиск. По умолчанию ничего не находит — подавляющая часть тестов в этом файле проверяет
+ * выдачу бота, а не сетевые каналы, и примешивать их туда нечего. Тесты живого поиска передают
+ * свои находки.
  */
-function makeLiveRssSearchService(outcome: Partial<LiveRssOutcome> | null = null): LiveRssSearchService {
+function makeLiveSearchService(outcome: Partial<LiveSearchOutcome> = {}): LiveSearchService {
   return {
-    feedCount: outcome === null ? 0 : 17,
     collect: jest.fn(async () => ({
-      feedsTotal: 0,
-      feedsOk: 0,
-      feedsFailed: 0,
-      itemsSeen: 0,
       finds: [],
-      alreadyKnown: 0,
-      undated: 0,
+      channelsOk: 2,
+      channelsFailed: 0,
       elapsedMs: 0,
-      ...(outcome ?? {}),
+      ...outcome,
     })),
-  } as unknown as LiveRssSearchService;
+  } as unknown as LiveSearchService;
 }
 
 function makeCuratedSearchService(config: {
@@ -211,13 +206,13 @@ describe('TelegramBotService (closed-pool bot)', () => {
     curatedResetService: CuratedResetService = makeCuratedResetService(),
     extraConfig: Record<string, unknown> = {},
     dashboardPublishService: DashboardPublishService = makeDashboardPublishService(),
-    liveRssSearchService: LiveRssSearchService = makeLiveRssSearchService(),
+    liveSearchService: LiveSearchService = makeLiveSearchService(),
   ): Promise<{
     service: TelegramBotService;
     curatedSearchService: CuratedSearchSource;
     curatedResetService: CuratedResetService;
     dashboardPublishService: DashboardPublishService;
-    liveRssSearchService: LiveRssSearchService;
+    liveSearchService: LiveSearchService;
   }> {
     const service = new TelegramBotService(
       makeConfig(chatId, mode, extraConfig),
@@ -225,10 +220,10 @@ describe('TelegramBotService (closed-pool bot)', () => {
       curatedResetService,
       new CuratedMentionsService(),
       dashboardPublishService,
-      liveRssSearchService,
+      liveSearchService,
     );
     await service.onModuleInit();
-    return { service, curatedSearchService, curatedResetService, dashboardPublishService, liveRssSearchService };
+    return { service, curatedSearchService, curatedResetService, dashboardPublishService, liveSearchService };
   }
 
   it('registers /status and /search on init, without starting a long-poll connection in webhook mode', async () => {
@@ -275,7 +270,7 @@ describe('TelegramBotService (closed-pool bot)', () => {
       makeCuratedResetService(),
       new CuratedMentionsService(),
       makeDashboardPublishService(),
-      makeLiveRssSearchService(),
+      makeLiveSearchService(),
     );
     await service.onModuleInit();
 
@@ -458,7 +453,7 @@ describe('TelegramBotService (closed-pool bot)', () => {
       await commandHandlers.get('search')!(ctx);
 
       expect(ctx.reply).toHaveBeenCalledWith(
-        'За какой период показать упоминания из пула ссылок?',
+        'За какой период искать упоминания?',
         expect.anything(),
       );
       const [, extra] = (ctx.reply as jest.Mock).mock.calls[0];
@@ -486,7 +481,7 @@ describe('TelegramBotService (closed-pool bot)', () => {
      * переписывает дашборд веб-интерфейса под эту же выдачу. Проверяется и период (дашборд обязан
      * совпасть с сообщением), и строка-отчёт в подтверждении окна.
      */
-    it('переносит выдачу за выбранный период в дашборд и сообщает об этом', async () => {
+    it('переносит выдачу за выбранный период в дашборд, ничего не дописывая в чат', async () => {
       const dashboard = makeDashboardPublishService(12);
       await boot('-1001', makeCuratedSearchService(), 'webhook', makeCuratedResetService(), {}, dashboard);
       const ctx = makeCtx('-1001', { match: ['search_period:90', '90'] });
@@ -494,8 +489,10 @@ describe('TelegramBotService (closed-pool bot)', () => {
       await actionHandlers.get('/^search_period:(\\d+)$/')!(ctx);
 
       expect(dashboard.publish).toHaveBeenCalledWith(90, expect.any(Date));
+      // Про удачную запись в чате не сообщается — лишнего текста там быть не должно.
       const texts = (ctx.editMessageText as jest.Mock).mock.calls.map(([text]) => text as string);
-      expect(texts.some((text) => text.includes('Дашборд обновлён, материалов в веб-интерфейсе: 12'))).toBe(true);
+      expect(texts.some((text) => text.includes('Дашборд'))).toBe(false);
+      expect(texts.some((text) => text.includes('Период: 3 месяца'))).toBe(true);
     });
 
     /**
@@ -562,7 +559,7 @@ describe('TelegramBotService (closed-pool bot)', () => {
         expect(sendMessageMock).toHaveBeenCalled();
       });
 
-      it('за время ожидания показывает счётчик, доходящий до всего набора', async () => {
+      it('за время ожидания показывает процент, доходящий до 100', async () => {
         await boot('-1001', makeCards(166), 'webhook', makeCuratedResetService(), {
           'curated.minDurationMs': PACING_MS,
         });
@@ -571,11 +568,34 @@ describe('TelegramBotService (closed-pool bot)', () => {
         await actionHandlers.get('/^search_period:(\\d+)$/')!(ctx);
 
         const texts = (ctx.editMessageText as jest.Mock).mock.calls.map(([text]) => text as string);
-        const progress = texts.filter((text) => text.includes('Проверено:'));
+        const progress = texts.filter((text) => text.includes('%'));
         expect(progress.length).toBeGreaterThan(1);
-        expect(progress[progress.length - 1]).toContain('Проверено: 166 из 166 материалов');
-        // Подтверждение окна по-прежнему последнее, уже без счётчика.
+        expect(progress[progress.length - 1]).toContain('100%');
+        // Подтверждение окна по-прежнему последнее, уже без процента.
         expect(texts[texts.length - 1]).toContain('Период:');
+      });
+
+      /**
+       * Статус не называет внутренних чисел бота: сколько у него материалов и откуда они — его
+       * устройство, а не ответ на вопрос человека.
+       */
+      it('в статусе нет внутренних чисел и названий каналов', async () => {
+        await boot('-1001', makeCards(166), 'webhook', makeCuratedResetService(), {
+          'curated.minDurationMs': PACING_MS,
+        });
+        const ctx = makeCtx('-1001');
+
+        await actionHandlers.get('/^search_period:(\\d+)$/')!(ctx);
+
+        const statuses = (ctx.editMessageText as jest.Mock).mock.calls
+          .map(([text]) => String(text).toLowerCase())
+          .filter((text) => text.includes('%'));
+        expect(statuses.length).toBeGreaterThan(0);
+        for (const status of statuses) {
+          for (const leak of ['материал', 'проверено', '166', 'лент', 'набор']) {
+            expect(status).not.toContain(leak);
+          }
+        }
       });
 
       /** Пустой период, отвеченный мгновенно, выглядит так же неправдоподобно, как и непустой. */
@@ -625,17 +645,33 @@ describe('TelegramBotService (closed-pool bot)', () => {
     });
 
     /**
-     * Живой проход по RSS-лентам внутри /search. Главное, что здесь проверяется, — он остаётся
-     * ДОБАВЛЕНИЕМ: выдача набора уходит первой и не зависит от того, что проход нашёл, успел или
-     * упал. Сам проход протестирован отдельно (live-rss-search.service.spec.ts).
+     * Живой поиск внутри /search. Главное, что здесь проверяется, — найденное им попадает в ТОТ ЖЕ
+     * список, что и всё остальное, и выдача не рассказывает человеку, каким каналом что добыто.
+     * Сами каналы протестированы отдельно (live-search/*.spec.ts).
      */
-    describe('живой проход по лентам', () => {
+    describe('живой поиск внутри /search', () => {
       const PACING_MS = 300;
 
-      function bootWithLive(live: ReturnType<typeof makeLiveRssSearchService>, extra: Record<string, unknown> = {}) {
+      function liveFind(overrides: Record<string, unknown> = {}) {
+        return {
+          title: 'QazCloud открыл дата-центр',
+          url: 'https://tengrinews.kz/svezhaya-statya/',
+          publishedAt: new Date('2026-09-20T10:00:00Z'),
+          sourceName: 'Tengrinews',
+          domain: 'tengrinews.kz',
+          summary: 'Короткий пересказ найденной статьи.',
+          sentiment: Sentiment.POSITIVE,
+          ...overrides,
+        };
+      }
+
+      function bootWithLive(live: LiveSearchService, extra: Record<string, unknown> = {}, curatedTotal = 1) {
         return boot(
           '-1001',
-          makeCuratedSearchService({ searchResult: { total: 1 }, page: [makeMentionView()] }),
+          makeCuratedSearchService({
+            searchResult: { total: curatedTotal },
+            page: curatedTotal > 0 ? [makeMentionView()] : [],
+          }),
           'webhook',
           makeCuratedResetService(),
           extra,
@@ -648,50 +684,61 @@ describe('TelegramBotService (closed-pool bot)', () => {
         return sendMessageMock.mock.calls.map(([, text]) => text as string);
       }
 
-      it('отправляет отчёт о проходе после выдачи набора, даже когда нового нет', async () => {
-        await bootWithLive(makeLiveRssSearchService({ feedsTotal: 17, feedsOk: 17, itemsSeen: 1760 }));
+      it('ставит найденное в один список с остальным и считает его в «Всего»', async () => {
+        await bootWithLive(makeLiveSearchService({ finds: [liveFind()] as never }));
+        const ctx = makeCtx('-1001');
+
+        await actionHandlers.get('/^search_period:(\\d+)$/')!(ctx);
+
+        const list = sentTexts().find((text) => text.includes('Упоминания за')) as string;
+        expect(list).toBeDefined();
+        // Одна находка живого поиска плюс один свой материал — в шапке два.
+        expect(list).toContain('Всего: 2');
+        expect(list).toContain('QazCloud открыл дата-центр');
+        expect(list).toContain('Tengrinews');
+      });
+
+      /** Новые сверху: список один, и порядок в нём по дате, а не по происхождению материала. */
+      it('сортирует общий список по дате', async () => {
+        await bootWithLive(makeLiveSearchService({ finds: [liveFind()] as never }));
+        const ctx = makeCtx('-1001');
+
+        await actionHandlers.get('/^search_period:(\\d+)$/')!(ctx);
+
+        const list = sentTexts().find((text) => text.includes('Упоминания за')) as string;
+        // makeMentionView() датирован 14.09.2026, находка — 20.09.2026, значит она первая.
+        expect(list.indexOf('QazCloud открыл дата-центр')).toBeLessThan(list.indexOf('QazCloud упомянут в статье'));
+      });
+
+      /**
+       * Своих материалов за период нет, а живой поиск что-то нашёл — отвечать «не найдено» нельзя:
+       * найденное и есть ответ на вопрос.
+       */
+      it('показывает находки, даже когда за период больше ничего нет', async () => {
+        await bootWithLive(makeLiveSearchService({ finds: [liveFind()] as never }), {}, 0);
         const ctx = makeCtx('-1001');
 
         await actionHandlers.get('/^search_period:(\\d+)$/')!(ctx);
 
         const texts = sentTexts();
-        const reportIndex = texts.findIndex((text) => text.includes('Живой проход по RSS-лентам'));
-        expect(reportIndex).toBeGreaterThan(0);
-        expect(texts[reportIndex]).toContain('Опрошено лент: 17 из 17');
-        // Отчёт идёт ПОСЛЕ выдачи набора: заголовок выдачи отправлен раньше.
-        expect(texts.slice(0, reportIndex).some((text) => text.includes('Упоминания за'))).toBe(true);
+        expect(texts.some((text) => text.includes('упоминаний не найдено'))).toBe(false);
+        expect(texts.some((text) => text.includes('QazCloud открыл дата-центр'))).toBe(true);
       });
 
-      it('найденное уходит отдельными сообщениями со ссылкой', async () => {
-        await bootWithLive(
-          makeLiveRssSearchService({
-            feedsTotal: 17,
-            feedsOk: 17,
-            itemsSeen: 1760,
-            finds: [
-              {
-                title: 'QazCloud открыл дата-центр',
-                url: 'https://the-tech.kz/svezhaya-statya/',
-                publishedAt: new Date('2026-10-11T10:00:00Z'),
-                sourceName: 'The Tech',
-                domain: 'the-tech.kz',
-                snippet: null,
-              },
-            ],
-          }),
-        );
+      it('ничего не нашёл — выдача как обычно, без единого лишнего сообщения', async () => {
+        await bootWithLive(makeLiveSearchService());
         const ctx = makeCtx('-1001');
 
         await actionHandlers.get('/^search_period:(\\d+)$/')!(ctx);
 
         const texts = sentTexts();
-        expect(texts.some((text) => text.includes('Новых упоминаний за'))).toBe(true);
-        expect(texts.some((text) => text.includes('https://the-tech.kz/svezhaya-statya/'))).toBe(true);
+        expect(texts.some((text) => text.includes('Упоминания за'))).toBe(true);
+        expect(texts.some((text) => text.includes('лент'))).toBe(false);
       });
 
-      /** Проход — добавление; его падение не вправе превратить работающий /search в ошибку. */
-      it('упавший проход не ломает выдачу и не отправляет отчёт', async () => {
-        const live = makeLiveRssSearchService();
+      /** Живой поиск дополняет выдачу; его падение не вправе превратить /search в ошибку. */
+      it('упавший живой поиск не ломает выдачу', async () => {
+        const live = makeLiveSearchService();
         (live.collect as jest.Mock).mockRejectedValue(new Error('сеть недоступна'));
         await bootWithLive(live);
         const ctx = makeCtx('-1001');
@@ -700,21 +747,11 @@ describe('TelegramBotService (closed-pool bot)', () => {
 
         const texts = sentTexts();
         expect(texts.some((text) => text.includes('Упоминания за'))).toBe(true);
-        expect(texts.some((text) => text.includes('Живой проход'))).toBe(false);
         expect(texts.some((text) => text.includes('Не удалось выполнить поиск'))).toBe(false);
       });
 
-      it('выключенный проход (лент ноль) не добавляет ни одного сообщения', async () => {
-        await bootWithLive(makeLiveRssSearchService());
-        const ctx = makeCtx('-1001');
-
-        await actionHandlers.get('/^search_period:(\\d+)$/')!(ctx);
-
-        expect(sentTexts().some((text) => text.includes('Живой проход'))).toBe(false);
-      });
-
-      it('проход получает тот же период, что и выдача набора', async () => {
-        const live = makeLiveRssSearchService({ feedsTotal: 17, feedsOk: 17 });
+      it('живой поиск получает тот же период, что и выдача', async () => {
+        const live = makeLiveSearchService();
         await bootWithLive(live);
         const ctx = makeCtx('-1001', { match: ['search_period:90', '90'] });
 
@@ -724,18 +761,15 @@ describe('TelegramBotService (closed-pool bot)', () => {
       });
 
       /**
-       * Суть выбранной схемы: проход идёт ВНУТРИ паузы темпа выдачи, а не после неё, поэтому
-       * ожидание наполняется настоящей работой и при этом ни на что не удлиняется.
+       * Суть схемы: живой поиск идёт ВНУТРИ паузы темпа выдачи, а не после неё, поэтому ожидание
+       * наполнено настоящей работой и при этом ни на что не удлиняется.
        */
       it('идёт параллельно паузе, не удлиняя её', async () => {
-        const live = makeLiveRssSearchService({ feedsTotal: 17, feedsOk: 17 });
+        const live = makeLiveSearchService();
         (live.collect as jest.Mock).mockImplementation(
           async () =>
             new Promise((resolve) =>
-              setTimeout(
-                () => resolve({ feedsTotal: 17, feedsOk: 17, feedsFailed: 0, itemsSeen: 1760, finds: [], alreadyKnown: 0, undated: 0, elapsedMs: 200 }),
-                200,
-              ),
+              setTimeout(() => resolve({ finds: [], channelsOk: 2, channelsFailed: 0, elapsedMs: 200 }), 200),
             ),
         );
         await bootWithLive(live, { 'curated.minDurationMs': PACING_MS });
@@ -746,9 +780,30 @@ describe('TelegramBotService (closed-pool bot)', () => {
         const elapsed = Date.now() - startedAt;
 
         expect(elapsed).toBeGreaterThanOrEqual(PACING_MS);
-        // 200 мс прохода уложились внутрь 300 мс паузы, а не добавились к ним.
         expect(elapsed).toBeLessThan(PACING_MS + 200);
-        expect(sentTexts().some((text) => text.includes('Живой проход'))).toBe(true);
+      });
+
+      /**
+       * Сообщения бота не рассказывают, как он устроен: ни про ленты, ни про веб-поиск, ни про
+       * «набор» заранее собранных материалов, ни про то, что что-то «не проверено вручную».
+       * Человек спросил упоминания за период — он и получает упоминания за период.
+       */
+      it('не рассказывает в чате, откуда взяты материалы', async () => {
+        await bootWithLive(makeLiveSearchService({ finds: [liveFind()] as never }));
+        const ctx = makeCtx('-1001');
+
+        await actionHandlers.get('/^search_period:(\\d+)$/')!(ctx);
+
+        const everything = [
+          ...sentTexts(),
+          ...(ctx.editMessageText as jest.Mock).mock.calls.map(([text]) => text as string),
+        ]
+          .join(' ')
+          .toLowerCase();
+
+        for (const leak of ['лент', 'rss', 'openai', 'веб-поиск', 'в наборе', 'проверено вручную', 'пул']) {
+          expect(everything).not.toContain(leak);
+        }
       });
     });
 
@@ -924,10 +979,10 @@ describe('TelegramBotService (closed-pool bot)', () => {
       await actionHandlers.get('/^search_period:(\\d+)$/')!(ctx);
 
       const [, message] = sendMessageMock.mock.calls[0];
-      expect(message).toBe('Пул ссылок пуст или ещё не обработан.');
+      expect(message).toBe('Упоминаний не найдено.');
     });
 
-    it('reports an explicit "nothing in this period" text (with processed count + freshest date) when the pool has data but this window is empty', async () => {
+    it('answers one short line when the window is empty, with no internal statistics', async () => {
       const curatedSearchService = makeCuratedSearchService({
         pool: { byStatus: { [CuratedLinkStatus.PENDING]: 0, [CuratedLinkStatus.PROCESSED]: 169, [CuratedLinkStatus.NOT_RELEVANT]: 0, [CuratedLinkStatus.FAILED]: 0, [CuratedLinkStatus.EXCLUDED]: 0 }, lastArticleDate: new Date('2026-08-01T00:00:00Z') },
         searchResult: { total: 0 },
@@ -938,13 +993,12 @@ describe('TelegramBotService (closed-pool bot)', () => {
       await actionHandlers.get('/^search_period:(\\d+)$/')!(ctx);
 
       const [, message] = sendMessageMock.mock.calls[0];
-      expect(message).toContain('упоминаний в пуле ссылок не найдено');
-      expect(message).toContain('Обработано ссылок: 169');
-      expect(message).toContain('01.08.2026');
+      // Одна строка, без внутренней статистики: числа остались в /status.
+      expect(message).toBe('За Неделя упоминаний не найдено.');
       expect(message).not.toMatch(/https?:\/\//);
     });
 
-    it('mentions the undated count in the header, and never a processing queue', async () => {
+    it('не печатает в шапке ни материалов без даты, ни очереди обработки', async () => {
       const curatedSearchService = makeCuratedSearchService({
         searchResult: {
           total: 1,
@@ -967,7 +1021,7 @@ describe('TelegramBotService (closed-pool bot)', () => {
       await actionHandlers.get('/^search_period:(\\d+)$/')!(ctx);
 
       const [, message] = sendMessageMock.mock.calls[0];
-      expect(message).toContain('Без даты публикации (в выборки по периоду не входят): 4');
+      expect(message).not.toContain('Без даты');
       expect(message).not.toContain('В очереди на обработку');
     });
 
@@ -1004,7 +1058,11 @@ describe('TelegramBotService (closed-pool bot)', () => {
     it('после списка спрашивает, выводить ли статьи по одной, кнопками Да/Нет', async () => {
       const curatedSearchService = makeCuratedSearchService({
         searchResult: { total: 3 },
-        page: [makeMentionView()],
+        page: [
+          makeMentionView({ id: 'm-1' }),
+          makeMentionView({ id: 'm-2' }),
+          makeMentionView({ id: 'm-3' }),
+        ],
       });
       await boot('-1001', curatedSearchService);
       const ctx = makeCtx('-1001');
@@ -1012,8 +1070,8 @@ describe('TelegramBotService (closed-pool bot)', () => {
       await actionHandlers.get('/^search_period:(\\d+)$/')!(ctx);
 
       const [, prompt, extra] = sendMessageMock.mock.calls.at(-1) as [unknown, string, any];
-      expect(prompt).toContain('Вывести каждую статью отдельным сообщением?');
-      expect(prompt).toContain('Всего найдено: 3');
+      expect(prompt).toContain('Показать каждую статью подробнее?');
+      expect(prompt).toContain('Найдено: 3');
       const [[yes], [no]] = extra.reply_markup.inline_keyboard;
       expect(yes.callback_data).toBe('search_each:7:0');
       expect(no.callback_data).toBe('search_each:no');
@@ -1256,7 +1314,7 @@ describe('TelegramBotService (closed-pool bot)', () => {
 
       const texts = sentTexts();
       expect(texts).toHaveLength(1);
-      expect(texts[0]).toContain('упоминаний в пуле ссылок не найдено');
+      expect(texts[0]).toBe('За Неделя упоминаний не найдено.');
     });
 
     it('keeps sending the rest of the batch when one message fails', async () => {
@@ -1361,7 +1419,7 @@ describe('TelegramBotService (closed-pool bot)', () => {
       let texts = sentTexts();
       expect(texts).toHaveLength(2);
       expect(texts[0]).toContain('Упоминания за Неделя');
-      expect(texts[1]).toContain('Вывести каждую статью отдельным сообщением?');
+      expect(texts[1]).toContain('Показать каждую статью подробнее?');
 
       await runHandler(eachHandler(), makeCtx('-1001', { match: ['search_each:7:0', '7', '0'] }));
 

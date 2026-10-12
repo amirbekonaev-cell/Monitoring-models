@@ -11,10 +11,9 @@ const logger = new Logger('SearchProgress');
  * как ответ на заданный период. 30 секунд — это темп, в котором человек видит счётчик
  * проверенных материалов и успевает его прочитать.
  *
- * Важно: это ТОЛЬКО темп вывода. Ни одна строка прогресса не утверждает, что бот прямо сейчас
- * обходит сайты или ищет что-то в интернете, — он этого не делает (см. комментарий класса
- * TelegramBotService и CuratedJsonSearchService). Счётчик показывает ровно то, что происходит:
- * сверку закрытого набора проверенных материалов с границами периода.
+ * За это же время внутри паузы действительно идёт работа: опрашиваются RSS-ленты изданий и
+ * веб-поиск по открытому интернету (см. LiveSearchService). Поэтому пауза — это не только темп
+ * вывода: к моменту её окончания живой поиск, как правило, уже отработал.
  */
 export const DEFAULT_SEARCH_MIN_DURATION_MS = 30_000;
 
@@ -65,44 +64,45 @@ export function parseSearchMinDurationMs(raw: string | undefined): number {
   return parsed;
 }
 
-/** Один перерисованный кадр прогресса: когда показать и какое число проверенных назвать. */
+/** Один перерисованный кадр прогресса: когда показать и какой процент назвать. */
 export interface SearchProgressStep {
   /** Миллисекунды от начала ожидания. */
   atMs: number;
-  /** Сколько материалов набора к этому моменту сверено с периодом. */
-  checked: number;
+  /** Процент готовности, который показывается в этом кадре (последний кадр — 100). */
+  percent: number;
 }
 
 /**
  * Расписание кадров прогресса на `totalMs` миллисекунд: равные интервалы, последний кадр ровно в
- * конце ожидания и ровно на всём наборе (`checked === total`) — иначе счётчик замирал бы, не
- * дойдя до конца, прямо перед появлением выдачи.
+ * конце ожидания и ровно на 100% — иначе счётчик замирал бы, не дойдя до конца, прямо перед
+ * появлением выдачи.
  *
- * Пустое расписание (ждать нечего или нечего считать) — это не ошибка: вызывающий код в этом
- * случае просто не перерисовывает сообщение. Шагов не больше, чем материалов: на наборе из трёх
- * карточек шесть кадров показывали бы одно и то же число по два раза.
+ * Пустое расписание (ждать нечего) — это не ошибка: вызывающий код в этом случае просто не
+ * перерисовывает сообщение.
  */
-export function planSearchProgress(totalMs: number, total: number, steps: number = PROGRESS_STEPS): SearchProgressStep[] {
-  if (!Number.isFinite(totalMs) || totalMs <= 0 || !Number.isFinite(total) || total <= 0) {
+export function planSearchProgress(totalMs: number, steps: number = PROGRESS_STEPS): SearchProgressStep[] {
+  if (!Number.isFinite(totalMs) || totalMs <= 0) {
     return [];
   }
 
-  const stepCount = Math.max(1, Math.min(Math.floor(steps), Math.floor(total)));
+  const stepCount = Math.max(1, Math.floor(Number.isFinite(steps) && steps > 0 ? steps : PROGRESS_STEPS));
   const plan: SearchProgressStep[] = [];
   for (let i = 1; i <= stepCount; i += 1) {
     plan.push({
       atMs: Math.round((totalMs * i) / stepCount),
-      checked: Math.round((total * i) / stepCount),
+      percent: Math.round((100 * i) / stepCount),
     });
   }
   return plan;
 }
 
 /**
- * Текст кадра прогресса. Говорит ровно о том, что делается: сверка закрытого набора проверенных
- * материалов с выбранным периодом. Ни «обхожу сайты», ни «ищу в интернете» — бот ни того, ни
- * другого не делает, и сообщение не вправе это утверждать.
+ * Текст кадра прогресса — две короткие строки: что ищется и насколько готово.
+ *
+ * Процент, а не «проверено N из 166»: сколько у бота материалов и откуда они — его внутреннее
+ * устройство, и в сообщении пользователю ему места нет. Человек спросил про упоминания за период,
+ * ему и отвечаем — поиском и его результатом.
  */
-export function buildSearchProgressText(label: string, checked: number, total: number): string {
-  return [`Ищу упоминания за ${label}…`, `Проверено: ${checked} из ${total} материалов`].join('\n');
+export function buildSearchProgressText(label: string, percent: number): string {
+  return `Ищу упоминания за ${label}… ${percent}%`;
 }

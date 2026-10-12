@@ -145,17 +145,27 @@ export default () => ({
     itemsPerBatch: parseInt(process.env.SEARCH_ITEMS_PER_BATCH || '8', 10),
   },
   liveSearch: {
-    // Живой проход по RSS-лентам изданий внутри /search (см. LiveRssSearchService). Единственный
-    // канал сбора, который успевает отработать в запросе: замерено на реальной сети — 17 лент
-    // параллельно за 3.2 с, 1760 материалов, у всех есть дата. Идёт ВНУТРИ паузы
-    // SEARCH_MIN_DURATION_MS, поэтому к длительности /search ничего не добавляет.
+    // Живой поиск внутри /search (см. LiveSearchService): два канала сразу и параллельно — ленты
+    // изданий и веб-поиск по открытому интернету. Оба идут ВНУТРИ паузы SEARCH_MIN_DURATION_MS,
+    // поэтому к длительности /search не добавляют ничего (замер: ленты 3.2 с, веб-поиск 16–21 с).
+    //
+    // Потолок на ВЕСЬ живой поиск. Меньше паузы выдачи: то, что не успело, просто не попадает в
+    // выдачу — ждать дольше паузы нельзя, весь /search это один 60-секундный вызов на Vercel.
+    budgetMs: parseInt(process.env.SEARCH_LIVE_BUDGET_MS || '27000', 10),
+    // --- Канал «RSS-ленты изданий» ---
     // Выключается только явным SEARCH_LIVE_RSS=false.
     enabled: process.env.SEARCH_LIVE_RSS !== 'false',
-    // Потолок на весь проход и на одну ленту. Оба — внешним Promise.race: `timeout` у rss-parser
+    // Потолок на обход лент и на одну ленту. Оба — внешним Promise.race: `timeout` у rss-parser
     // на замере не сработал, лента висела минутами с выставленными ему 15 с.
-    budgetMs: parseInt(process.env.SEARCH_LIVE_RSS_BUDGET_MS || '12000', 10),
+    rssBudgetMs: parseInt(process.env.SEARCH_LIVE_RSS_BUDGET_MS || '12000', 10),
     feedTimeoutMs: parseInt(process.env.SEARCH_LIVE_RSS_FEED_TIMEOUT_MS || '8000', 10),
-    // Формы названия компании для живого прохода. Пусто — формы по умолчанию (те же, что сеет
+    // --- Канал «веб-поиск» (OpenAI Responses API, tools: web_search) ---
+    // Требует OPENAI_API_KEY (на деплое приходит из переменных окружения проекта Vercel). Без
+    // ключа канал молча выключается и остаются ленты — см. OpenAiNewsSearchService.available.
+    // Платный: 1–3 вызова инструмента на один /search, от длины периода не зависит.
+    openaiEnabled: process.env.SEARCH_LIVE_OPENAI !== 'false',
+    openaiTimeoutMs: parseInt(process.env.SEARCH_LIVE_OPENAI_TIMEOUT_MS || '26000', 10),
+    // Формы названия компании для живого поиска. Пусто — формы по умолчанию (те же, что сеет
     // npm run seed:keywords). Дублируются в коде, а не читаются из таблицы `keywords`, потому что
     // /search обязан работать без базы — см. brand-match.util.ts.
     brandForms: process.env.LIVE_SEARCH_BRAND_FORMS || '',

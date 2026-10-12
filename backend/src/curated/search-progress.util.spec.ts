@@ -46,55 +46,49 @@ describe('parseSearchMinDurationMs', () => {
 });
 
 describe('planSearchProgress', () => {
-  it('равные интервалы, последний кадр — в конце ожидания и на всём наборе', () => {
-    const plan = planSearchProgress(30000, 166);
+  it('равные интервалы, последний кадр — в конце ожидания и ровно на 100%', () => {
+    const plan = planSearchProgress(30000);
     expect(plan).toHaveLength(6);
     expect(plan.map((s) => s.atMs)).toEqual([5000, 10000, 15000, 20000, 25000, 30000]);
-    expect(plan[plan.length - 1]).toEqual({ atMs: 30000, checked: 166 });
-    expect(plan.map((s) => s.checked)).toEqual([28, 55, 83, 111, 138, 166]);
+    expect(plan.map((s) => s.percent)).toEqual([17, 33, 50, 67, 83, 100]);
+    expect(plan[plan.length - 1]).toEqual({ atMs: 30000, percent: 100 });
   });
 
-  it('счётчик только растёт и никогда не превышает набор', () => {
-    for (const total of [1, 2, 5, 17, 166, 1000]) {
-      const plan = planSearchProgress(30000, total);
-      const checked = plan.map((s) => s.checked);
-      expect(checked).toEqual([...checked].sort((a, b) => a - b));
-      expect(Math.max(...checked)).toBe(total);
+  it('процент только растёт и не превышает 100', () => {
+    for (const steps of [1, 2, 4, 6, 10]) {
+      const plan = planSearchProgress(30000, steps);
+      const percents = plan.map((s) => s.percent);
+      expect(percents).toEqual([...percents].sort((a, b) => a - b));
+      expect(Math.max(...percents)).toBe(100);
       expect(plan.map((s) => s.atMs)).toEqual([...plan.map((s) => s.atMs)].sort((a, b) => a - b));
     }
   });
 
-  /** На наборе меньше шести карточек шесть кадров показывали бы одно число по нескольку раз. */
-  it('кадров не больше, чем материалов в наборе', () => {
-    expect(planSearchProgress(30000, 3)).toHaveLength(3);
-    expect(planSearchProgress(30000, 1)).toEqual([{ atMs: 30000, checked: 1 }]);
+  it('ждать нечего — пустое расписание, а не исключение', () => {
+    expect(planSearchProgress(0)).toEqual([]);
+    expect(planSearchProgress(-1)).toEqual([]);
+    expect(planSearchProgress(Number.NaN)).toEqual([]);
   });
 
-  it('нечего ждать или нечего считать — пустое расписание, а не исключение', () => {
-    expect(planSearchProgress(0, 166)).toEqual([]);
-    expect(planSearchProgress(30000, 0)).toEqual([]);
-    expect(planSearchProgress(-1, 166)).toEqual([]);
-    expect(planSearchProgress(30000, -5)).toEqual([]);
-    expect(planSearchProgress(Number.NaN, 166)).toEqual([]);
-    expect(planSearchProgress(30000, Number.POSITIVE_INFINITY)).toEqual([]);
+  it('некорректное число шагов откатывается к значению по умолчанию', () => {
+    expect(planSearchProgress(30000, 0)).toHaveLength(6);
+    expect(planSearchProgress(30000, -3)).toHaveLength(6);
   });
 });
 
 describe('buildSearchProgressText', () => {
-  it('называет период и показывает, сколько материалов набора уже сверено', () => {
-    expect(buildSearchProgressText('Неделя', 83, 166)).toBe(
-      'Ищу упоминания за Неделя…\nПроверено: 83 из 166 материалов',
-    );
+  it('называет период и процент готовности, двумя словами', () => {
+    expect(buildSearchProgressText('Неделя', 50)).toBe('Ищу упоминания за Неделя… 50%');
   });
 
   /**
-   * Бот не обходит сайты и не ищет в интернете (набор закрыт — см. CuratedJsonSearchService),
-   * поэтому ни одна строка прогресса не вправе это утверждать. Тест держит формулировку.
+   * Сообщение не рассказывает, как бот устроен внутри: ни про заранее собранные материалы и их
+   * число, ни про ленты, ни про веб-поиск. Человек спросил упоминания за период — ему и отвечаем.
    */
-  it('не утверждает, что идёт обход сайтов или поиск в интернете', () => {
-    const text = buildSearchProgressText('Всё время', 166, 166).toLowerCase();
-    for (const claim of ['сайт', 'интернет', 'источник', 'лент', 'rss', 'openai', 'скачив', 'обход']) {
-      expect(text).not.toContain(claim);
+  it('не выдаёт устройство поиска и не называет внутренних чисел', () => {
+    const text = buildSearchProgressText('Всё время', 100).toLowerCase();
+    for (const leak of ['материал', 'проверено', 'набор', 'лент', 'rss', 'openai', 'источник', 'пул']) {
+      expect(text).not.toContain(leak);
     }
   });
 });
