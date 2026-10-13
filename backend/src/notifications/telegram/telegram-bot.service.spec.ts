@@ -9,6 +9,9 @@ import {
 import { CuratedJsonSearchService } from '../../curated/curated-json-search.service';
 import { CuratedResetService } from '../../curated/curated-reset.service';
 import { LiveSearchOutcome, LiveSearchService } from '../../live-search/live-search.service';
+import { LiveFindStoreService } from '../../live-search/live-find-store.service';
+import { LiveFind } from '../../live-search/live-find.types';
+import { StoredLiveFinds } from '../../live-search/live-find-store.util';
 import { DashboardPublishService } from '../../curated/dashboard-publish.service';
 import { CuratedLinkStatus } from '../../curated/curated-link.entity';
 import { CuratedMentionsService } from '../../curated/curated-mentions.service';
@@ -174,6 +177,25 @@ function makeLiveSearchService(outcome: Partial<LiveSearchOutcome> = {}): LiveSe
   } as unknown as LiveSearchService;
 }
 
+/**
+ * Хранилище находок в памяти — те же правила, что у LiveFindStoreService поверх `settings`: одна
+ * запись на период, каждое сохранение заменяет её целиком.
+ */
+function makeLiveFindStore(seed: Record<number, LiveFind[]> = {}): LiveFindStoreService & {
+  rows: Map<number, StoredLiveFinds>;
+} {
+  const rows = new Map<number, StoredLiveFinds>(
+    Object.entries(seed).map(([days, finds]) => [Number(days), { savedAt: new Date(), finds }]),
+  );
+  return {
+    rows,
+    save: jest.fn(async (periodDays: number, finds: LiveFind[], now: Date = new Date()) => {
+      rows.set(periodDays, { savedAt: now, finds: [...finds] });
+    }),
+    load: jest.fn(async (periodDays: number) => rows.get(periodDays) ?? { savedAt: null, finds: [] }),
+  } as unknown as LiveFindStoreService & { rows: Map<number, StoredLiveFinds> };
+}
+
 function makeCuratedSearchService(config: {
   pool?: Partial<PoolStats>;
   searchResult?: Partial<CuratedSearchResult>;
@@ -207,12 +229,14 @@ describe('TelegramBotService (closed-pool bot)', () => {
     extraConfig: Record<string, unknown> = {},
     dashboardPublishService: DashboardPublishService = makeDashboardPublishService(),
     liveSearchService: LiveSearchService = makeLiveSearchService(),
+    liveFindStore: LiveFindStoreService = makeLiveFindStore(),
   ): Promise<{
     service: TelegramBotService;
     curatedSearchService: CuratedSearchSource;
     curatedResetService: CuratedResetService;
     dashboardPublishService: DashboardPublishService;
     liveSearchService: LiveSearchService;
+    liveFindStore: LiveFindStoreService;
   }> {
     const service = new TelegramBotService(
       makeConfig(chatId, mode, extraConfig),
@@ -221,9 +245,17 @@ describe('TelegramBotService (closed-pool bot)', () => {
       new CuratedMentionsService(),
       dashboardPublishService,
       liveSearchService,
+      liveFindStore,
     );
     await service.onModuleInit();
-    return { service, curatedSearchService, curatedResetService, dashboardPublishService, liveSearchService };
+    return {
+      service,
+      curatedSearchService,
+      curatedResetService,
+      dashboardPublishService,
+      liveSearchService,
+      liveFindStore,
+    };
   }
 
   it('registers /status and /search on init, without starting a long-poll connection in webhook mode', async () => {
@@ -271,6 +303,7 @@ describe('TelegramBotService (closed-pool bot)', () => {
       new CuratedMentionsService(),
       makeDashboardPublishService(),
       makeLiveSearchService(),
+      makeLiveFindStore(),
     );
     await service.onModuleInit();
 
@@ -488,7 +521,8 @@ describe('TelegramBotService (closed-pool bot)', () => {
 
       await actionHandlers.get('/^search_period:(\\d+)$/')!(ctx);
 
-      expect(dashboard.publish).toHaveBeenCalledWith(90, expect.any(Date));
+      // Третий аргумент — находки живого поиска: в дашборд уезжает та же выдача, что в чат.
+      expect(dashboard.publish).toHaveBeenCalledWith(90, expect.any(Date), []);
       // Про удачную запись в чате не сообщается — лишнего текста там быть не должно.
       const texts = (ctx.editMessageText as jest.Mock).mock.calls.map(([text]) => text as string);
       expect(texts.some((text) => text.includes('Дашборд'))).toBe(false);
@@ -665,7 +699,12 @@ describe('TelegramBotService (closed-pool bot)', () => {
         };
       }
 
-      function bootWithLive(live: LiveSearchService, extra: Record<string, unknown> = {}, curatedTotal = 1) {
+      function bootWithLive(
+        live: LiveSearchService,
+        extra: Record<string, unknown> = {},
+        curatedTotal = 1,
+        liveFindStore: LiveFindStoreService = makeLiveFindStore(),
+      ) {
         return boot(
           '-1001',
           makeCuratedSearchService({
@@ -677,6 +716,7 @@ describe('TelegramBotService (closed-pool bot)', () => {
           extra,
           makeDashboardPublishService(),
           live,
+          liveFindStore,
         );
       }
 
@@ -781,6 +821,166 @@ describe('TelegramBotService (closed-pool bot)', () => {
 
         expect(elapsed).toBeGreaterThanOrEqual(PACING_MS);
         expect(elapsed).toBeLessThan(PACING_MS + 200);
+      });
+
+      /**
+       * Разворот статей по одному сообщению. Главное в этом блоке — найденное живым поиском
+       * получает СВОЁ сообщение с пересказом и ссылкой, а не только строку в списке заголовков.
+       *
+       * Ровно это и было сломано: «Да, по одной» — отдельное нажатие и отдельный вызов вебхука, в
+       * котором от живого поиска в памяти не остаётся ничего, и статьи собирались заново из одного
+       * набора карточек. Статья, найденная веб-поиском, стояла в списке, но своего сообщения
+       * никогда не получала.
+       */
+      describe('разворот статей по одному сообщению', () => {
+        const eachHandler = () => actionHandlers.get('/^search_each:(\\d+):(\\d+)$/')!;
+        const eachCtx = () => makeCtx('-1001', { match: ['search_each:7:0', '7', '0'] });
+        /**
+         * Находка внутри недельного окна. Дата именно «сейчас», а не фиксированная: разворот
+         * пересчитывает окно периода (от момента сохранения находок), и материал сентября 2026 в
+         * «Неделю» не попал бы — как не попал бы и в настоящей выдаче.
+         */
+        const freshFind = (overrides: Record<string, unknown> = {}) =>
+          liveFind({ publishedAt: new Date(), ...overrides });
+
+        it('находка получает своё сообщение с пересказом и ссылкой', async () => {
+          const store = makeLiveFindStore();
+          await bootWithLive(makeLiveSearchService({ finds: [freshFind()] as never }), {}, 1, store);
+
+          await actionHandlers.get('/^search_period:(\\d+)$/')!(makeCtx('-1001'));
+          sendMessageMock.mockClear();
+          await eachHandler()(eachCtx());
+
+          const texts = sentTexts();
+          // Две статьи: находка живого поиска и материал набора — по сообщению на каждую.
+          expect(texts).toHaveLength(2);
+          const find = texts.find((text) => text.includes('QazCloud открыл дата-центр')) as string;
+          expect(find).toBeDefined();
+          expect(find).toContain('Короткий пересказ найденной статьи.');
+          expect(find).toContain('https://tengrinews.kz/svezhaya-statya/');
+        });
+
+        /** Нумерация и порядок — те же, что в списке заголовков: находка новее, значит первая. */
+        it('нумерует статьи сквозь весь период, находку вместе с остальными', async () => {
+          await bootWithLive(makeLiveSearchService({ finds: [freshFind()] as never }));
+
+          await actionHandlers.get('/^search_period:(\\d+)$/')!(makeCtx('-1001'));
+          sendMessageMock.mockClear();
+          await eachHandler()(eachCtx());
+
+          const texts = sentTexts();
+          expect(texts[0]).toContain('1. ');
+          expect(texts[0]).toContain('QazCloud открыл дата-центр');
+          expect(texts[1]).toContain('2. ');
+        });
+
+        it('кладёт находки в хранилище под тем же периодом, что и выдача', async () => {
+          const store = makeLiveFindStore();
+          await bootWithLive(makeLiveSearchService({ finds: [freshFind()] as never }), {}, 1, store);
+
+          await actionHandlers.get('/^search_period:(\\d+)$/')!(
+            makeCtx('-1001', { match: ['search_period:90', '90'] }),
+          );
+
+          expect(store.save).toHaveBeenCalledWith(
+            90,
+            [expect.objectContaining({ url: 'https://tengrinews.kz/svezhaya-statya/' })],
+            expect.any(Date),
+          );
+        });
+
+        /**
+         * Упавший живой поиск затирает прежние находки пустым списком: список заголовков, который
+         * человек только что увидел, тоже без них, и разворот обязан показать ровно то же — иначе
+         * в сообщениях всплыли бы статьи от прошлого нажатия.
+         */
+        it('упавший живой поиск очищает находки прошлого нажатия', async () => {
+          const store = makeLiveFindStore({ 7: [freshFind() as never] });
+          const live = makeLiveSearchService();
+          (live.collect as jest.Mock).mockRejectedValue(new Error('сеть недоступна'));
+          await bootWithLive(live, {}, 1, store);
+
+          await actionHandlers.get('/^search_period:(\\d+)$/')!(makeCtx('-1001'));
+          sendMessageMock.mockClear();
+          await eachHandler()(eachCtx());
+
+          const texts = sentTexts();
+          expect(texts).toHaveLength(1);
+          expect(texts[0]).not.toContain('QazCloud открыл дата-центр');
+        });
+
+        /**
+         * Находка, выпавшая из периода к моменту разворота (запись в хранилище осталась от
+         * прошлого нажатия, а окно отсчитывается заново), в сообщения не попадает: шапка с датами
+         * и список статей не вправе разойтись.
+         */
+        it('не показывает находку, выпавшую из периода', async () => {
+          const store = makeLiveFindStore({
+            7: [liveFind({ publishedAt: new Date('2020-01-01T10:00:00Z') }) as never],
+          });
+          await bootWithLive(makeLiveSearchService(), {}, 1, store);
+
+          await eachHandler()(eachCtx());
+
+          const texts = sentTexts();
+          expect(texts).toHaveLength(1);
+          expect(texts[0]).not.toContain('QazCloud открыл дата-центр');
+        });
+
+        /**
+         * Недоступная база — это выдача без находок, а не ошибка в чате: /search обязан отвечать
+         * и с упавшим Postgres (хранилище — единственное место в этом пути, которое его трогает).
+         */
+        it('недоступное хранилище не ломает ни выдачу, ни разворот', async () => {
+          const store = makeLiveFindStore();
+          (store.save as jest.Mock).mockRejectedValue(new Error('no connection to postgres'));
+          (store.load as jest.Mock).mockRejectedValue(new Error('no connection to postgres'));
+          await bootWithLive(makeLiveSearchService({ finds: [freshFind()] as never }), {}, 1, store);
+
+          await actionHandlers.get('/^search_period:(\\d+)$/')!(makeCtx('-1001'));
+          // Список заголовков всё равно с находкой: она ещё в памяти этого же вызова.
+          expect(sentTexts()[0]).toContain('QazCloud открыл дата-центр');
+
+          sendMessageMock.mockClear();
+          await eachHandler()(eachCtx());
+
+          const texts = sentTexts();
+          expect(texts).toHaveLength(1);
+          expect(texts.join(' ')).not.toContain('Не удалось выполнить поиск');
+        });
+
+        /** Упакованные страницы («Показать ещё») считают находки так же, как поштучный поток. */
+        it('упакованная страница тоже включает находку', async () => {
+          const store = makeLiveFindStore({ 7: [freshFind() as never] });
+          await bootWithLive(makeLiveSearchService(), {}, 1, store);
+
+          await actionHandlers.get('/^search_more:(\\d+):(\\d+)$/')!(
+            makeCtx('-1001', { match: ['search_more:7:0', '7', '0'] }),
+          );
+
+          expect(sentTexts()[0]).toContain('QazCloud открыл дата-центр');
+        });
+
+        /** Дашборд получает ту же выдачу, что и чат: иначе веб-интерфейс расходится с ботом. */
+        it('передаёт находки в дашборд', async () => {
+          const dashboard = makeDashboardPublishService();
+          await boot(
+            '-1001',
+            makeCuratedSearchService({ searchResult: { total: 1 }, page: [makeMentionView()] }),
+            'webhook',
+            makeCuratedResetService(),
+            {},
+            dashboard,
+            makeLiveSearchService({ finds: [freshFind()] as never }),
+            makeLiveFindStore(),
+          );
+
+          await actionHandlers.get('/^search_period:(\\d+)$/')!(makeCtx('-1001'));
+
+          expect(dashboard.publish).toHaveBeenCalledWith(7, expect.any(Date), [
+            expect.objectContaining({ title: 'QazCloud открыл дата-центр' }),
+          ]);
+        });
       });
 
       /**
@@ -1162,10 +1362,12 @@ describe('TelegramBotService (closed-pool bot)', () => {
     });
 
     it('clears the keyboard on the previous message, fetches the next page at the given offset, and reports the correct remaining count', async () => {
-      const items = [makeMentionView({ id: 'm-4', title: 'Находка 4' })];
+      // Окно из пяти материалов целиком: смещение теперь применяется к общему списку, а не к
+      // запросу, поэтому источник обязан отдавать окно так же, как отдаёт его бот в жизни.
+      const window = Array.from({ length: 5 }, (_, i) => makeMentionView({ id: `m-${i}`, title: `Находка ${i}` }));
       const curatedSearchService = makeCuratedSearchService({
-        searchResult: { total: 5 },
-        page: items,
+        searchResult: { total: window.length },
+        page: window,
       });
       await boot('-1001', curatedSearchService);
       const ctx = makeMoreCtx('-1001', 7, 4);
@@ -1174,7 +1376,9 @@ describe('TelegramBotService (closed-pool bot)', () => {
 
       expect(ctx.answerCbQuery).toHaveBeenCalled();
       expect(ctx.editMessageReplyMarkup).toHaveBeenCalledWith({ inline_keyboard: [] });
-      expect(curatedSearchService.findPage).toHaveBeenCalledWith(7, 4, expect.any(Number), expect.any(Date));
+      // Окно читается целиком и уже потом нарезается по смещению: в общем списке материалы
+      // стоят вперемешку с находками живого поиска, и страницу №N иначе не собрать (periodItems).
+      expect(curatedSearchService.findPage).toHaveBeenCalledWith(7, 0, expect.any(Number), expect.any(Date));
       const [, message, extra] = sendMessageMock.mock.calls[0] as [unknown, string, any];
       expect(message).toContain('5. '); // startIndex = offset + 1
       expect(message).toContain('Находка 4');
@@ -1284,9 +1488,14 @@ describe('TelegramBotService (closed-pool bot)', () => {
         .filter((t) => /^\d+\. /.test(t))
         .map((t) => parseInt(t.split('.')[0], 10));
       expect(numbered).toEqual(Array.from({ length: total }, (_, i) => i + 1));
-      expect(curatedSearchService.findPage).toHaveBeenCalledWith(7, 0, 8, expect.any(Date));
-      expect(curatedSearchService.findPage).toHaveBeenCalledWith(7, 8, 8, expect.any(Date));
-      expect(curatedSearchService.findPage).toHaveBeenCalledWith(7, 16, 8, expect.any(Date));
+      // Главное здесь — ровно 19 статей, по одной, без дублей и пропусков (проверено выше).
+      // Смещение при этом применяется к общему списку, а не к запросу: окно каждый раз читается
+      // целиком, потому что в нём вперемешку стоят находки живого поиска — см. periodItems.
+      expect((curatedSearchService.findPage as jest.Mock).mock.calls).toEqual([
+        [7, 0, total, expect.any(Date)],
+        [7, 0, total, expect.any(Date)],
+        [7, 0, total, expect.any(Date)],
+      ]);
     });
 
     it('drops the "Показать ещё" button on the last batch', async () => {

@@ -16,6 +16,8 @@ import { CuratedMention } from '../../curated/curated-mentions';
 import { searchPeriodLabel } from '../../curated/search-period.util';
 import { buildSearchProgressText, planSearchProgress } from '../../curated/search-progress.util';
 import { LiveSearchOutcome, LiveSearchService } from '../../live-search/live-search.service';
+import { LiveFindStoreService } from '../../live-search/live-find-store.service';
+import { filterFindsToPeriod } from '../../live-search/live-find-period.util';
 import { liveFindToMentionView } from '../../live-search/live-find.types';
 import {
   CURATED_MENTIONS_BATCH_SIZE,
@@ -109,6 +111,7 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
     private readonly curatedMentionsService: CuratedMentionsService,
     private readonly dashboardPublishService: DashboardPublishService,
     private readonly liveSearchService: LiveSearchService,
+    private readonly liveFindStore: LiveFindStoreService,
   ) {}
 
   private get periodDays(): number[] {
@@ -465,15 +468,22 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
         // выдачи (ленты ~3 с, веб-поиск 16–21 с — внутри 30 с ожидания), поэтому к длительности
         // /search не добавляет ничего. Ошибка внутри него уже обработана — см. startLiveSearch.
         const livePass = this.startLiveSearch(days, now);
-        // Нажатая кнопка периода — единственное, что решает, какие материалы лежат в дашборде и
-        // ленте веб-интерфейса: выдача за этот период заменяет там всё, что было раньше (см.
-        // DashboardPublishService). Поэтому запись идёт здесь, а не после отправки сообщений, —
-        // иначе сбой на отправке оставил бы в веб-интерфейсе прежний набор.
-        const dashboard = await this.publishToDashboard(days, now);
         await this.showSearchProgress(ctx, label, startedAt);
         const live = await livePass;
+        const liveViews = liveItems(live);
+        // Находки кладутся в хранилище СРАЗУ, до отправки списка: разворот статей по одному
+        // сообщению — это уже другое нажатие и другой вызов вебхука, и взять их там больше
+        // негде. Повторить живой поиск нельзя — он платный и во второй раз отдаёт другой набор
+        // (см. LiveFindStoreService).
+        await this.storeLiveFinds(days, live, now);
+        // Нажатая кнопка периода — единственное, что решает, какие материалы лежат в дашборде и
+        // ленте веб-интерфейса: выдача за этот период заменяет там всё, что было раньше (см.
+        // DashboardPublishService). Запись идёт здесь, а не после отправки сообщений, — иначе
+        // сбой на отправке оставил бы в веб-интерфейсе прежний набор, — и уже ПОСЛЕ живого
+        // поиска, чтобы в дашборд уехала та же выдача, что и в Telegram, вместе с находками.
+        const dashboard = await this.publishToDashboard(days, now, liveViews);
         await ctx.editMessageText(buildPeriodConfirmationText(label, result.dateFrom, result.dateTo, dashboard));
-        await this.sendFirstResultsPage(ctx.telegram, chatId, days, label, result, now, liveItems(live));
+        await this.sendFirstResultsPage(ctx.telegram, chatId, days, label, result, now, liveViews);
       } catch (error) {
         await this.replyWithSearchError(ctx.telegram, chatId, error);
       }
@@ -513,17 +523,23 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
         const result = await this.curatedSearchService.search(days, now);
 
         if (this.oneArticlePerMessage) {
-          const sent = await this.sendItemsOnePerMessage(ctx.telegram, chatId, days, result, offset, now);
+          const sent = await this.sendItemsOnePerMessage(
+            ctx.telegram,
+            chatId,
+            days,
+            await this.periodItems(days, result, now),
+            offset,
+          );
           if (sent === 0) {
             await ctx.telegram.sendMessage(chatId, 'Больше записей нет.');
           }
           return;
         }
 
-        const items = await this.curatedSearchService.findPage(days, offset, PAGE_FETCH_BATCH_SIZE, now);
+        const periodItems = await this.periodItems(days, result, now);
         const { text, shownCount } = buildPage({
           header: null,
-          items,
+          items: periodItems.slice(offset, offset + PAGE_FETCH_BATCH_SIZE),
           startIndex: offset + 1,
           timezone: this.timezone,
           charLimit: this.charLimit,
@@ -534,7 +550,7 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
           return;
         }
 
-        const remaining = result.total - (offset + shownCount);
+        const remaining = periodItems.length - (offset + shownCount);
         const replyMarkup = remaining > 0 ? this.buildMoreKeyboard(days, offset + shownCount, remaining) : undefined;
         await ctx.telegram.sendMessage(chatId, text, {
           parse_mode: 'HTML',
@@ -596,7 +612,13 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
       try {
         const now = new Date();
         const result = await this.curatedSearchService.search(days, now);
-        const sent = await this.sendItemsOnePerMessage(ctx.telegram, chatId, days, result, offset, now);
+        const sent = await this.sendItemsOnePerMessage(
+          ctx.telegram,
+          chatId,
+          days,
+          await this.periodItems(days, result, now),
+          offset,
+        );
         if (sent === 0) {
           await ctx.telegram.sendMessage(chatId, 'Больше записей нет.');
         }
@@ -604,6 +626,72 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
         await this.replyWithSearchError(ctx.telegram, chatId, error);
       }
     });
+  }
+
+  /**
+   * ОДИН список материалов за период — то, из чего состоит и обзор заголовков, и разворот статей
+   * по одному сообщению: найденное живым поиском и карточки набора вперемешку, по дате публикации.
+   *
+   * Отдельного блока «вот это я нашёл только что» нет намеренно: человек спрашивал упоминания за
+   * период, а не отчёт о том, какими способами бот их собирал.
+   *
+   * `live` передаётся только в том вызове, который сам запускал живой поиск (нажатие периода). Во
+   * всех остальных — «Да, по одной», «Показать ещё» — это уже другой вызов вебхука, от прежнего в
+   * памяти не осталось ничего, и находки читаются из хранилища. Именно поэтому разворот
+   * показывает те же статьи, что человек увидел в списке, вместе с пересказом и ссылкой: до
+   * хранилища он собирал статьи заново из одного набора, и найденного живым поиском в нём не было.
+   */
+  private async periodItems(
+    days: number,
+    result: CuratedSearchResult,
+    now: Date,
+    live?: CuratedMentionView[],
+  ): Promise<CuratedMentionView[]> {
+    // Окно читается ЦЕЛИКОМ, а не страницей по смещению: порядок в общем списке задаёт дата, и
+    // чтобы отдать страницу №3, надо сперва знать, где в нём встали находки. Для источника бота
+    // это срез массива в памяти (CuratedJsonSearchService, карточки из JSON), так что лишней
+    // работы здесь нет.
+    const found = result.total > 0 ? await this.curatedSearchService.findPage(days, 0, result.total, now) : [];
+    const liveViews = live ?? (await this.storedLiveItems(days, now));
+    return [...liveViews, ...found].sort(byPublishedAtDesc);
+  }
+
+  /**
+   * Находки последнего /search за период из хранилища.
+   *
+   * Окно периода отсчитывается от момента, когда находки были СОХРАНЕНЫ, а не от «сейчас»: иначе
+   * статья на границе окна (поиск за неделю вечером, разворот после полуночи) исчезла бы из
+   * сообщений, хотя в списке заголовков человек её только что видел. Фильтр при этом остаётся —
+   * он же заново сверяет находки с набором карточек и отбрасывает дубли.
+   *
+   * Сбой базы — это пустой вклад и предупреждение, а не ошибка выдачи: человек получит статьи
+   * набора, как получал их до появления хранилища. /search обязан отвечать и с недоступным
+   * Postgres.
+   */
+  private async storedLiveItems(days: number, now: Date): Promise<CuratedMentionView[]> {
+    try {
+      const stored = await this.liveFindStore.load(days);
+      return filterFindsToPeriod(stored.finds, days, stored.savedAt ?? now, this.timezone).map(liveFindToMentionView);
+    } catch (error) {
+      this.logger.warn(`Не удалось прочитать находки живого поиска за ${days} дн.: ${describeError(error)}`);
+      return [];
+    }
+  }
+
+  /**
+   * Сохраняет находки, которыми только что дополнена выдача.
+   *
+   * Упавший живой поиск (`null`) сохраняется как ПУСТОЙ список, а не оставляет прежние находки:
+   * список заголовков, который человек видит, в этот раз тоже без них, и разворот обязан
+   * показать ровно то, что в списке, — иначе в сообщениях появились бы статьи из прошлого
+   * нажатия.
+   */
+  private async storeLiveFinds(days: number, outcome: LiveSearchOutcome | null, now: Date): Promise<void> {
+    try {
+      await this.liveFindStore.save(days, outcome?.finds ?? [], now);
+    } catch (error) {
+      this.logger.warn(`Не удалось сохранить находки живого поиска за ${days} дн.: ${describeError(error)}`);
+    }
   }
 
   /**
@@ -684,13 +772,7 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
     now: Date,
     live: CuratedMentionView[],
   ): Promise<void> {
-    const found = result.total > 0 ? await this.curatedSearchService.findPage(days, 0, result.total, now) : [];
-
-    // Один список, отсортированный по дате: найденное живым поиском и показываемое всегда стоит в
-    // нём вперемешку, по дате публикации. Отдельного блока «вот это я нашёл только что» нет
-    // намеренно — человек спрашивал упоминания за период, а не отчёт о том, какими способами бот
-    // их собирал.
-    const merged = [...live, ...found].sort(byPublishedAtDesc);
+    const merged = await this.periodItems(days, result, now, live);
 
     if (merged.length === 0) {
       await telegram.sendMessage(chatId, result.pool.mentionsTotal === 0 ? EMPTY_POOL_TEXT : buildEmptyPeriodText(label));
@@ -717,7 +799,7 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
     }
 
     if (this.oneArticlePerMessage) {
-      await this.sendItemsOnePerMessage(telegram, chatId, days, result, 0, now);
+      await this.sendItemsOnePerMessage(telegram, chatId, days, merged, 0);
       return;
     }
 
@@ -765,16 +847,14 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
     telegram: Telegraf['telegram'],
     chatId: number,
     days: number,
-    result: CuratedSearchResult,
+    periodItems: CuratedMentionView[],
     offset: number,
-    now: Date,
   ): Promise<number> {
     const batchSize = this.itemsPerBatch;
-    const items = await this.curatedSearchService.findPage(days, offset, batchSize, now);
     const { messages, nextOffset, remaining } = buildItemMessages({
-      items,
+      items: periodItems.slice(offset, offset + batchSize),
       startOffset: offset,
-      total: result.total,
+      total: periodItems.length,
       timezone: this.timezone,
       batchSize,
     });
@@ -810,7 +890,7 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
 
     if (!keyboardDelivered && replyMarkup) {
       try {
-        await telegram.sendMessage(chatId, buildMoreButtonFallbackText(nextOffset, result.total), {
+        await telegram.sendMessage(chatId, buildMoreButtonFallbackText(nextOffset, periodItems.length), {
           reply_markup: replyMarkup,
         });
       } catch (error) {
@@ -925,9 +1005,13 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
    * читает карточки из JSON. Поэтому сбой логируется и уезжает в сообщение отдельной строкой
    * (published: null), чтобы человек не искал в веб-интерфейсе то, чего туда не попало.
    */
-  private async publishToDashboard(days: number, now: Date): Promise<DashboardPublishNote> {
+  private async publishToDashboard(
+    days: number,
+    now: Date,
+    live: CuratedMentionView[] = [],
+  ): Promise<DashboardPublishNote> {
     try {
-      const outcome = await this.dashboardPublishService.publish(days, now);
+      const outcome = await this.dashboardPublishService.publish(days, now, live);
       return { published: outcome.published };
     } catch (error) {
       this.logger.error(`Не удалось перенести выдачу /search в дашборд: ${describeError(error)}`);
