@@ -219,6 +219,51 @@ describe('DashboardPublishService.publish', () => {
   });
 });
 
+/**
+ * Находки живого поиска в дашборде. Человек получил в Telegram ОДИН список, и веб-интерфейс
+ * обязан показывать тот же: иначе статья, которую бот только что прислал, в ленте отсутствует.
+ */
+describe('DashboardPublishService.publish — находки живого поиска', () => {
+  it('публикует находку наравне с карточками набора', async () => {
+    const stub = createRepoStub();
+    const source = createSourceStub([view({ id: '1.1' })]);
+    const service = new DashboardPublishService(stub.repo, source);
+
+    const outcome = await service.publish(
+      90,
+      new Date('2026-10-10T09:00:00Z'),
+      [view({ id: 'live:tengrinews.kz', title: 'Найденная статья', url: 'https://tengrinews.kz/news/1/' })],
+    );
+
+    expect(outcome.published).toBe(2);
+    const titles = stub.inserts.flatMap((insert) => insert.rows.map((row) => row.title));
+    expect(titles).toEqual(expect.arrayContaining(['Найденная статья', 'Статья 1.1']));
+  });
+
+  /** Одна статья — одна карточка в ленте, даже если находка повторяет материал набора. */
+  it('схлопывает находку, которая уже есть в наборе, по адресу', async () => {
+    const stub = createRepoStub();
+    const source = createSourceStub([view({ id: '1.1', url: 'https://sknews.kz/1.1' })]);
+    const service = new DashboardPublishService(stub.repo, source);
+
+    const outcome = await service.publish(
+      90,
+      new Date('2026-10-10T09:00:00Z'),
+      [view({ id: 'live:sknews.kz', title: 'Та же статья', url: 'https://sknews.kz/1.1?utm_source=x' })],
+    );
+
+    expect(outcome.published).toBe(1);
+  });
+
+  it('без находок публикует ровно то же, что и раньше', async () => {
+    const stub = createRepoStub();
+    const source = createSourceStub([view({ id: '1.1' })]);
+    const service = new DashboardPublishService(stub.repo, source);
+
+    expect((await service.publish(90, new Date('2026-10-10T09:00:00Z'))).published).toBe(1);
+  });
+});
+
 describe('DashboardPublishService.clear', () => {
   it('удаляет все упоминания и возвращает их число', async () => {
     const stub = createRepoStub({ deleted: 167 });

@@ -4,6 +4,7 @@ import { createHash } from 'crypto';
 import { Repository } from 'typeorm';
 import { Mention, MentionSourceType } from '../mentions/mention.entity';
 import { CURATED_SEARCH_SOURCE, CuratedMentionView, CuratedSearchSource } from './curated-search.types';
+import { normalizeUrl } from './curated-mentions';
 
 export interface DashboardPublishOutcome {
   periodDays: number;
@@ -67,9 +68,17 @@ export class DashboardPublishService {
    * Обе операции — в одной транзакции, чтобы дашборд не оказался пустым из-за упавшей вставки:
    * либо он показывает новую выдачу целиком, либо остаётся прежним.
    */
-  async publish(periodDays: number, now: Date = new Date()): Promise<DashboardPublishOutcome> {
+  async publish(
+    periodDays: number,
+    now: Date = new Date(),
+    live: readonly CuratedMentionView[] = [],
+  ): Promise<DashboardPublishOutcome> {
     const result = await this.searchSource.search(periodDays, now);
-    const items = await this.searchSource.findPage(periodDays, 0, result.total, now);
+    const found = await this.searchSource.findPage(periodDays, 0, result.total, now);
+    // Найденное живым поиском идёт в дашборд наравне с карточками набора: в Telegram человек
+    // получил один список, и веб-интерфейс обязан показывать тот же. Дубль по адресу (находка,
+    // которая уже есть в наборе) отбрасывается — иначе одна статья заняла бы в ленте две карточки.
+    const items = dedupeByUrl([...live, ...found]);
     const publishable = items.filter((item) => hasPublicUrl(item));
 
     const outcome = await this.mentionsRepo.manager.transaction(async (manager) => {
@@ -88,6 +97,7 @@ export class DashboardPublishService {
     });
 
     const skipped = items.length - publishable.length;
+
     this.logger.log(
       `Дашборд обновлён по выдаче за ${periodDays} дн. (${result.dateFrom} — ${result.dateTo}): ` +
         `удалено прежних упоминаний ${outcome.removed}, опубликовано ${outcome.published}` +
@@ -125,6 +135,29 @@ export class DashboardPublishService {
  */
 function hasPublicUrl(item: CuratedMentionView): boolean {
   return typeof item.url === 'string' && item.url.trim().length > 0;
+}
+
+/**
+ * Один адрес — одна карточка в ленте. Сравнение по normalizeUrl, тому же, которым живой поиск
+ * сверяется с показываемыми материалами. Материал без адреса (закрытый пул) здесь не
+ * схлопывается: ключа у него нет, а отбрасывает такие строки hasPublicUrl.
+ */
+function dedupeByUrl(items: readonly CuratedMentionView[]): CuratedMentionView[] {
+  const seen = new Set<string>();
+  const kept: CuratedMentionView[] = [];
+  for (const item of items) {
+    if (!item.url) {
+      kept.push(item);
+      continue;
+    }
+    const key = normalizeUrl(item.url);
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    kept.push(item);
+  }
+  return kept;
 }
 
 function toMentionRow(item: CuratedMentionView): Partial<Mention> {
