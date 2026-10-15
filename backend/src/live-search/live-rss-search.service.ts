@@ -4,6 +4,7 @@ import { RssService, ParsedRssItem } from '../collectors/rss/rss.service';
 import { hasCurated, normalizeUrl } from '../curated/curated-mentions';
 import { subtractCalendarDays, zonedDateString } from '../curated/curated-date.util';
 import { ALL_TIME_PERIOD_DAYS } from '../curated/search-period.util';
+import { SearchPeriod, toSearchWindow } from '../curated/search-window.util';
 import { Sentiment } from '../mentions/mention.entity';
 import { matchesBrand, parseBrandForms } from './brand-match.util';
 import { LiveFind } from './live-find.types';
@@ -105,7 +106,7 @@ export class LiveRssSearchService {
    * иначе находка могла бы не совпасть с периодом, указанным в шапке сообщения. «Всё время» окна
    * не ограничивает: у лент и так нет ничего старше нескольких недель.
    */
-  async collect(periodDays: number, now: Date = new Date()): Promise<LiveRssOutcome> {
+  async collect(period: SearchPeriod, now: Date = new Date()): Promise<LiveRssOutcome> {
     const startedAt = Date.now();
     if (!this.enabled) {
       return emptyOutcome(0);
@@ -113,8 +114,16 @@ export class LiveRssSearchService {
 
     const deadline = startedAt + this.budgetMs;
     const forms = parseBrandForms(this.config.get<string>('liveSearch.brandForms'));
-    const dateTo = zonedDateString(now, this.timezone);
-    const dateFrom = periodDays >= ALL_TIME_PERIOD_DAYS ? null : subtractCalendarDays(dateTo, periodDays);
+    // У своего отрезка границы вписал человек — в том числе правая в прошлом; у «за N дней»
+    // правая граница всегда сегодня, а у «Всё время» левой нет вовсе.
+    const window = toSearchWindow(period);
+    const dateTo = window.kind === 'range' ? window.dateTo : zonedDateString(now, this.timezone);
+    const dateFrom =
+      window.kind === 'range'
+        ? window.dateFrom
+        : window.days >= ALL_TIME_PERIOD_DAYS
+          ? null
+          : subtractCalendarDays(dateTo, window.days);
 
     const outcome = emptyOutcome(LIVE_FEEDS.length);
     const seenUrls = new Set<string>();

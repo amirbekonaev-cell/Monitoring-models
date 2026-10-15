@@ -1,7 +1,31 @@
 import { hasCurated, normalizeUrl } from '../curated/curated-mentions';
 import { subtractCalendarDays, zonedDateString } from '../curated/curated-date.util';
 import { ALL_TIME_PERIOD_DAYS } from '../curated/search-period.util';
+import { SearchPeriod, toSearchWindow } from '../curated/search-window.util';
 import { LiveFind } from './live-find.types';
+
+/**
+ * Окно, по которому отсекаются находки.
+ *
+ * `dateFrom: null` — только «Всё время»: левой границы у него нет вовсе. У своего отрезка границы
+ * обе и ровно те, что вписал человек, — в том числе правая в прошлом, поэтому статья, найденная
+ * сегодня, в отрезок «июль» не попадёт.
+ */
+function findsWindow(
+  period: SearchPeriod,
+  now: Date,
+  timezone: string,
+): { dateFrom: string | null; dateTo: string } {
+  const window = toSearchWindow(period);
+  if (window.kind === 'range') {
+    return { dateFrom: window.dateFrom, dateTo: window.dateTo };
+  }
+  const dateTo = zonedDateString(now, timezone);
+  return {
+    dateFrom: window.days >= ALL_TIME_PERIOD_DAYS ? null : subtractCalendarDays(dateTo, window.days),
+    dateTo,
+  };
+}
 
 /**
  * Приводит набор находок к тому, что имеет право попасть в выдачу за период: выбрасывает
@@ -19,12 +43,11 @@ import { LiveFind } from './live-find.types';
  */
 export function filterFindsToPeriod(
   finds: readonly LiveFind[],
-  periodDays: number,
+  period: SearchPeriod,
   now: Date,
   timezone: string,
 ): LiveFind[] {
-  const dateTo = zonedDateString(now, timezone);
-  const dateFrom = periodDays >= ALL_TIME_PERIOD_DAYS ? null : subtractCalendarDays(dateTo, periodDays);
+  const { dateFrom, dateTo } = findsWindow(period, now, timezone);
 
   const seen = new Set<string>();
   const kept: LiveFind[] = [];

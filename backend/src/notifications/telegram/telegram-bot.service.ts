@@ -1,6 +1,7 @@
 import { Inject, Injectable, Logger, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { Context, Markup, Telegraf } from 'telegraf';
+import { message } from 'telegraf/filters';
 import { Sentiment } from '../../mentions/mention.entity';
 import { InlineKeyboardMarkup, Update } from 'telegraf/types';
 import {
@@ -17,6 +18,14 @@ import { searchPeriodLabel } from '../../curated/search-period.util';
 import { buildSearchProgressText, planSearchProgress } from '../../curated/search-progress.util';
 import { LiveSearchOutcome, LiveSearchService } from '../../live-search/live-search.service';
 import { LiveFindStoreService } from '../../live-search/live-find-store.service';
+import {
+  decodeSearchPeriod,
+  encodeSearchPeriod,
+  parseSearchRangeInput,
+  SearchPeriod,
+  SearchWindow,
+  searchWindowLabel,
+} from '../../curated/search-window.util';
 import { filterFindsToPeriod } from '../../live-search/live-find-period.util';
 import { liveFindToMentionView } from '../../live-search/live-find.types';
 import {
@@ -39,6 +48,10 @@ import {
   SEARCH_EXPAND_NO_TEXT,
   SEARCH_EXPAND_YES_TEXT,
   SEARCH_PERIOD_PROMPT_TEXT,
+  SEARCH_CUSTOM_RANGE_BUTTON_TEXT,
+  SEARCH_CUSTOM_RANGE_CALLBACK_DATA,
+  SEARCH_CUSTOM_RANGE_PROMPT_TEXT,
+  buildCustomRangeErrorText,
   buildResetConfirmText,
   buildResetDoneText,
   buildEmptyPeriodText,
@@ -192,7 +205,7 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
       // только засоряли меню. Сами обработчики ниже оставлены — их можно вызвать, набрав команду
       // руками, и кнопки в уже отправленных сообщениях продолжают работать.
       await this.bot.telegram.setMyCommands([
-        { command: 'search', description: 'Упоминания за период: список, затем статьи по одной' },
+        { command: 'search', description: 'Упоминания за период или свой отрезок: /search 01.07.2026-15.10.2026' },
         { command: 'status', description: 'Статистика пула ссылок' },
         { command: 'reset', description: 'Сбросить пул: удалить упоминания, вернуть ссылки в очередь' },
       ]);
@@ -299,10 +312,64 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
         await this.rejectUnauthorized(ctx);
         return;
       }
+
+      // `/search 01.07.2026-15.10.2026` — свой отрезок прямо в команде, без кнопок вообще.
+      const typed = commandArgument(ctx);
+      if (typed) {
+        await this.searchTypedRange(ctx, typed);
+        return;
+      }
+
       const rows = chunkArray(this.periodDays, 3).map((row) =>
         row.map((days) => Markup.button.callback(searchPeriodLabel(days), buildSearchPeriodCallbackData(days))),
       );
+      // Своя строка под кнопками: периоды — это готовые ответы, а свой отрезок человек вписывает
+      // сам, и ставить его в один ряд с ними значило бы выдавать за такой же готовый.
+      rows.push([Markup.button.callback(SEARCH_CUSTOM_RANGE_BUTTON_TEXT, SEARCH_CUSTOM_RANGE_CALLBACK_DATA)]);
       await ctx.reply(SEARCH_PERIOD_PROMPT_TEXT, Markup.inlineKeyboard(rows));
+    });
+
+    /**
+     * «Свои даты»: бот задаёт вопрос с `force_reply`, человек отвечает на него датами.
+     *
+     * Состояние «жду даты» нигде не хранится, и это не упрощение, а требование среды: на Vercel
+     * следующее сообщение придёт в ДРУГОЙ вызов функции, возможно на другом инстансе, и запоминать
+     * ожидание было бы негде. Вместо состояния — сам Telegram: он присылает ответ вместе с
+     * `reply_to_message`, по которому ответ и узнаётся (см. обработчик текста ниже).
+     */
+    bot.action(SEARCH_CUSTOM_RANGE_CALLBACK_DATA, async (ctx) => {
+      if (!this.isAuthorizedChat(ctx.chat?.id)) {
+        await ctx.answerCbQuery('Эта команда доступна только в рабочей группе мониторинга.');
+        return;
+      }
+
+      await ctx.answerCbQuery();
+      // Клавиатуру периодов снимаем: вопрос про даты уже задан, и нажатие кнопки поверх него
+      // запустило бы второй поиск в тот же чат.
+      try {
+        await ctx.editMessageReplyMarkup({ inline_keyboard: [] });
+      } catch (error) {
+        this.logger.warn(`Не удалось снять клавиатуру периодов: ${describeError(error)}`);
+      }
+
+      await ctx.reply(SEARCH_CUSTOM_RANGE_PROMPT_TEXT, {
+        reply_markup: { force_reply: true, input_field_placeholder: '01.07.2026-15.10.2026' },
+      });
+    });
+
+    /**
+     * Ответ на вопрос про свои даты. Реагирует ТОЛЬКО на ответ (`reply_to_message`) на этот
+     * конкретный вопрос бота: в рабочей группе люди переписываются, и запускать поиск на каждое
+     * сообщение, в котором мелькнули цифры, бот не вправе.
+     */
+    bot.on(message('text'), async (ctx) => {
+      if (!this.isAuthorizedChat(ctx.chat?.id)) {
+        return;
+      }
+      if (!isReplyToRangePrompt(ctx.message)) {
+        return;
+      }
+      await this.searchTypedRange(ctx, ctx.message.text);
     });
 
     // Destructive, so it is two steps: /reset only ever shows what would be lost, and nothing is
@@ -427,20 +494,21 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
       await this.sendCuratedBatch(ctx.telegram, chatId, parsed.domain, items, parsed.offset);
     });
 
-    bot.action(/^search_period:(\d+)$/, async (ctx) => {
+    bot.action(/^search_period:([\d~-]+)$/, async (ctx) => {
       if (!this.isAuthorizedChat(ctx.chat?.id)) {
         await ctx.answerCbQuery('Эта команда доступна только в рабочей группе мониторинга.');
         return;
       }
 
-      const days = parseInt((ctx.match as RegExpMatchArray)[1], 10);
-      if (!this.periodDays.includes(days)) {
+      const period = decodeSearchPeriod((ctx.match as RegExpMatchArray)[1]);
+      // Кнопка обязана быть одной из предложенных: период не из списка — это чужая или
+      // подделанная кнопка, и искать за него нечего.
+      if (period === null || (period.kind === 'days' && !this.periodDays.includes(period.days))) {
         await ctx.answerCbQuery('Неизвестный период');
         return;
       }
 
       await ctx.answerCbQuery();
-      const label = searchPeriodLabel(days);
       const chatId = ctx.chat?.id;
       if (chatId === undefined) {
         return;
@@ -451,6 +519,7 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
       // сверх него. Иначе минимальная длительность складывалась бы с реальной работой и вызов
       // подходил бы к 60-секундному потолку Vercel без всякой необходимости.
       const startedAt = Date.now();
+      const label = searchWindowLabel(period);
 
       // Первый кадр: заменяет клавиатуру периодов строкой с названием периода. Дальше его
       // перерисовывает showSearchProgress (счётчик), а в самом конце — подтверждение окна.
@@ -461,44 +530,19 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
         this.logger.warn(`Не удалось показать статус поиска: ${describeError(error)}`);
       }
 
-      try {
-        const now = new Date();
-        const result = await this.curatedSearchService.search(days, now);
-        // Живой поиск запускается ЗДЕСЬ и не дожидается: он идёт параллельно с паузой темпа
-        // выдачи (ленты ~3 с, веб-поиск 16–21 с — внутри 30 с ожидания), поэтому к длительности
-        // /search не добавляет ничего. Ошибка внутри него уже обработана — см. startLiveSearch.
-        const livePass = this.startLiveSearch(days, now);
-        await this.showSearchProgress(ctx, label, startedAt);
-        const live = await livePass;
-        const liveViews = liveItems(live);
-        // Находки кладутся в хранилище СРАЗУ, до отправки списка: разворот статей по одному
-        // сообщению — это уже другое нажатие и другой вызов вебхука, и взять их там больше
-        // негде. Повторить живой поиск нельзя — он платный и во второй раз отдаёт другой набор
-        // (см. LiveFindStoreService).
-        await this.storeLiveFinds(days, live, now);
-        // Нажатая кнопка периода — единственное, что решает, какие материалы лежат в дашборде и
-        // ленте веб-интерфейса: выдача за этот период заменяет там всё, что было раньше (см.
-        // DashboardPublishService). Запись идёт здесь, а не после отправки сообщений, — иначе
-        // сбой на отправке оставил бы в веб-интерфейсе прежний набор, — и уже ПОСЛЕ живого
-        // поиска, чтобы в дашборд уехала та же выдача, что и в Telegram, вместе с находками.
-        const dashboard = await this.publishToDashboard(days, now, liveViews);
-        await ctx.editMessageText(buildPeriodConfirmationText(label, result.dateFrom, result.dateTo, dashboard));
-        await this.sendFirstResultsPage(ctx.telegram, chatId, days, label, result, now, liveViews);
-      } catch (error) {
-        await this.replyWithSearchError(ctx.telegram, chatId, error);
-      }
+      await this.runSearch(ctx, chatId, period, label, startedAt);
     });
 
-    bot.action(/^search_more:(\d+):(\d+)$/, async (ctx) => {
+    bot.action(/^search_more:([\d~-]+):(\d+)$/, async (ctx) => {
       if (!this.isAuthorizedChat(ctx.chat?.id)) {
         await ctx.answerCbQuery('Эта команда доступна только в рабочей группе мониторинга.');
         return;
       }
 
       const match = ctx.match as RegExpMatchArray;
-      const days = parseInt(match[1], 10);
+      const period = this.knownPeriod(match[1]);
       const offset = parseInt(match[2], 10);
-      if (!this.periodDays.includes(days) || !Number.isInteger(offset) || offset < 0) {
+      if (period === null || !Number.isInteger(offset) || offset < 0) {
         await ctx.answerCbQuery('Некорректный запрос');
         return;
       }
@@ -519,15 +563,15 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
 
       try {
         const now = new Date();
-        const label = searchPeriodLabel(days);
-        const result = await this.curatedSearchService.search(days, now);
+        const label = searchWindowLabel(period);
+        const result = await this.curatedSearchService.search(period, now);
 
         if (this.oneArticlePerMessage) {
           const sent = await this.sendItemsOnePerMessage(
             ctx.telegram,
             chatId,
-            days,
-            await this.periodItems(days, result, now),
+            period,
+            await this.periodItems(period, result, now),
             offset,
           );
           if (sent === 0) {
@@ -536,7 +580,7 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
           return;
         }
 
-        const periodItems = await this.periodItems(days, result, now);
+        const periodItems = await this.periodItems(period, result, now);
         const { text, shownCount } = buildPage({
           header: null,
           items: periodItems.slice(offset, offset + PAGE_FETCH_BATCH_SIZE),
@@ -551,7 +595,7 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
         }
 
         const remaining = periodItems.length - (offset + shownCount);
-        const replyMarkup = remaining > 0 ? this.buildMoreKeyboard(days, offset + shownCount, remaining) : undefined;
+        const replyMarkup = remaining > 0 ? this.buildMoreKeyboard(period, offset + shownCount, remaining) : undefined;
         await ctx.telegram.sendMessage(chatId, text, {
           parse_mode: 'HTML',
           link_preview_options: { is_disabled: true },
@@ -581,16 +625,16 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
     // «Да, по одной» и её продолжение («Показать ещё» под последней статьёй): одна статья — одно
     // сообщение, с пересказом и ссылкой. Отдельная ветка от search_more, которая остаётся для
     // упакованных страниц и для кнопок в уже отправленных сообщениях.
-    bot.action(/^search_each:(\d+):(\d+)$/, async (ctx) => {
+    bot.action(/^search_each:([\d~-]+):(\d+)$/, async (ctx) => {
       if (!this.isAuthorizedChat(ctx.chat?.id)) {
         await ctx.answerCbQuery('Эта команда доступна только в рабочей группе мониторинга.');
         return;
       }
 
       const match = ctx.match as RegExpMatchArray;
-      const days = parseInt(match[1], 10);
+      const period = this.knownPeriod(match[1]);
       const offset = parseInt(match[2], 10);
-      if (!this.periodDays.includes(days) || !Number.isInteger(offset) || offset < 0) {
+      if (period === null || !Number.isInteger(offset) || offset < 0) {
         await ctx.answerCbQuery('Некорректный запрос');
         return;
       }
@@ -611,12 +655,12 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
 
       try {
         const now = new Date();
-        const result = await this.curatedSearchService.search(days, now);
+        const result = await this.curatedSearchService.search(period, now);
         const sent = await this.sendItemsOnePerMessage(
           ctx.telegram,
           chatId,
-          days,
-          await this.periodItems(days, result, now),
+          period,
+          await this.periodItems(period, result, now),
           offset,
         );
         if (sent === 0) {
@@ -642,7 +686,7 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
    * хранилища он собирал статьи заново из одного набора, и найденного живым поиском в нём не было.
    */
   private async periodItems(
-    days: number,
+    period: SearchPeriod,
     result: CuratedSearchResult,
     now: Date,
     live?: CuratedMentionView[],
@@ -651,8 +695,8 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
     // чтобы отдать страницу №3, надо сперва знать, где в нём встали находки. Для источника бота
     // это срез массива в памяти (CuratedJsonSearchService, карточки из JSON), так что лишней
     // работы здесь нет.
-    const found = result.total > 0 ? await this.curatedSearchService.findPage(days, 0, result.total, now) : [];
-    const liveViews = live ?? (await this.storedLiveItems(days, now));
+    const found = result.total > 0 ? await this.curatedSearchService.findPage(period, 0, result.total, now) : [];
+    const liveViews = live ?? (await this.storedLiveItems(period, now));
     return [...liveViews, ...found].sort(byPublishedAtDesc);
   }
 
@@ -668,12 +712,14 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
    * набора, как получал их до появления хранилища. /search обязан отвечать и с недоступным
    * Postgres.
    */
-  private async storedLiveItems(days: number, now: Date): Promise<CuratedMentionView[]> {
+  private async storedLiveItems(period: SearchPeriod, now: Date): Promise<CuratedMentionView[]> {
     try {
-      const stored = await this.liveFindStore.load(days);
-      return filterFindsToPeriod(stored.finds, days, stored.savedAt ?? now, this.timezone).map(liveFindToMentionView);
+      const stored = await this.liveFindStore.load(period);
+      return filterFindsToPeriod(stored.finds, period, stored.savedAt ?? now, this.timezone).map(liveFindToMentionView);
     } catch (error) {
-      this.logger.warn(`Не удалось прочитать находки живого поиска за ${days} дн.: ${describeError(error)}`);
+      this.logger.warn(
+        `Не удалось прочитать находки живого поиска за «${searchWindowLabel(period)}»: ${describeError(error)}`,
+      );
       return [];
     }
   }
@@ -686,12 +732,108 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
    * показать ровно то, что в списке, — иначе в сообщениях появились бы статьи из прошлого
    * нажатия.
    */
-  private async storeLiveFinds(days: number, outcome: LiveSearchOutcome | null, now: Date): Promise<void> {
+  private async storeLiveFinds(period: SearchPeriod, outcome: LiveSearchOutcome | null, now: Date): Promise<void> {
     try {
-      await this.liveFindStore.save(days, outcome?.finds ?? [], now);
+      await this.liveFindStore.save(period, outcome?.finds ?? [], now);
     } catch (error) {
-      this.logger.warn(`Не удалось сохранить находки живого поиска за ${days} дн.: ${describeError(error)}`);
+      this.logger.warn(
+        `Не удалось сохранить находки живого поиска за «${searchWindowLabel(period)}»: ${describeError(error)}`,
+      );
     }
+  }
+
+  /**
+   * Один поиск за период: от статуса со счётчиком до выдачи. Общий для ВСЕХ трёх способов
+   * спросить — кнопки периода, `/search 01.07.2026-15.10.2026` и ответа датами на вопрос бота, —
+   * потому что отличаются они только тем, как получено окно, а не тем, что происходит дальше.
+   *
+   * `target` — сообщение, которое перерисовывается счётчиком и в конце становится подтверждением
+   * окна. У кнопки это сам ctx (правится сообщение с клавиатурой), у вписанного руками отрезка —
+   * отдельно отправленный статус: Context.editMessageText правит сообщение, на котором нажали
+   * кнопку, а у текстовой команды такого сообщения нет вовсе.
+   */
+  private async runSearch(
+    target: SearchStatusTarget,
+    chatId: number,
+    period: SearchWindow,
+    label: string,
+    startedAt: number,
+  ): Promise<void> {
+    try {
+      const now = new Date();
+      const result = await this.curatedSearchService.search(period, now);
+      // Живой поиск запускается ЗДЕСЬ и не дожидается: он идёт параллельно с паузой темпа
+      // выдачи (ленты ~3 с, веб-поиск 16–21 с — внутри 30 с ожидания), поэтому к длительности
+      // /search не добавляет ничего. Ошибка внутри него уже обработана — см. startLiveSearch.
+      const livePass = this.startLiveSearch(period, now);
+      await this.showSearchProgress(target, label, startedAt);
+      const live = await livePass;
+      const liveViews = liveItems(live);
+      // Находки кладутся в хранилище СРАЗУ, до отправки списка: разворот статей по одному
+      // сообщению — это уже другое нажатие и другой вызов вебхука, и взять их там больше
+      // негде. Повторить живой поиск нельзя — он платный и во второй раз отдаёт другой набор
+      // (см. LiveFindStoreService).
+      await this.storeLiveFinds(period, live, now);
+      // Выбранный период — единственное, что решает, какие материалы лежат в дашборде и ленте
+      // веб-интерфейса: выдача за этот период заменяет там всё, что было раньше (см.
+      // DashboardPublishService). Запись идёт здесь, а не после отправки сообщений, — иначе
+      // сбой на отправке оставил бы в веб-интерфейсе прежний набор, — и уже ПОСЛЕ живого
+      // поиска, чтобы в дашборд уехала та же выдача, что и в Telegram, вместе с находками.
+      const dashboard = await this.publishToDashboard(period, now, liveViews);
+      await target.editMessageText(buildPeriodConfirmationText(label, result.dateFrom, result.dateTo, dashboard));
+      await this.sendFirstResultsPage(target.telegram, chatId, period, label, result, now, liveViews);
+    } catch (error) {
+      await this.replyWithSearchError(target.telegram, chatId, error);
+    }
+  }
+
+  /**
+   * Свой отрезок, вписанный руками: `/search 01.07.2026-15.10.2026` или ответ датами на вопрос
+   * бота. Непонятные даты — это ответ с причиной и подсказкой, а не молчание: человек печатал
+   * сам и вправе знать, что именно не так.
+   */
+  private async searchTypedRange(ctx: Context, typed: string): Promise<void> {
+    const chatId = ctx.chat?.id;
+    if (chatId === undefined) {
+      return;
+    }
+
+    const parsed = parseSearchRangeInput(typed, new Date(), this.timezone);
+    if ('error' in parsed) {
+      await ctx.reply(buildCustomRangeErrorText(parsed.error));
+      return;
+    }
+
+    const period = parsed.window;
+    const label = searchWindowLabel(period);
+    // Отсчёт темпа выдачи — с этого момента, как и у кнопки периода: всё, что успеет сделаться
+    // само, идёт в счёт ожидания, а не сверх него.
+    const startedAt = Date.now();
+    const status = await ctx.telegram.sendMessage(chatId, buildSearchInProgressText(label));
+    await this.runSearch(
+      {
+        telegram: ctx.telegram,
+        editMessageText: (text: string) =>
+          ctx.telegram.editMessageText(chatId, status.message_id, undefined, text),
+      },
+      chatId,
+      period,
+      label,
+      startedAt,
+    );
+  }
+
+  /**
+   * Период из `callback_data` кнопки, которую бот действительно мог показать: число дней — только
+   * из списка SEARCH_PERIOD_DAYS, свой отрезок — любой разбираемый, его ведь вписал человек.
+   * `null` — кнопка чужая или подделанная, и обработчик обязан отказать.
+   */
+  private knownPeriod(raw: string): SearchWindow | null {
+    const period = decodeSearchPeriod(raw);
+    if (period === null) {
+      return null;
+    }
+    return period.kind === 'days' && !this.periodDays.includes(period.days) ? null : period;
   }
 
   /**
@@ -703,8 +845,8 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
    * выдачу, и упавший канал не вправе превратить работающий /search в сообщение об ошибке. Это то
    * же правило, по которому живёт ленивая дообработка в CuratedSearchService.
    */
-  private startLiveSearch(days: number, now: Date): Promise<LiveSearchOutcome | null> {
-    return this.liveSearchService.collect(days, now).catch((error) => {
+  private startLiveSearch(period: SearchPeriod, now: Date): Promise<LiveSearchOutcome | null> {
+    return this.liveSearchService.collect(period, now).catch((error) => {
       this.logger.warn(`Живой поиск пропущен (выдача не затронута): ${describeError(error)}`);
       return null;
     });
@@ -727,7 +869,7 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
    * отправка сообщений. Сбой перерисовки проглатывается — это косметика, из-за неё выдача не
    * должна пропадать.
    */
-  private async showSearchProgress(ctx: Context, label: string, startedAt: number): Promise<void> {
+  private async showSearchProgress(target: SearchStatusTarget, label: string, startedAt: number): Promise<void> {
     const minDurationMs = this.searchMinDurationMs;
     if (minDurationMs <= 0) {
       return;
@@ -739,7 +881,7 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
         await sleep(waitMs);
       }
       try {
-        await ctx.editMessageText(buildSearchProgressText(label, step.percent));
+        await target.editMessageText(buildSearchProgressText(label, step.percent));
       } catch (error) {
         this.logger.warn(`Не удалось обновить статус поиска: ${describeError(error)}`);
       }
@@ -766,13 +908,13 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
   private async sendFirstResultsPage(
     telegram: Telegraf['telegram'],
     chatId: number,
-    days: number,
+    period: SearchPeriod,
     label: string,
     result: CuratedSearchResult,
     now: Date,
     live: CuratedMentionView[],
   ): Promise<void> {
-    const merged = await this.periodItems(days, result, now, live);
+    const merged = await this.periodItems(period, result, now, live);
 
     if (merged.length === 0) {
       await telegram.sendMessage(chatId, result.pool.mentionsTotal === 0 ? EMPTY_POOL_TEXT : buildEmptyPeriodText(label));
@@ -799,24 +941,24 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
     }
 
     if (this.oneArticlePerMessage) {
-      await this.sendItemsOnePerMessage(telegram, chatId, days, merged, 0);
+      await this.sendItemsOnePerMessage(telegram, chatId, period, merged, 0);
       return;
     }
 
-    await this.sendExpandPrompt(telegram, chatId, days, mergedResult.total);
+    await this.sendExpandPrompt(telegram, chatId, period, mergedResult.total);
   }
 
   /** Вопрос «выводить ли каждую статью отдельным сообщением» с кнопками Да/Нет. */
   private async sendExpandPrompt(
     telegram: Telegraf['telegram'],
     chatId: number,
-    days: number,
+    period: SearchPeriod,
     total: number,
   ): Promise<void> {
-    const yes = buildSearchExpandCallbackData(days, 0);
+    const yes = buildSearchExpandCallbackData(period, 0);
     if (yes === null) {
       // callback_data не влезло — спрашивать бессмысленно, кнопка всё равно не уедет.
-      this.logger.warn(`Не удалось собрать кнопку разворачивания для периода ${days} дн.`);
+      this.logger.warn(`Не удалось собрать кнопку разворачивания для периода «${searchWindowLabel(period)}»`);
       return;
     }
 
@@ -846,7 +988,7 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
   private async sendItemsOnePerMessage(
     telegram: Telegraf['telegram'],
     chatId: number,
-    days: number,
+    period: SearchPeriod,
     periodItems: CuratedMentionView[],
     offset: number,
   ): Promise<number> {
@@ -863,7 +1005,7 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
       return 0;
     }
 
-    const replyMarkup = remaining > 0 ? this.buildEachMoreKeyboard(days, nextOffset, remaining) : undefined;
+    const replyMarkup = remaining > 0 ? this.buildEachMoreKeyboard(period, nextOffset, remaining) : undefined;
     let keyboardDelivered = replyMarkup === undefined;
 
     for (let i = 0; i < messages.length; i++) {
@@ -883,7 +1025,8 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
         }
       } catch (error) {
         this.logger.warn(
-          `Не удалось отправить сообщение с находкой №${offset + i + 1} за период ${days} дн.: ${describeError(error)}`,
+          `Не удалось отправить сообщение с находкой №${offset + i + 1} за период ` +
+            `«${searchWindowLabel(period)}»: ${describeError(error)}`,
         );
       }
     }
@@ -969,8 +1112,12 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
-  private buildMoreKeyboard(days: number, offset: number, remaining: number): InlineKeyboardMarkup | undefined {
-    return this.buildContinueKeyboard(buildSearchMoreCallbackData(days, offset), days, offset, remaining);
+  private buildMoreKeyboard(
+    period: SearchPeriod,
+    offset: number,
+    remaining: number,
+  ): InlineKeyboardMarkup | undefined {
+    return this.buildContinueKeyboard(buildSearchMoreCallbackData(period, offset), period, offset, remaining);
   }
 
   /**
@@ -978,19 +1125,24 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
    * а не упакованные страницы. Иначе нажатие после «Да, по одной» переключало бы вывод на другой
    * формат посреди периода.
    */
-  private buildEachMoreKeyboard(days: number, offset: number, remaining: number): InlineKeyboardMarkup | undefined {
-    return this.buildContinueKeyboard(buildSearchExpandCallbackData(days, offset), days, offset, remaining);
+  private buildEachMoreKeyboard(
+    period: SearchPeriod,
+    offset: number,
+    remaining: number,
+  ): InlineKeyboardMarkup | undefined {
+    return this.buildContinueKeyboard(buildSearchExpandCallbackData(period, offset), period, offset, remaining);
   }
 
   private buildContinueKeyboard(
     callbackData: string | null,
-    days: number,
+    period: SearchPeriod,
     offset: number,
     remaining: number,
   ): InlineKeyboardMarkup | undefined {
     if (!callbackData) {
       this.logger.error(
-        `callback_data для кнопки "Показать ещё" превысил 64 байта (days=${days}, offset=${offset}) — кнопка не показана`,
+        'callback_data для кнопки "Показать ещё" превысил 64 байта ' +
+          `(период=${encodeSearchPeriod(period)}, offset=${offset}) — кнопка не показана`,
       );
       return undefined;
     }
@@ -1006,12 +1158,12 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
    * (published: null), чтобы человек не искал в веб-интерфейсе то, чего туда не попало.
    */
   private async publishToDashboard(
-    days: number,
+    period: SearchPeriod,
     now: Date,
     live: CuratedMentionView[] = [],
   ): Promise<DashboardPublishNote> {
     try {
-      const outcome = await this.dashboardPublishService.publish(days, now, live);
+      const outcome = await this.dashboardPublishService.publish(period, now, live);
       return { published: outcome.published };
     } catch (error) {
       this.logger.error(`Не удалось перенести выдачу /search в дашборд: ${describeError(error)}`);
@@ -1036,6 +1188,37 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
     this.logger.warn(`Отклонена команда из неавторизованного чата (chat_id=${ctx.chat?.id})`);
     await ctx.reply('Эта команда доступна только в рабочей группе мониторинга.');
   }
+}
+
+/**
+ * Куда /search пишет свой статус: сообщение, которое он перерисовывает счётчиком, а в конце —
+ * подтверждением окна. Телеграфный Context подходит сюда как есть (у кнопки правится сообщение с
+ * клавиатурой), а вписанному руками отрезку статус отправляется отдельным сообщением — см.
+ * searchTypedRange.
+ */
+interface SearchStatusTarget {
+  telegram: Telegraf['telegram'];
+  editMessageText(text: string): Promise<unknown>;
+}
+
+/** Аргумент команды: `/search 01.07.2026-15.10.2026` → «01.07.2026-15.10.2026». */
+function commandArgument(ctx: Context): string {
+  const text = (ctx.message as { text?: string } | undefined)?.text ?? '';
+  // Первый токен — сама команда, возможно с упоминанием бота (`/search@qazcloud_bot`).
+  return text.replace(/^\/\S+/, '').trim();
+}
+
+/**
+ * Это ответ на вопрос бота про свои даты?
+ *
+ * Признак — само сообщение, на которое отвечают: его текст бот и отправил. Состояния «жду даты»
+ * нет нигде, и это требование среды, а не упрощение — следующее сообщение придёт в другой вызов
+ * функции на Vercel, запоминать ожидание негде. Сверка по первой строке, а не по тексту целиком:
+ * во второй строке стоят примеры, и их правка не должна ломать узнавание.
+ */
+function isReplyToRangePrompt(msg: { reply_to_message?: unknown }): boolean {
+  const repliedTo = (msg.reply_to_message as { text?: string } | undefined)?.text ?? '';
+  return repliedTo.startsWith(SEARCH_CUSTOM_RANGE_PROMPT_TEXT.split('\n')[0]);
 }
 
 function describeError(error: unknown): string {

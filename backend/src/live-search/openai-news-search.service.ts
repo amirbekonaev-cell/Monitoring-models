@@ -1,6 +1,8 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { Sentiment } from '../mentions/mention.entity';
+import { formatIsoDateDisplay } from '../curated/curated-date.util';
+import { SearchWindow } from '../curated/search-window.util';
 import { LiveFind } from './live-find.types';
 
 const RESPONSES_API_URL = 'https://api.openai.com/v1/responses';
@@ -72,6 +74,24 @@ interface SchemaItem {
  * Выдача непостоянна: три прогона подряд дали пересекающиеся, но разные наборы статей. Это
  * свойство инструмента, а не ошибка — поэтому канал дополняет ленты и набор, а не заменяет их.
  */
+/**
+ * Строка требования о периоде для промпта.
+ *
+ * Пусто для «за N дней» и «Всё время»: инструмент и так отдаёт самое свежее, а сужать его
+ * формулировками вроде «за последнюю неделю» вредно — в замерах это выбрасывало годные статьи,
+ * у которых на странице не было явной даты. А вот отрезок в прошлом назвать обязательно: иначе
+ * на вопрос «что было в июле» приходит октябрь.
+ */
+function periodRequirement(window?: SearchWindow): string {
+  if (!window || window.kind !== 'range') {
+    return '';
+  }
+  return (
+    `ВАЖНО: нужны статьи, опубликованные с ${formatIsoDateDisplay(window.dateFrom)} по ` +
+    `${formatIsoDateDisplay(window.dateTo)} включительно. Материалы вне этого отрезка не нужны.\n\n`
+  );
+}
+
 @Injectable()
 export class OpenAiNewsSearchService {
   private readonly logger = new Logger(OpenAiNewsSearchService.name);
@@ -100,11 +120,16 @@ export class OpenAiNewsSearchService {
     return typeof value === 'number' && Number.isFinite(value) && value > 0 ? Math.floor(value) : DEFAULT_TIMEOUT_MS;
   }
 
-  private buildInput(brandForms: readonly string[]): string {
+  private buildInput(brandForms: readonly string[], window?: SearchWindow): string {
     const brand = brandForms.map((form) => `"${form}"`).join(' OR ');
     return (
       `Найди НОВОСТНЫЕ СТАТЬИ И ПУБЛИКАЦИИ В СМИ о казахстанской компании (${brand}) — ` +
       'облачном провайдере.\n\n' +
+      // Свой отрезок попадает в сам запрос, а не только в фильтр после ответа: инструмент
+      // по умолчанию тянет самое свежее, и на вопрос «что было в июле» он вернул бы октябрь,
+      // который фильтр целиком и выбросил бы. Отсечка по датам всё равно остаётся — модели
+      // верить на слово в датах нельзя (см. filterFindsToPeriod).
+      periodRequirement(window) +
       'Строгие требования:\n' +
       '1. Только журналистские материалы: новости, интервью, обзоры. Каждая ссылка ведёт на ' +
       'КОНКРЕТНУЮ СТАТЬЮ с заголовком и датой.\n' +
@@ -129,7 +154,7 @@ export class OpenAiNewsSearchService {
    * внутри одного 60-секундного вызова на Vercel. Берётся меньшее из своего потолка и остатка
    * общего бюджета прохода.
    */
-  async search(brandForms: readonly string[], deadline?: number): Promise<LiveFind[]> {
+  async search(brandForms: readonly string[], deadline?: number, window?: SearchWindow): Promise<LiveFind[]> {
     if (!this.available) {
       return [];
     }
@@ -158,7 +183,7 @@ export class OpenAiNewsSearchService {
           reasoning: { effort: 'low' },
           tools: [{ type: 'web_search' }],
           text: { format: { type: 'json_schema', name: 'mentions', strict: true, schema: RESPONSE_SCHEMA } },
-          input: this.buildInput(brandForms),
+          input: this.buildInput(brandForms, window),
         }),
         signal: controller.signal,
       });

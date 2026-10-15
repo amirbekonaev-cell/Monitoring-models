@@ -17,15 +17,24 @@ import { CuratedLinkStatus } from '../../curated/curated-link.entity';
 import { CuratedMentionsService } from '../../curated/curated-mentions.service';
 import { Sentiment } from '../../mentions/mention.entity';
 import { DEFAULT_SEARCH_PERIOD_DAYS } from '../../curated/search-period.util';
+import { encodeSearchPeriod, SearchPeriod } from '../../curated/search-window.util';
+import {
+  SEARCH_CUSTOM_RANGE_BUTTON_TEXT,
+  SEARCH_CUSTOM_RANGE_CALLBACK_DATA,
+  SEARCH_CUSTOM_RANGE_PROMPT_TEXT,
+} from '../../curated/curated-message.util';
 
 type CommandHandler = (ctx: any) => Promise<void>;
 type ActionHandler = (ctx: any) => Promise<void>;
 
 const commandHandlers = new Map<string, CommandHandler>();
 const actionHandlers = new Map<string, ActionHandler>();
+/** Обработчики bot.on(...) — сейчас это ровно один: ответ датами на вопрос про свой отрезок. */
+const updateHandlers: ActionHandler[] = [];
 const handleUpdateMock = jest.fn(async () => undefined);
 const setMyCommandsMock = jest.fn(async () => undefined);
-const sendMessageMock = jest.fn(async (..._args: unknown[]) => undefined);
+const sendMessageMock = jest.fn(async (..._args: unknown[]) => ({ message_id: 777 }));
+const editMessageTextMock = jest.fn(async (..._args: unknown[]) => undefined);
 const catchMock = jest.fn();
 const stopMock = jest.fn();
 // launch() resolves only when the bot stops — the mock mirrors that (a never-settling promise),
@@ -44,14 +53,33 @@ jest.mock('telegraf', () => {
     Telegraf: jest.fn().mockImplementation(() => ({
       command: (name: string, handler: CommandHandler) => commandHandlers.set(name, handler),
       action: (pattern: RegExp, handler: ActionHandler) => actionHandlers.set(pattern.toString(), handler),
+      on: (_filter: unknown, handler: ActionHandler) => updateHandlers.push(handler),
       handleUpdate: handleUpdateMock,
       catch: catchMock,
       launch: launchMock,
       stop: stopMock,
-      telegram: { setMyCommands: setMyCommandsMock, sendMessage: sendMessageMock },
+      telegram: {
+        setMyCommands: setMyCommandsMock,
+        sendMessage: sendMessageMock,
+        editMessageText: editMessageTextMock,
+      },
     })),
   };
 });
+
+/**
+ * Обработчик по НАЧАЛУ его регулярки, а не по её полному тексту: шаблон периода в callback_data
+ * меняется (сейчас в нём, кроме дней, живёт и свой отрезок), и тесты не должны ломаться от этого
+ * — они проверяют поведение, а не текст регулярного выражения.
+ */
+function actionHandler(prefix: string): ActionHandler {
+  for (const [pattern, handler] of actionHandlers) {
+    if (pattern.startsWith(prefix)) {
+      return handler;
+    }
+  }
+  throw new Error(`обработчик для ${prefix} не зарегистрирован`);
+}
 
 function makeConfig(
   chatId = '-1001',
@@ -78,7 +106,7 @@ function makeCtx(chatId: number | string | undefined, overrides: Record<string, 
     answerCbQuery: jest.fn(async () => undefined),
     editMessageText: jest.fn(async () => undefined),
     editMessageReplyMarkup: jest.fn(async () => undefined),
-    telegram: { sendMessage: sendMessageMock },
+    telegram: { sendMessage: sendMessageMock, editMessageText: editMessageTextMock },
     match: ['search_period:7', '7'],
     ...overrides,
   };
@@ -182,18 +210,25 @@ function makeLiveSearchService(outcome: Partial<LiveSearchOutcome> = {}): LiveSe
  * запись на период, каждое сохранение заменяет её целиком.
  */
 function makeLiveFindStore(seed: Record<number, LiveFind[]> = {}): LiveFindStoreService & {
-  rows: Map<number, StoredLiveFinds>;
+  rows: Map<string, StoredLiveFinds>;
 } {
-  const rows = new Map<number, StoredLiveFinds>(
-    Object.entries(seed).map(([days, finds]) => [Number(days), { savedAt: new Date(), finds }]),
+  // Ключ — закодированный период, ровно как у LiveFindStoreService поверх `settings`: у своего
+  // отрезка это даты, и по объекту-окну искать в Map нельзя — сравнивались бы ссылки.
+  const rows = new Map<string, StoredLiveFinds>(
+    Object.entries(seed).map(([days, finds]) => [
+      encodeSearchPeriod(Number(days)),
+      { savedAt: new Date(), finds },
+    ]),
   );
   return {
     rows,
-    save: jest.fn(async (periodDays: number, finds: LiveFind[], now: Date = new Date()) => {
-      rows.set(periodDays, { savedAt: now, finds: [...finds] });
+    save: jest.fn(async (period: SearchPeriod, finds: LiveFind[], now: Date = new Date()) => {
+      rows.set(encodeSearchPeriod(period), { savedAt: now, finds: [...finds] });
     }),
-    load: jest.fn(async (periodDays: number) => rows.get(periodDays) ?? { savedAt: null, finds: [] }),
-  } as unknown as LiveFindStoreService & { rows: Map<number, StoredLiveFinds> };
+    load: jest.fn(
+      async (period: SearchPeriod) => rows.get(encodeSearchPeriod(period)) ?? { savedAt: null, finds: [] },
+    ),
+  } as unknown as LiveFindStoreService & { rows: Map<string, StoredLiveFinds> };
 }
 
 function makeCuratedSearchService(config: {
@@ -213,6 +248,8 @@ describe('TelegramBotService (closed-pool bot)', () => {
   beforeEach(() => {
     commandHandlers.clear();
     actionHandlers.clear();
+    updateHandlers.length = 0;
+    editMessageTextMock.mockClear();
     handleUpdateMock.mockClear();
     setMyCommandsMock.mockClear();
     sendMessageMock.mockClear();
@@ -491,7 +528,14 @@ describe('TelegramBotService (closed-pool bot)', () => {
       );
       const [, extra] = (ctx.reply as jest.Mock).mock.calls[0];
       const buttons = extra.reply_markup.inline_keyboard.flat();
-      expect(buttons).toHaveLength(DEFAULT_SEARCH_PERIOD_DAYS.length);
+      // Кнопки периодов плюс «Свои даты» — свой отрезок человек вписывает сам.
+      expect(buttons).toHaveLength(DEFAULT_SEARCH_PERIOD_DAYS.length + 1);
+      expect(buttons[buttons.length - 1]).toEqual(
+        expect.objectContaining({
+          text: SEARCH_CUSTOM_RANGE_BUTTON_TEXT,
+          callback_data: SEARCH_CUSTOM_RANGE_CALLBACK_DATA,
+        }),
+      );
       expect(buttons.map((b: any) => b.callback_data)).toEqual(
         expect.arrayContaining(['search_period:1', 'search_period:730']),
       );
@@ -519,10 +563,11 @@ describe('TelegramBotService (closed-pool bot)', () => {
       await boot('-1001', makeCuratedSearchService(), 'webhook', makeCuratedResetService(), {}, dashboard);
       const ctx = makeCtx('-1001', { match: ['search_period:90', '90'] });
 
-      await actionHandlers.get('/^search_period:(\\d+)$/')!(ctx);
+      await actionHandler('/^search_period:')(ctx);
 
-      // Третий аргумент — находки живого поиска: в дашборд уезжает та же выдача, что в чат.
-      expect(dashboard.publish).toHaveBeenCalledWith(90, expect.any(Date), []);
+      // Период — окно (у кнопки это «за N дней»), третий аргумент — находки живого поиска:
+      // в дашборд уезжает та же выдача, что и в чат.
+      expect(dashboard.publish).toHaveBeenCalledWith({ kind: 'days', days: 90 }, expect.any(Date), []);
       // Про удачную запись в чате не сообщается — лишнего текста там быть не должно.
       const texts = (ctx.editMessageText as jest.Mock).mock.calls.map(([text]) => text as string);
       expect(texts.some((text) => text.includes('Дашборд'))).toBe(false);
@@ -540,7 +585,7 @@ describe('TelegramBotService (closed-pool bot)', () => {
       await boot('-1001', makeCuratedSearchService(), 'webhook', makeCuratedResetService(), {}, dashboard);
       const ctx = makeCtx('-1001');
 
-      await actionHandlers.get('/^search_period:(\\d+)$/')!(ctx);
+      await actionHandler('/^search_period:')(ctx);
 
       const texts = (ctx.editMessageText as jest.Mock).mock.calls.map(([text]) => text as string);
       expect(texts.some((text) => text.includes('Дашборд обновить не удалось'))).toBe(true);
@@ -587,7 +632,7 @@ describe('TelegramBotService (closed-pool bot)', () => {
         const ctx = makeCtx('-1001');
 
         const startedAt = Date.now();
-        await actionHandlers.get('/^search_period:(\\d+)$/')!(ctx);
+        await actionHandler('/^search_period:')(ctx);
 
         expect(Date.now() - startedAt).toBeGreaterThanOrEqual(PACING_MS);
         expect(sendMessageMock).toHaveBeenCalled();
@@ -599,7 +644,7 @@ describe('TelegramBotService (closed-pool bot)', () => {
         });
         const ctx = makeCtx('-1001');
 
-        await actionHandlers.get('/^search_period:(\\d+)$/')!(ctx);
+        await actionHandler('/^search_period:')(ctx);
 
         const texts = (ctx.editMessageText as jest.Mock).mock.calls.map(([text]) => text as string);
         const progress = texts.filter((text) => text.includes('%'));
@@ -619,7 +664,7 @@ describe('TelegramBotService (closed-pool bot)', () => {
         });
         const ctx = makeCtx('-1001');
 
-        await actionHandlers.get('/^search_period:(\\d+)$/')!(ctx);
+        await actionHandler('/^search_period:')(ctx);
 
         const statuses = (ctx.editMessageText as jest.Mock).mock.calls
           .map(([text]) => String(text).toLowerCase())
@@ -639,7 +684,7 @@ describe('TelegramBotService (closed-pool bot)', () => {
         const ctx = makeCtx('-1001');
 
         const startedAt = Date.now();
-        await actionHandlers.get('/^search_period:(\\d+)$/')!(ctx);
+        await actionHandler('/^search_period:')(ctx);
 
         expect(Date.now() - startedAt).toBeGreaterThanOrEqual(PACING_MS);
         expect(sendMessageMock).toHaveBeenCalled();
@@ -654,7 +699,7 @@ describe('TelegramBotService (closed-pool bot)', () => {
         const ctx = makeCtx('-1001');
 
         const startedAt = Date.now();
-        await actionHandlers.get('/^search_period:(\\d+)$/')!(ctx);
+        await actionHandler('/^search_period:')(ctx);
 
         expect(Date.now() - startedAt).toBeLessThan(PACING_MS);
         const texts = (ctx.editMessageText as jest.Mock).mock.calls.map(([text]) => text as string);
@@ -672,7 +717,7 @@ describe('TelegramBotService (closed-pool bot)', () => {
           }),
         });
 
-        await actionHandlers.get('/^search_period:(\\d+)$/')!(ctx);
+        await actionHandler('/^search_period:')(ctx);
 
         expect(sendMessageMock).toHaveBeenCalled();
       });
@@ -728,7 +773,7 @@ describe('TelegramBotService (closed-pool bot)', () => {
         await bootWithLive(makeLiveSearchService({ finds: [liveFind()] as never }));
         const ctx = makeCtx('-1001');
 
-        await actionHandlers.get('/^search_period:(\\d+)$/')!(ctx);
+        await actionHandler('/^search_period:')(ctx);
 
         const list = sentTexts().find((text) => text.includes('Упоминания за')) as string;
         expect(list).toBeDefined();
@@ -743,7 +788,7 @@ describe('TelegramBotService (closed-pool bot)', () => {
         await bootWithLive(makeLiveSearchService({ finds: [liveFind()] as never }));
         const ctx = makeCtx('-1001');
 
-        await actionHandlers.get('/^search_period:(\\d+)$/')!(ctx);
+        await actionHandler('/^search_period:')(ctx);
 
         const list = sentTexts().find((text) => text.includes('Упоминания за')) as string;
         // makeMentionView() датирован 14.09.2026, находка — 20.09.2026, значит она первая.
@@ -758,7 +803,7 @@ describe('TelegramBotService (closed-pool bot)', () => {
         await bootWithLive(makeLiveSearchService({ finds: [liveFind()] as never }), {}, 0);
         const ctx = makeCtx('-1001');
 
-        await actionHandlers.get('/^search_period:(\\d+)$/')!(ctx);
+        await actionHandler('/^search_period:')(ctx);
 
         const texts = sentTexts();
         expect(texts.some((text) => text.includes('упоминаний не найдено'))).toBe(false);
@@ -769,7 +814,7 @@ describe('TelegramBotService (closed-pool bot)', () => {
         await bootWithLive(makeLiveSearchService());
         const ctx = makeCtx('-1001');
 
-        await actionHandlers.get('/^search_period:(\\d+)$/')!(ctx);
+        await actionHandler('/^search_period:')(ctx);
 
         const texts = sentTexts();
         expect(texts.some((text) => text.includes('Упоминания за'))).toBe(true);
@@ -783,7 +828,7 @@ describe('TelegramBotService (closed-pool bot)', () => {
         await bootWithLive(live);
         const ctx = makeCtx('-1001');
 
-        await actionHandlers.get('/^search_period:(\\d+)$/')!(ctx);
+        await actionHandler('/^search_period:')(ctx);
 
         const texts = sentTexts();
         expect(texts.some((text) => text.includes('Упоминания за'))).toBe(true);
@@ -795,9 +840,9 @@ describe('TelegramBotService (closed-pool bot)', () => {
         await bootWithLive(live);
         const ctx = makeCtx('-1001', { match: ['search_period:90', '90'] });
 
-        await actionHandlers.get('/^search_period:(\\d+)$/')!(ctx);
+        await actionHandler('/^search_period:')(ctx);
 
-        expect(live.collect).toHaveBeenCalledWith(90, expect.any(Date));
+        expect(live.collect).toHaveBeenCalledWith({ kind: 'days', days: 90 }, expect.any(Date));
       });
 
       /**
@@ -816,7 +861,7 @@ describe('TelegramBotService (closed-pool bot)', () => {
         const ctx = makeCtx('-1001');
 
         const startedAt = Date.now();
-        await actionHandlers.get('/^search_period:(\\d+)$/')!(ctx);
+        await actionHandler('/^search_period:')(ctx);
         const elapsed = Date.now() - startedAt;
 
         expect(elapsed).toBeGreaterThanOrEqual(PACING_MS);
@@ -833,7 +878,7 @@ describe('TelegramBotService (closed-pool bot)', () => {
        * никогда не получала.
        */
       describe('разворот статей по одному сообщению', () => {
-        const eachHandler = () => actionHandlers.get('/^search_each:(\\d+):(\\d+)$/')!;
+        const eachHandler = () => actionHandler('/^search_each:');
         const eachCtx = () => makeCtx('-1001', { match: ['search_each:7:0', '7', '0'] });
         /**
          * Находка внутри недельного окна. Дата именно «сейчас», а не фиксированная: разворот
@@ -847,7 +892,7 @@ describe('TelegramBotService (closed-pool bot)', () => {
           const store = makeLiveFindStore();
           await bootWithLive(makeLiveSearchService({ finds: [freshFind()] as never }), {}, 1, store);
 
-          await actionHandlers.get('/^search_period:(\\d+)$/')!(makeCtx('-1001'));
+          await actionHandler('/^search_period:')(makeCtx('-1001'));
           sendMessageMock.mockClear();
           await eachHandler()(eachCtx());
 
@@ -864,7 +909,7 @@ describe('TelegramBotService (closed-pool bot)', () => {
         it('нумерует статьи сквозь весь период, находку вместе с остальными', async () => {
           await bootWithLive(makeLiveSearchService({ finds: [freshFind()] as never }));
 
-          await actionHandlers.get('/^search_period:(\\d+)$/')!(makeCtx('-1001'));
+          await actionHandler('/^search_period:')(makeCtx('-1001'));
           sendMessageMock.mockClear();
           await eachHandler()(eachCtx());
 
@@ -878,12 +923,12 @@ describe('TelegramBotService (closed-pool bot)', () => {
           const store = makeLiveFindStore();
           await bootWithLive(makeLiveSearchService({ finds: [freshFind()] as never }), {}, 1, store);
 
-          await actionHandlers.get('/^search_period:(\\d+)$/')!(
+          await actionHandler('/^search_period:')(
             makeCtx('-1001', { match: ['search_period:90', '90'] }),
           );
 
           expect(store.save).toHaveBeenCalledWith(
-            90,
+            { kind: 'days', days: 90 },
             [expect.objectContaining({ url: 'https://tengrinews.kz/svezhaya-statya/' })],
             expect.any(Date),
           );
@@ -900,7 +945,7 @@ describe('TelegramBotService (closed-pool bot)', () => {
           (live.collect as jest.Mock).mockRejectedValue(new Error('сеть недоступна'));
           await bootWithLive(live, {}, 1, store);
 
-          await actionHandlers.get('/^search_period:(\\d+)$/')!(makeCtx('-1001'));
+          await actionHandler('/^search_period:')(makeCtx('-1001'));
           sendMessageMock.mockClear();
           await eachHandler()(eachCtx());
 
@@ -937,7 +982,7 @@ describe('TelegramBotService (closed-pool bot)', () => {
           (store.load as jest.Mock).mockRejectedValue(new Error('no connection to postgres'));
           await bootWithLive(makeLiveSearchService({ finds: [freshFind()] as never }), {}, 1, store);
 
-          await actionHandlers.get('/^search_period:(\\d+)$/')!(makeCtx('-1001'));
+          await actionHandler('/^search_period:')(makeCtx('-1001'));
           // Список заголовков всё равно с находкой: она ещё в памяти этого же вызова.
           expect(sentTexts()[0]).toContain('QazCloud открыл дата-центр');
 
@@ -954,7 +999,7 @@ describe('TelegramBotService (closed-pool bot)', () => {
           const store = makeLiveFindStore({ 7: [freshFind() as never] });
           await bootWithLive(makeLiveSearchService(), {}, 1, store);
 
-          await actionHandlers.get('/^search_more:(\\d+):(\\d+)$/')!(
+          await actionHandler('/^search_more:')(
             makeCtx('-1001', { match: ['search_more:7:0', '7', '0'] }),
           );
 
@@ -975,9 +1020,9 @@ describe('TelegramBotService (closed-pool bot)', () => {
             makeLiveFindStore(),
           );
 
-          await actionHandlers.get('/^search_period:(\\d+)$/')!(makeCtx('-1001'));
+          await actionHandler('/^search_period:')(makeCtx('-1001'));
 
-          expect(dashboard.publish).toHaveBeenCalledWith(7, expect.any(Date), [
+          expect(dashboard.publish).toHaveBeenCalledWith({ kind: 'days', days: 7 }, expect.any(Date), [
             expect.objectContaining({ title: 'QazCloud открыл дата-центр' }),
           ]);
         });
@@ -992,7 +1037,7 @@ describe('TelegramBotService (closed-pool bot)', () => {
         await bootWithLive(makeLiveSearchService({ finds: [liveFind()] as never }));
         const ctx = makeCtx('-1001');
 
-        await actionHandlers.get('/^search_period:(\\d+)$/')!(ctx);
+        await actionHandler('/^search_period:')(ctx);
 
         const everything = [
           ...sentTexts(),
@@ -1011,7 +1056,7 @@ describe('TelegramBotService (closed-pool bot)', () => {
       const { curatedSearchService } = await boot('-1001');
       const ctx = makeCtx('999999');
 
-      await actionHandlers.get('/^search_period:(\\d+)$/')!(ctx);
+      await actionHandler('/^search_period:')(ctx);
 
       expect(curatedSearchService.search).not.toHaveBeenCalled();
       expect(ctx.answerCbQuery).toHaveBeenCalledWith('Эта команда доступна только в рабочей группе мониторинга.');
@@ -1021,7 +1066,7 @@ describe('TelegramBotService (closed-pool bot)', () => {
       const { curatedSearchService } = await boot('-1001');
       const ctx = makeCtx('-1001', { match: ['search_period:999999', '999999'] });
 
-      await actionHandlers.get('/^search_period:(\\d+)$/')!(ctx);
+      await actionHandler('/^search_period:')(ctx);
 
       expect(ctx.answerCbQuery).toHaveBeenCalledWith('Неизвестный период');
       expect(curatedSearchService.search).not.toHaveBeenCalled();
@@ -1038,9 +1083,9 @@ describe('TelegramBotService (closed-pool bot)', () => {
       });
 
       try {
-        await actionHandlers.get('/^search_period:(\\d+)$/')!(ctx);
+        await actionHandler('/^search_period:')(ctx);
 
-        expect(curatedSearchService.search).toHaveBeenCalledWith(7, expect.any(Date));
+        expect(curatedSearchService.search).toHaveBeenCalledWith({ kind: 'days', days: 7 }, expect.any(Date));
         expect(fetchSpy).not.toHaveBeenCalled();
       } finally {
         fetchSpy.mockRestore();
@@ -1087,7 +1132,7 @@ describe('TelegramBotService (closed-pool bot)', () => {
         return undefined;
       }) as unknown as typeof ctx.editMessageText;
 
-      await actionHandlers.get('/^search_period:(\\d+)$/')!(ctx);
+      await actionHandler('/^search_period:')(ctx);
 
       expect(order).toEqual(['status', 'search', 'result']);
     });
@@ -1112,7 +1157,7 @@ describe('TelegramBotService (closed-pool bot)', () => {
       );
       const ctx = makeCtx('-1001');
 
-      await actionHandlers.get('/^search_period:(\\d+)$/')!(ctx);
+      await actionHandler('/^search_period:')(ctx);
 
       for (const call of (ctx.editMessageText as jest.Mock).mock.calls) {
         expect(String(call[0])).not.toContain('Обработано источников');
@@ -1131,7 +1176,7 @@ describe('TelegramBotService (closed-pool bot)', () => {
         .mockRejectedValueOnce(new Error('message is not modified'))
         .mockResolvedValue(undefined) as unknown as typeof ctx.editMessageText;
 
-      await actionHandlers.get('/^search_period:(\\d+)$/')!(ctx);
+      await actionHandler('/^search_period:')(ctx);
 
       expect(curatedSearchService.search).toHaveBeenCalled();
       expect(sendMessageMock).toHaveBeenCalled();
@@ -1153,7 +1198,7 @@ describe('TelegramBotService (closed-pool bot)', () => {
       await boot('-1001', curatedSearchService);
       const ctx = makeCtx('-1001');
 
-      await actionHandlers.get('/^search_period:(\\d+)$/')!(ctx);
+      await actionHandler('/^search_period:')(ctx);
 
       expect(ctx.answerCbQuery).toHaveBeenCalled();
       expect(ctx.editMessageText).toHaveBeenCalledWith(expect.stringContaining('Период: Неделя'));
@@ -1176,7 +1221,7 @@ describe('TelegramBotService (closed-pool bot)', () => {
       await boot('-1001', curatedSearchService);
       const ctx = makeCtx('-1001');
 
-      await actionHandlers.get('/^search_period:(\\d+)$/')!(ctx);
+      await actionHandler('/^search_period:')(ctx);
 
       const [, message] = sendMessageMock.mock.calls[0];
       expect(message).toBe('Упоминаний не найдено.');
@@ -1190,7 +1235,7 @@ describe('TelegramBotService (closed-pool bot)', () => {
       await boot('-1001', curatedSearchService);
       const ctx = makeCtx('-1001');
 
-      await actionHandlers.get('/^search_period:(\\d+)$/')!(ctx);
+      await actionHandler('/^search_period:')(ctx);
 
       const [, message] = sendMessageMock.mock.calls[0];
       // Одна строка, без внутренней статистики: числа остались в /status.
@@ -1218,7 +1263,7 @@ describe('TelegramBotService (closed-pool bot)', () => {
       await boot('-1001', curatedSearchService);
       const ctx = makeCtx('-1001');
 
-      await actionHandlers.get('/^search_period:(\\d+)$/')!(ctx);
+      await actionHandler('/^search_period:')(ctx);
 
       const [, message] = sendMessageMock.mock.calls[0];
       expect(message).not.toContain('Без даты');
@@ -1243,7 +1288,7 @@ describe('TelegramBotService (closed-pool bot)', () => {
       await boot('-1001', curatedSearchService);
       const ctx = makeCtx('-1001');
 
-      await actionHandlers.get('/^search_period:(\\d+)$/')!(ctx);
+      await actionHandler('/^search_period:')(ctx);
 
       const [, message] = sendMessageMock.mock.calls[0] as [unknown, string, any];
       expect(message).toContain('🟡 Нейтрал');
@@ -1267,7 +1312,7 @@ describe('TelegramBotService (closed-pool bot)', () => {
       await boot('-1001', curatedSearchService);
       const ctx = makeCtx('-1001');
 
-      await actionHandlers.get('/^search_period:(\\d+)$/')!(ctx);
+      await actionHandler('/^search_period:')(ctx);
 
       const [, prompt, extra] = sendMessageMock.mock.calls.at(-1) as [unknown, string, any];
       expect(prompt).toContain('Показать каждую статью подробнее?');
@@ -1300,7 +1345,7 @@ describe('TelegramBotService (closed-pool bot)', () => {
       await boot('-1001', curatedSearchService);
       const ctx = makeCtx('-1001');
 
-      await actionHandlers.get('/^search_period:(\\d+)$/')!(ctx);
+      await actionHandler('/^search_period:')(ctx);
 
       const [, message] = sendMessageMock.mock.calls[0];
       expect(message).toContain('Не удалось выполнить поиск');
@@ -1319,7 +1364,7 @@ describe('TelegramBotService (closed-pool bot)', () => {
       const ctx = makeCtx('-1001');
 
       let handlerResolved = false;
-      const handlerPromise = actionHandlers.get('/^search_period:(\\d+)$/')!(ctx).then(() => {
+      const handlerPromise = actionHandler('/^search_period:')(ctx).then(() => {
         handlerResolved = true;
       });
       await new Promise((resolve) => setImmediate(resolve));
@@ -1336,6 +1381,208 @@ describe('TelegramBotService (closed-pool bot)', () => {
     });
   });
 
+  /**
+   * Свой отрезок времени в боте — то же, что «Свои даты» в веб-интерфейсе.
+   *
+   * Спросить можно двумя способами, и оба проверяются здесь: командой с датами
+   * (`/search 01.07.2026-15.10.2026`) и ответом датами на вопрос бота по кнопке «Свои даты».
+   * Состояния «жду даты» нигде нет: ответ узнаётся по `reply_to_message` — на Vercel следующее
+   * сообщение приходит в другой вызов функции, и запоминать ожидание было бы негде.
+   */
+  describe('свой отрезок времени', () => {
+    const periodButtonHandler = () => actionHandler('/^search_period:');
+    const customHandler = () => actionHandlers.get(SEARCH_CUSTOM_RANGE_CALLBACK_DATA)!;
+    const textHandler = () => updateHandlers[0];
+
+    function replyCtx(text: string, chatId: string | number = '-1001') {
+      return makeCtx(chatId, {
+        message: { text, reply_to_message: { text: SEARCH_CUSTOM_RANGE_PROMPT_TEXT } },
+      });
+    }
+
+    function commandCtx(text: string, chatId: string | number = '-1001') {
+      return makeCtx(chatId, { message: { text } });
+    }
+
+    function sentTexts(): string[] {
+      return sendMessageMock.mock.calls.map((call) => call[1] as string);
+    }
+
+    async function bootWithWindow(total = 1) {
+      return boot('-1001', makeCuratedSearchService({ searchResult: { total }, page: [makeMentionView()] }));
+    }
+
+    it('ищет по датам из команды /search', async () => {
+      const { curatedSearchService } = await bootWithWindow();
+
+      await commandHandlers.get('search')!(commandCtx('/search 01.07.2026-15.10.2026'));
+
+      expect(curatedSearchService.search).toHaveBeenCalledWith(
+        { kind: 'range', dateFrom: '2026-07-01', dateTo: '2026-10-15' },
+        expect.any(Date),
+      );
+    });
+
+    /** Кнопки периодов тогда не нужны вовсе: период уже назван. */
+    it('команда с датами не показывает клавиатуру периодов', async () => {
+      await bootWithWindow();
+      const ctx = commandCtx('/search 01.07.2026-15.10.2026');
+
+      await commandHandlers.get('search')!(ctx);
+
+      const replies = (ctx.reply as jest.Mock).mock.calls;
+      expect(replies.every(([, extra]) => extra?.reply_markup?.inline_keyboard === undefined)).toBe(true);
+    });
+
+    it('в шапке выдачи стоят сами даты, а не название периода', async () => {
+      await bootWithWindow();
+
+      await commandHandlers.get('search')!(commandCtx('/search 01.07.2026-15.10.2026'));
+
+      const list = sentTexts().find((text) => text.includes('Упоминания за')) as string;
+      expect(list).toContain('01.07.2026 — 15.10.2026');
+    });
+
+    it('кнопка «Свои даты» задаёт вопрос с force_reply и снимает клавиатуру периодов', async () => {
+      await bootWithWindow();
+      const ctx = makeCtx('-1001');
+
+      await customHandler()(ctx);
+
+      expect(ctx.editMessageReplyMarkup).toHaveBeenCalledWith({ inline_keyboard: [] });
+      const [text, extra] = (ctx.reply as jest.Mock).mock.calls[0];
+      expect(text).toBe(SEARCH_CUSTOM_RANGE_PROMPT_TEXT);
+      expect(extra.reply_markup.force_reply).toBe(true);
+    });
+
+    it('ищет по датам из ответа на вопрос бота', async () => {
+      const { curatedSearchService } = await bootWithWindow();
+
+      await textHandler()(replyCtx('01.07.2026 - 15.10.2026'));
+
+      expect(curatedSearchService.search).toHaveBeenCalledWith(
+        { kind: 'range', dateFrom: '2026-07-01', dateTo: '2026-10-15' },
+        expect.any(Date),
+      );
+    });
+
+    /**
+     * В рабочей группе люди переписываются. Поиск на каждое сообщение с цифрами бот запускать не
+     * вправе — отсюда требование ответа именно на свой вопрос.
+     */
+    it('не реагирует на обычное сообщение с датами, не адресованное ему', async () => {
+      const { curatedSearchService } = await bootWithWindow();
+
+      await textHandler()(makeCtx('-1001', { message: { text: '01.07.2026-15.10.2026' } }));
+      await textHandler()(
+        makeCtx('-1001', { message: { text: '01.07.2026', reply_to_message: { text: 'Упоминания за Неделя' } } }),
+      );
+
+      expect(curatedSearchService.search).not.toHaveBeenCalled();
+      expect(sendMessageMock).not.toHaveBeenCalled();
+    });
+
+    it('не отвечает на ответ из чужого чата', async () => {
+      const { curatedSearchService } = await bootWithWindow();
+
+      await textHandler()(replyCtx('01.07.2026-15.10.2026', '999999'));
+
+      expect(curatedSearchService.search).not.toHaveBeenCalled();
+    });
+
+    it('живой поиск и дашборд получают тот же отрезок, что и выдача', async () => {
+      const dashboard = makeDashboardPublishService();
+      const live = makeLiveSearchService();
+      await boot(
+        '-1001',
+        makeCuratedSearchService({ searchResult: { total: 1 }, page: [makeMentionView()] }),
+        'webhook',
+        makeCuratedResetService(),
+        {},
+        dashboard,
+        live,
+      );
+
+      await commandHandlers.get('search')!(commandCtx('/search 01.07.2026-15.10.2026'));
+
+      const range = { kind: 'range', dateFrom: '2026-07-01', dateTo: '2026-10-15' };
+      expect(live.collect).toHaveBeenCalledWith(range, expect.any(Date));
+      expect(dashboard.publish).toHaveBeenCalledWith(range, expect.any(Date), []);
+    });
+
+    /** Кнопки продолжения несут тот же отрезок: иначе «Показать ещё» ушло бы в другой период. */
+    it('кнопка разворота несёт в себе сам отрезок', async () => {
+      await bootWithWindow();
+
+      await commandHandlers.get('search')!(commandCtx('/search 01.07.2026-15.10.2026'));
+
+      const prompt = sendMessageMock.mock.calls.find(([, text]) =>
+        String(text).includes('Показать каждую статью подробнее?'),
+      ) as [unknown, string, any];
+      expect(prompt[2].reply_markup.inline_keyboard[0][0].callback_data).toBe(
+        'search_each:2026-07-01~2026-10-15:0',
+      );
+    });
+
+    it('разворот по кнопке с отрезком выдаёт статьи того же отрезка', async () => {
+      const { curatedSearchService } = await bootWithWindow();
+
+      await actionHandler('/^search_each:')(
+        makeCtx('-1001', {
+          match: ['search_each:2026-07-01~2026-10-15:0', '2026-07-01~2026-10-15', '0'],
+        }),
+      );
+
+      expect(curatedSearchService.search).toHaveBeenCalledWith(
+        { kind: 'range', dateFrom: '2026-07-01', dateTo: '2026-10-15' },
+        expect.any(Date),
+      );
+    });
+
+    describe('неудачный ввод', () => {
+      it('непонятные даты — причина и подсказка, без поиска', async () => {
+        const { curatedSearchService } = await bootWithWindow();
+        const ctx = commandCtx('/search с июля по октябрь');
+
+        await commandHandlers.get('search')!(ctx);
+
+        const [text] = (ctx.reply as jest.Mock).mock.calls[0];
+        expect(text).toContain('Не понял даты');
+        expect(text).toContain('01.07.2026-15.10.2026');
+        expect(curatedSearchService.search).not.toHaveBeenCalled();
+      });
+
+      it('перевёрнутый отрезок — поиск не запускается', async () => {
+        const { curatedSearchService } = await bootWithWindow();
+        const ctx = replyCtx('15.10.2026-01.07.2026');
+
+        await textHandler()(ctx);
+
+        expect((ctx.reply as jest.Mock).mock.calls[0][0]).toContain('позже конца');
+        expect(curatedSearchService.search).not.toHaveBeenCalled();
+      });
+
+      it('пустой отрезок отвечает «не найдено», а не молчанием', async () => {
+        await boot('-1001', makeCuratedSearchService({ searchResult: { total: 0 }, page: [] }));
+
+        await commandHandlers.get('search')!(commandCtx('/search 01.01.2019-02.01.2019'));
+
+        expect(sentTexts().some((text) => text.includes('упоминаний не найдено'))).toBe(true);
+      });
+
+      /** Отрезок не из списка кнопок — это нормально, а вот число дней не из списка нормально не */
+      it('подделанный период в кнопке отклоняется', async () => {
+        const { curatedSearchService } = await bootWithWindow();
+        const ctx = makeCtx('-1001', { match: ['search_period:12345', '12345'] });
+
+        await periodButtonHandler()(ctx);
+
+        expect(ctx.answerCbQuery).toHaveBeenCalledWith('Неизвестный период');
+        expect(curatedSearchService.search).not.toHaveBeenCalled();
+      });
+    });
+  });
+
   describe('search_more callback (pagination)', () => {
     function makeMoreCtx(chatId: number | string | undefined, days: number, offset: number) {
       return makeCtx(chatId, { match: [`search_more:${days}:${offset}`, String(days), String(offset)] });
@@ -1345,7 +1592,7 @@ describe('TelegramBotService (closed-pool bot)', () => {
       const { curatedSearchService } = await boot('-1001');
       const ctx = makeMoreCtx('999999', 7, 3);
 
-      await actionHandlers.get('/^search_more:(\\d+):(\\d+)$/')!(ctx);
+      await actionHandler('/^search_more:')(ctx);
 
       expect(curatedSearchService.findPage).not.toHaveBeenCalled();
       expect(ctx.answerCbQuery).toHaveBeenCalledWith('Эта команда доступна только в рабочей группе мониторинга.');
@@ -1355,7 +1602,7 @@ describe('TelegramBotService (closed-pool bot)', () => {
       const { curatedSearchService } = await boot('-1001');
       const ctx = makeMoreCtx('-1001', 999999, 0);
 
-      await actionHandlers.get('/^search_more:(\\d+):(\\d+)$/')!(ctx);
+      await actionHandler('/^search_more:')(ctx);
 
       expect(ctx.answerCbQuery).toHaveBeenCalledWith('Некорректный запрос');
       expect(curatedSearchService.findPage).not.toHaveBeenCalled();
@@ -1372,13 +1619,18 @@ describe('TelegramBotService (closed-pool bot)', () => {
       await boot('-1001', curatedSearchService);
       const ctx = makeMoreCtx('-1001', 7, 4);
 
-      await actionHandlers.get('/^search_more:(\\d+):(\\d+)$/')!(ctx);
+      await actionHandler('/^search_more:')(ctx);
 
       expect(ctx.answerCbQuery).toHaveBeenCalled();
       expect(ctx.editMessageReplyMarkup).toHaveBeenCalledWith({ inline_keyboard: [] });
       // Окно читается целиком и уже потом нарезается по смещению: в общем списке материалы
       // стоят вперемешку с находками живого поиска, и страницу №N иначе не собрать (periodItems).
-      expect(curatedSearchService.findPage).toHaveBeenCalledWith(7, 0, expect.any(Number), expect.any(Date));
+      expect(curatedSearchService.findPage).toHaveBeenCalledWith(
+        { kind: 'days', days: 7 },
+        0,
+        expect.any(Number),
+        expect.any(Date),
+      );
       const [, message, extra] = sendMessageMock.mock.calls[0] as [unknown, string, any];
       expect(message).toContain('5. '); // startIndex = offset + 1
       expect(message).toContain('Находка 4');
@@ -1390,7 +1642,7 @@ describe('TelegramBotService (closed-pool bot)', () => {
       await boot('-1001', curatedSearchService);
       const ctx = makeMoreCtx('-1001', 7, 2);
 
-      await actionHandlers.get('/^search_more:(\\d+):(\\d+)$/')!(ctx);
+      await actionHandler('/^search_more:')(ctx);
 
       const [, message] = sendMessageMock.mock.calls[0];
       expect(message).toBe('Больше записей нет.');
@@ -1431,10 +1683,10 @@ describe('TelegramBotService (closed-pool bot)', () => {
       }
     }
 
-    const periodHandler = () => actionHandlers.get('/^search_period:(\\d+)$/')!;
-    const moreHandler = () => actionHandlers.get('/^search_more:(\\d+):(\\d+)$/')!;
+    const periodHandler = () => actionHandler('/^search_period:');
+    const moreHandler = () => actionHandler('/^search_more:');
     /** «Да, по одной» и её продолжение — поток, на который теперь указывает кнопка. */
-    const eachHandler = () => actionHandlers.get('/^search_each:(\\d+):(\\d+)$/')!;
+    const eachHandler = () => actionHandler('/^search_each:');
 
     function sentTexts(): string[] {
       return sendMessageMock.mock.calls.map((call) => call[1] as string);
@@ -1491,10 +1743,11 @@ describe('TelegramBotService (closed-pool bot)', () => {
       // Главное здесь — ровно 19 статей, по одной, без дублей и пропусков (проверено выше).
       // Смещение при этом применяется к общему списку, а не к запросу: окно каждый раз читается
       // целиком, потому что в нём вперемешку стоят находки живого поиска — см. periodItems.
+      const week = { kind: 'days', days: 7 };
       expect((curatedSearchService.findPage as jest.Mock).mock.calls).toEqual([
-        [7, 0, total, expect.any(Date)],
-        [7, 0, total, expect.any(Date)],
-        [7, 0, total, expect.any(Date)],
+        [week, 0, total, expect.any(Date)],
+        [week, 0, total, expect.any(Date)],
+        [week, 0, total, expect.any(Date)],
       ]);
     });
 
@@ -1529,8 +1782,8 @@ describe('TelegramBotService (closed-pool bot)', () => {
     it('keeps sending the rest of the batch when one message fails', async () => {
       await boot('-1001', makePagedSearchService(3), 'webhook', makeCuratedResetService(), ONE_PER_MESSAGE);
       // Header and finding 1 go out, finding 2 fails, finding 3 must still be attempted.
-      sendMessageMock.mockImplementationOnce(async () => undefined);
-      sendMessageMock.mockImplementationOnce(async () => undefined);
+      sendMessageMock.mockImplementationOnce(async () => ({ message_id: 0 }));
+      sendMessageMock.mockImplementationOnce(async () => ({ message_id: 0 }));
       sendMessageMock.mockImplementationOnce(async () => {
         throw new Error('429: Too Many Requests');
       });
@@ -1545,7 +1798,7 @@ describe('TelegramBotService (closed-pool bot)', () => {
       await boot('-1001', makePagedSearchService(19), 'webhook', makeCuratedResetService(), ONE_PER_MESSAGE);
       // Header plus findings 1-7 succeed; finding 8 — the one carrying the keyboard — fails.
       for (let i = 0; i < 8; i++) {
-        sendMessageMock.mockImplementationOnce(async () => undefined);
+        sendMessageMock.mockImplementationOnce(async () => ({ message_id: 0 }));
       }
       sendMessageMock.mockImplementationOnce(async () => {
         throw new Error('400: message text is too long');

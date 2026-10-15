@@ -1,6 +1,7 @@
 import { Sentiment } from '../mentions/mention.entity';
 import { CuratedLinkStatus } from './curated-link.entity';
 import { CuratedStatus } from './curated-mentions';
+import { SearchPeriod } from './search-window.util';
 
 export const CURATED_DEFAULT_SOURCE_LABEL = 'Подборка материалов';
 
@@ -38,6 +39,11 @@ export interface PoolStats {
 }
 
 export interface CuratedSearchResult {
+  /**
+   * Длина окна в днях. У кнопок периода это сами «N дней», у своего отрезка — его длина с
+   * границами включительно (см. searchWindowSpanDays): у отрезка своя правая граница, поэтому
+   * «дней назад» для него не определено.
+   */
   periodDays: number;
   /** Calendar dates ("YYYY-MM-DD") in the configured timezone — see curated-date.util.ts. */
   dateFrom: string;
@@ -88,8 +94,8 @@ export interface CuratedMentionView {
  * must not depend on a third-party API being up (or on OPENAI_API_KEY being set at all).
  */
 export interface CuratedSearchSource {
-  search(periodDays: number, now?: Date): Promise<CuratedSearchResult>;
-  findPage(periodDays: number, offset: number, limit: number, now?: Date): Promise<CuratedMentionView[]>;
+  search(period: SearchPeriod, now?: Date): Promise<CuratedSearchResult>;
+  findPage(period: SearchPeriod, offset: number, limit: number, now?: Date): Promise<CuratedMentionView[]>;
   getPoolStats(): Promise<PoolStats>;
 }
 
