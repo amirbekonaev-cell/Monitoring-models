@@ -2,6 +2,7 @@ import { Injectable, Logger } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { Setting } from '../settings/setting.entity';
+import { SearchPeriod, searchWindowLabel } from '../curated/search-window.util';
 import { LiveFind } from './live-find.types';
 import {
   liveFindsSettingKey,
@@ -48,27 +49,28 @@ export class LiveFindStoreService {
 
   /** Заменяет находки периода на переданные. Пустой список тоже сохраняется: он означает, что в
    *  этот раз живой поиск не нашёл ничего, и прошлые находки показывать больше нельзя. */
-  async save(periodDays: number, finds: readonly LiveFind[], now: Date = new Date()): Promise<void> {
+  async save(period: SearchPeriod, finds: readonly LiveFind[], now: Date = new Date()): Promise<void> {
     await this.settingsRepo.upsert(
-      { key: liveFindsSettingKey(periodDays), value: serializeLiveFinds(finds, now) },
+      { key: liveFindsSettingKey(period), value: serializeLiveFinds(finds, now) },
       ['key'],
     );
-    this.logger.log(`Находки живого поиска сохранены для периода ${periodDays} дн.: ${finds.length}`);
+    this.logger.log(`Находки живого поиска сохранены для периода «${searchWindowLabel(period)}»: ${finds.length}`);
   }
 
   /**
    * Находки последнего /search за период вместе с моментом, когда они сохранены. Нет строки или
    * строка не разбирается — пустая запись: выдача останется без находок, но уйдёт человеку.
    */
-  async load(periodDays: number): Promise<StoredLiveFinds> {
-    const row = await this.settingsRepo.findOne({ where: { key: liveFindsSettingKey(periodDays) } });
+  async load(period: SearchPeriod): Promise<StoredLiveFinds> {
+    const row = await this.settingsRepo.findOne({ where: { key: liveFindsSettingKey(period) } });
     if (!row) {
       return EMPTY;
     }
     const stored = parseLiveFinds(row.value);
     if (stored === null) {
       this.logger.warn(
-        `Запись находок живого поиска за ${periodDays} дн. не разобрана — в выдаче останется только набор`,
+        `Запись находок живого поиска за «${searchWindowLabel(period)}» не разобрана — ` +
+          'в выдаче останется только набор',
       );
       return EMPTY;
     }

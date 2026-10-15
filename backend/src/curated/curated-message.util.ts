@@ -4,6 +4,7 @@ import { CuratedLinkStatus } from './curated-link.entity';
 import { formatDateInTimezone, formatIsoDateDisplay } from './curated-date.util';
 import { CardSetStats, CuratedMentionView, CuratedSearchResult, PoolStats } from './curated-search.types';
 import { escapeHtml, truncateText } from './text.util';
+import { encodeSearchPeriod, SearchPeriod } from './search-window.util';
 
 export const SEARCH_PERIOD_PROMPT_TEXT = 'За какой период искать упоминания?';
 export const EMPTY_POOL_TEXT = 'Упоминаний не найдено.';
@@ -258,13 +259,32 @@ function withLink(block: string, item: CuratedMentionView): string {
 
 /** null when the resulting callback_data would exceed Telegram's 64-byte limit (never happens for
  *  realistic day/offset ranges — a defensive check, not a normal code path). */
-export function buildSearchMoreCallbackData(days: number, offset: number): string | null {
-  const data = `search_more:${days}:${offset}`;
+export function buildSearchMoreCallbackData(period: SearchPeriod, offset: number): string | null {
+  const data = `search_more:${encodeSearchPeriod(period)}:${offset}`;
   return Buffer.byteLength(data, 'utf8') <= CALLBACK_DATA_MAX_BYTES ? data : null;
 }
 
-export function buildSearchPeriodCallbackData(days: number): string {
-  return `search_period:${days}`;
+export function buildSearchPeriodCallbackData(period: SearchPeriod): string {
+  return `search_period:${encodeSearchPeriod(period)}`;
+}
+
+/** Кнопка «Свои даты» под списком периодов: период в ней не зашит — его ещё вписывает человек. */
+export const SEARCH_CUSTOM_RANGE_CALLBACK_DATA = 'search_period:custom';
+
+export const SEARCH_CUSTOM_RANGE_BUTTON_TEXT = 'Свои даты';
+
+/**
+ * Вопрос про свой отрезок. Текст служит ещё и признаком: ответ на него бот узнаёт по
+ * `reply_to_message`, а не по запомненному состоянию — состояния между вызовами вебхука на Vercel
+ * нет и быть не может (см. TelegramBotService).
+ */
+export const SEARCH_CUSTOM_RANGE_PROMPT_TEXT =
+  'Пришлите свой отрезок времени ответом на это сообщение.\n' +
+  'Примеры: 01.07.2026-15.10.2026 · 2026-07-01 2026-10-15 · 01.07.2026 (с этой даты по сегодня)';
+
+/** Та же подсказка в ответ на `/search` с непонятными датами — там к ней добавляется причина. */
+export function buildCustomRangeErrorText(reason: string): string {
+  return `${reason}\n\n${SEARCH_CUSTOM_RANGE_PROMPT_TEXT}`;
 }
 
 /**
@@ -275,8 +295,8 @@ export function buildSearchPeriodCallbackData(days: number): string {
  * null — если callback_data не влезает в 64 байта Telegram (для реальных дней/смещений не
  * случается, защитная проверка).
  */
-export function buildSearchExpandCallbackData(days: number, offset: number): string | null {
-  const data = `search_each:${days}:${offset}`;
+export function buildSearchExpandCallbackData(period: SearchPeriod, offset: number): string | null {
+  const data = `search_each:${encodeSearchPeriod(period)}:${offset}`;
   return Buffer.byteLength(data, 'utf8') <= CALLBACK_DATA_MAX_BYTES ? data : null;
 }
 

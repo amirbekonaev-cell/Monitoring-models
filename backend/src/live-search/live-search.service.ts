@@ -1,5 +1,6 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { SearchPeriod, toSearchWindow } from '../curated/search-window.util';
 import { parseBrandForms } from './brand-match.util';
 import { filterFindsToPeriod } from './live-find-period.util';
 import { LiveRssSearchService } from './live-rss-search.service';
@@ -60,21 +61,21 @@ export class LiveSearchService {
    * превращается в предупреждение в логе и пустой вклад этого канала — выдача обязана уйти
    * человеку независимо от того, что случилось с сетью.
    */
-  async collect(periodDays: number, now: Date = new Date()): Promise<LiveSearchOutcome> {
+  async collect(period: SearchPeriod, now: Date = new Date()): Promise<LiveSearchOutcome> {
     const startedAt = Date.now();
     const deadline = startedAt + this.budgetMs;
     const brandForms = parseBrandForms(this.config.get<string>('liveSearch.brandForms'));
 
     const [rssResult, openAiResult] = await Promise.all([
       this.rssSearch
-        .collect(periodDays, now)
+        .collect(period, now)
         .then((outcome) => ({ finds: outcome.finds, failed: false }))
         .catch((error) => {
           this.logger.warn(`Канал «RSS-ленты» не отработал: ${describeError(error)}`);
           return { finds: [] as LiveFind[], failed: true };
         }),
       this.openAiSearch
-        .search(brandForms, deadline)
+        .search(brandForms, deadline, toSearchWindow(period))
         .then((finds) => ({ finds, failed: false }))
         .catch((error) => {
           this.logger.warn(`Канал «веб-поиск» не отработал: ${describeError(error)}`);
@@ -84,7 +85,7 @@ export class LiveSearchService {
 
     // Ленты первыми: у них дата из самого фида, а не восстановленная моделью, поэтому при
     // совпадении адресов остаётся запись ленты.
-    const finds = this.mergeAndFilter([...rssResult.finds, ...openAiResult.finds], periodDays, now);
+    const finds = this.mergeAndFilter([...rssResult.finds, ...openAiResult.finds], period, now);
 
     const channelsFailed = Number(rssResult.failed) + Number(openAiResult.failed);
     const outcome: LiveSearchOutcome = {
@@ -109,8 +110,8 @@ export class LiveSearchService {
    * применяются второй раз, при развороте статей по одному сообщению: находки к тому моменту
    * читаются из хранилища, в другом вызове вебхука.
    */
-  private mergeAndFilter(finds: LiveFind[], periodDays: number, now: Date): LiveFind[] {
-    return filterFindsToPeriod(finds, periodDays, now, this.timezone);
+  private mergeAndFilter(finds: LiveFind[], period: SearchPeriod, now: Date): LiveFind[] {
+    return filterFindsToPeriod(finds, period, now, this.timezone);
   }
 }
 

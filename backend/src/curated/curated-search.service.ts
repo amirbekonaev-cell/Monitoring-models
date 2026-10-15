@@ -17,6 +17,7 @@ import {
   zeroedLinkStatusRecord,
   zeroedSentimentRecord,
 } from './curated-search.types';
+import { SearchPeriod, searchWindowSpanDays, toSearchWindow } from './search-window.util';
 
 // Re-exported so the formatters, scripts and specs that have always imported these from here keep
 // working; the definitions themselves live in curated-search.types.ts, which the JSON source
@@ -80,10 +81,16 @@ export class CuratedSearchService implements CuratedSearchSource {
     return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : DEFAULT_SUMMARY_DISPLAY_LENGTH;
   }
 
-  private dateWindow(periodDays: number, now: Date): { tz: string; dateFrom: string; dateTo: string } {
+  private dateWindow(period: SearchPeriod, now: Date): { tz: string; dateFrom: string; dateTo: string } {
     const tz = this.timezone;
+    const window = toSearchWindow(period);
+    // Свой отрезок уже является окном — границы вписал человек; «за N дней» отсчитывается от
+    // сегодняшней календарной даты в SEARCH_TIMEZONE.
+    if (window.kind === 'range') {
+      return { tz, dateFrom: window.dateFrom, dateTo: window.dateTo };
+    }
     const dateTo = zonedDateString(now, tz);
-    const dateFrom = subtractCalendarDays(dateTo, periodDays);
+    const dateFrom = subtractCalendarDays(dateTo, window.days);
     return { tz, dateFrom, dateTo };
   }
 
@@ -98,8 +105,8 @@ export class CuratedSearchService implements CuratedSearchSource {
       .andWhere('(m.publishedAt AT TIME ZONE :tz)::date BETWEEN :dateFrom AND :dateTo', { tz, dateFrom, dateTo });
   }
 
-  async search(periodDays: number, now: Date = new Date()): Promise<CuratedSearchResult> {
-    const { tz, dateFrom, dateTo } = this.dateWindow(periodDays, now);
+  async search(period: SearchPeriod, now: Date = new Date()): Promise<CuratedSearchResult> {
+    const { tz, dateFrom, dateTo } = this.dateWindow(period, now);
 
     await this.lazyProcess(dateFrom, now);
 
@@ -123,6 +130,7 @@ export class CuratedSearchService implements CuratedSearchSource {
 
     const pool = await this.getPoolStats();
 
+    const periodDays = searchWindowSpanDays(toSearchWindow(period));
     return { periodDays, dateFrom, dateTo, total, bySentiment, undatedCount, pool };
   }
 
@@ -131,8 +139,8 @@ export class CuratedSearchService implements CuratedSearchSource {
    * from the start of the whole (unpaginated) window, matching the running total /search's
    * "Показать ещё" button reports — not from any previous page.
    */
-  async findPage(periodDays: number, offset: number, limit: number, now: Date = new Date()): Promise<CuratedMentionView[]> {
-    const { tz, dateFrom, dateTo } = this.dateWindow(periodDays, now);
+  async findPage(period: SearchPeriod, offset: number, limit: number, now: Date = new Date()): Promise<CuratedMentionView[]> {
+    const { tz, dateFrom, dateTo } = this.dateWindow(period, now);
 
     const rows = await this.inWindowQuery(tz, dateFrom, dateTo)
       .select(['m.id', 'm.title', 'm.sourceLabel', 'm.publishedAt', 'm.sentiment', 'm.summary', 'm.text'])

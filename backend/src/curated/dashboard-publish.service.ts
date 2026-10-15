@@ -5,6 +5,7 @@ import { Repository } from 'typeorm';
 import { Mention, MentionSourceType } from '../mentions/mention.entity';
 import { CURATED_SEARCH_SOURCE, CuratedMentionView, CuratedSearchSource } from './curated-search.types';
 import { normalizeUrl } from './curated-mentions';
+import { SearchPeriod, searchWindowLabel } from './search-window.util';
 
 export interface DashboardPublishOutcome {
   periodDays: number;
@@ -69,12 +70,12 @@ export class DashboardPublishService {
    * либо он показывает новую выдачу целиком, либо остаётся прежним.
    */
   async publish(
-    periodDays: number,
+    period: SearchPeriod,
     now: Date = new Date(),
     live: readonly CuratedMentionView[] = [],
   ): Promise<DashboardPublishOutcome> {
-    const result = await this.searchSource.search(periodDays, now);
-    const found = await this.searchSource.findPage(periodDays, 0, result.total, now);
+    const result = await this.searchSource.search(period, now);
+    const found = await this.searchSource.findPage(period, 0, result.total, now);
     // Найденное живым поиском идёт в дашборд наравне с карточками набора: в Telegram человек
     // получил один список, и веб-интерфейс обязан показывать тот же. Дубль по адресу (находка,
     // которая уже есть в наборе) отбрасывается — иначе одна статья заняла бы в ленте две карточки.
@@ -99,13 +100,13 @@ export class DashboardPublishService {
     const skipped = items.length - publishable.length;
 
     this.logger.log(
-      `Дашборд обновлён по выдаче за ${periodDays} дн. (${result.dateFrom} — ${result.dateTo}): ` +
+      `Дашборд обновлён по выдаче за «${searchWindowLabel(period)}» (${result.dateFrom} — ${result.dateTo}): ` +
         `удалено прежних упоминаний ${outcome.removed}, опубликовано ${outcome.published}` +
         (skipped > 0 ? `, пропущено без публичной ссылки ${skipped}` : ''),
     );
 
     return {
-      periodDays,
+      periodDays: result.periodDays,
       dateFrom: result.dateFrom,
       dateTo: result.dateTo,
       removed: outcome.removed,

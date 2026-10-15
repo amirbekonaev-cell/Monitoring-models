@@ -4,6 +4,7 @@ import { Sentiment } from '../mentions/mention.entity';
 import { CuratedLinkStatus } from './curated-link.entity';
 import { subtractCalendarDays, zonedDateString } from './curated-date.util';
 import { ALL_TIME_PERIOD_DAYS } from './search-period.util';
+import { SearchPeriod, searchWindowSpanDays, toSearchWindow } from './search-window.util';
 import { CuratedMentionsService } from './curated-mentions.service';
 import { CURATED_SENTIMENT_TO_ENUM, CuratedMention, CuratedStatus } from './curated-mentions';
 import {
@@ -73,7 +74,15 @@ export class CuratedJsonSearchService implements CuratedSearchSource {
    * неделя, даже когда весь набор новее этой недели. Иначе сообщение отвечало бы не на тот
    * вопрос, который задали кнопкой.
    */
-  private dateWindow(periodDays: number, now: Date): { dateFrom: string; dateTo: string } {
+  private dateWindow(period: SearchPeriod, now: Date): { dateFrom: string; dateTo: string } {
+    const window = toSearchWindow(period);
+    // Свой отрезок — это и есть окно: обе границы вписал человек, считать нечего. Правая граница
+    // при этом может быть и в прошлом, чего «за N дней» не умеет вовсе.
+    if (window.kind === 'range') {
+      return { dateFrom: window.dateFrom, dateTo: window.dateTo };
+    }
+
+    const periodDays = window.days;
     const dateTo = zonedDateString(now, this.timezone);
     if (periodDays >= ALL_TIME_PERIOD_DAYS) {
       const earliest = this.earliestCardDate();
@@ -110,16 +119,16 @@ export class CuratedJsonSearchService implements CuratedSearchSource {
    * to shift, so there is no instant to re-zone — the date printed on the article is the date, in
    * Almaty or anywhere else.
    */
-  private inWindow(periodDays: number, now: Date): CuratedMention[] {
-    const { dateFrom, dateTo } = this.dateWindow(periodDays, now);
+  private inWindow(period: SearchPeriod, now: Date): CuratedMention[] {
+    const { dateFrom, dateTo } = this.dateWindow(period, now);
     return this.visibleCards()
       .filter((card) => card.publishedAt !== null && card.publishedAt >= dateFrom && card.publishedAt <= dateTo)
       .sort(compareByDateDescThenId);
   }
 
-  async search(periodDays: number, now: Date = new Date()): Promise<CuratedSearchResult> {
-    const { dateFrom, dateTo } = this.dateWindow(periodDays, now);
-    const items = this.inWindow(periodDays, now);
+  async search(period: SearchPeriod, now: Date = new Date()): Promise<CuratedSearchResult> {
+    const { dateFrom, dateTo } = this.dateWindow(period, now);
+    const items = this.inWindow(period, now);
 
     const bySentiment = zeroedSentimentRecord();
     for (const card of items) {
@@ -127,7 +136,7 @@ export class CuratedJsonSearchService implements CuratedSearchSource {
     }
 
     return {
-      periodDays,
+      periodDays: searchWindowSpanDays(toSearchWindow(period)),
       dateFrom,
       dateTo,
       total: items.length,
@@ -147,12 +156,12 @@ export class CuratedJsonSearchService implements CuratedSearchSource {
    * message instead is how many items the page packer fits under SEARCH_MESSAGE_CHAR_LIMIT.
    */
   async findPage(
-    periodDays: number,
+    period: SearchPeriod,
     offset: number,
     limit: number,
     now: Date = new Date(),
   ): Promise<CuratedMentionView[]> {
-    const items = this.inWindow(periodDays, now);
+    const items = this.inWindow(period, now);
     const safeOffset = Number.isFinite(offset) && offset > 0 ? Math.floor(offset) : 0;
     const safeLimit = Number.isFinite(limit) && limit > 0 ? Math.floor(limit) : 0;
     const timeZone = this.timezone;

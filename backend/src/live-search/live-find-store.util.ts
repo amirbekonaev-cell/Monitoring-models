@@ -1,12 +1,16 @@
 import { Sentiment } from '../mentions/mention.entity';
+import { encodeSearchPeriod, SearchPeriod } from '../curated/search-window.util';
 import { LiveFind } from './live-find.types';
 
 /** Префикс ключа в таблице `settings`. Одна строка на период — см. LiveFindStoreService. */
 const KEY_PREFIX = 'live_finds:';
 
-/** Ключ строки для периода. `settings.key` — varchar(100), сюда влезает с запасом. */
-export function liveFindsSettingKey(periodDays: number): string {
-  return `${KEY_PREFIX}${periodDays}`;
+/**
+ * Ключ строки для периода. `settings.key` — varchar(100): самый длинный случай это свой отрезок,
+ * `live_finds:2026-07-01~2026-10-15` — 32 символа.
+ */
+export function liveFindsSettingKey(period: SearchPeriod): string {
+  return `${KEY_PREFIX}${encodeSearchPeriod(period)}`;
 }
 
 interface StoredFind {
